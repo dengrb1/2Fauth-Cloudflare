@@ -1,5 +1,7 @@
 ﻿const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const MOBILE_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const MOBILE_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
 // Keep hashing strong while avoiding CPU limit spikes on Workers.
 const PBKDF2_ITERATIONS = 100_000;
@@ -36,6 +38,15 @@ export default {
       }
       if (method === "POST" && path === "/api/login") {
         return handleLogin(request, env);
+      }
+      if (method === "POST" && path === "/api/mobile/login") {
+        return handleMobileLogin(request, env);
+      }
+      if (method === "POST" && path === "/api/mobile/refresh") {
+        return handleMobileRefresh(request, env);
+      }
+      if (method === "POST" && path === "/api/mobile/logout") {
+        return handleMobileLogout(request, env);
       }
       if (method === "POST" && path === "/api/logout") {
         return handleLogout(request, env);
@@ -196,12 +207,75 @@ async function handleLogin(request, env) {
   const ok = await verifyPassword(password, row.password_salt, row.password_hash);
   if (!ok) return json({ error: "Invalid credentials" }, 401);
 
+  const clientType = String(body.clientType || "").trim().toLowerCase();
+  if (clientType === "android") {
+    const mobileSession = await createMobileSession(env, row.id, "android");
+    return json({
+      ok: true,
+      user: { id: row.id, username: row.username, role: row.role },
+      accessToken: mobileSession.accessToken,
+      refreshToken: mobileSession.refreshToken,
+      expiresIn: mobileSession.expiresIn,
+    });
+  }
+
   const { cookie } = await createSession(env, row.id);
   return json(
     { ok: true, user: { id: row.id, username: row.username, role: row.role } },
     200,
     { "set-cookie": cookie }
   );
+}
+
+async function handleMobileLogin(request, env) {
+  const body = await parseJson(request);
+  body.clientType = "android";
+  return handleLogin(withJsonBody(request, body), env);
+}
+
+async function handleMobileRefresh(request, env) {
+  const body = await parseJson(request);
+  const refreshToken = String(body.refreshToken || "").trim();
+  if (!refreshToken) return json({ error: "refreshToken is required" }, 400);
+
+  const refreshHash = await hashSessionToken(refreshToken, env);
+  const now = nowIso();
+  const row = await env.DB.prepare(
+    "SELECT s.id, s.user_id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.refresh_hash = ? AND s.refresh_expires_at > ?"
+  )
+    .bind(refreshHash, now)
+    .first();
+  if (!row) return json({ error: "Invalid refresh token" }, 401);
+
+  const accessToken = randomHex(32);
+  const newRefreshToken = randomHex(32);
+  const accessHash = await hashSessionToken(accessToken, env);
+  const newRefreshHash = await hashSessionToken(newRefreshToken, env);
+  const nowDate = new Date();
+  const expiresAt = new Date(nowDate.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(nowDate.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+
+  await env.DB.prepare(
+    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ?"
+  )
+    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id)
+    .run();
+
+  return json({
+    ok: true,
+    user: { id: row.user_id, username: row.username, role: row.role },
+    accessToken,
+    refreshToken: newRefreshToken,
+    expiresIn: MOBILE_ACCESS_TTL_SECONDS,
+  });
+}
+
+async function handleMobileLogout(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "mobile") return json({ error: "Mobile bearer token required" }, 400);
+  await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
+  return json({ ok: true });
 }
 
 async function handleLogout(request, env) {
@@ -226,7 +300,9 @@ async function handleCloseSoon(request, env) {
 async function handleMe(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  await refreshSessionTtl(request, env).catch(() => {});
+  if (auth.sessionKind === "web") {
+    await refreshSessionTtl(request, env).catch(() => {});
+  }
   return json({ user: auth.user });
 }
 
@@ -870,12 +946,31 @@ async function verifyTurnstileToken(token, remoteip, env) {
 }
 
 async function requireAuth(request, env) {
-  const user = await getCurrentUser(request, env);
-  if (!user) return { ok: false, response: json({ error: "Unauthorized" }, 401) };
-  return { ok: true, user };
+  const current = await getCurrentUser(request, env);
+  if (!current) return { ok: false, response: json({ error: "Unauthorized" }, 401) };
+  return { ok: true, ...current };
 }
 
 async function getCurrentUser(request, env) {
+  const bearerToken = readBearerToken(request);
+  if (bearerToken) {
+    const tokenHash = await hashSessionToken(bearerToken, env);
+    const now = nowIso();
+    const row = await env.DB.prepare(
+      "SELECT s.id AS session_id, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
+    )
+      .bind(tokenHash, now, now)
+      .first();
+    if (row) {
+      await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
+      return {
+        user: { id: row.id, username: row.username, role: row.role },
+        sessionKind: "mobile",
+        sessionId: row.session_id,
+      };
+    }
+  }
+
   const token = readCookie(request, SESSION_COOKIE);
   if (!token) return null;
   const tokenHash = await hashSessionToken(token, env);
@@ -885,7 +980,8 @@ async function getCurrentUser(request, env) {
   )
     .bind(tokenHash, now)
     .first();
-  return row || null;
+  if (!row) return null;
+  return { user: row, sessionKind: "web" };
 }
 
 async function createSession(env, userId) {
@@ -912,7 +1008,28 @@ async function refreshSessionTtl(request, env) {
 }
 
 async function cleanExpiredSessions(env) {
-  await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(nowIso()).run();
+  const now = nowIso();
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now).run();
+  await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
+}
+
+async function createMobileSession(env, userId, clientType) {
+  const accessToken = randomHex(32);
+  const refreshToken = randomHex(32);
+  const tokenHash = await hashSessionToken(accessToken, env);
+  const refreshHash = await hashSessionToken(refreshToken, env);
+  const now = new Date();
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(now.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+
+  await env.DB.prepare(
+    "INSERT INTO api_sessions (user_id, token_hash, refresh_hash, expires_at, refresh_expires_at, created_at, last_used_at, client_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind(userId, tokenHash, refreshHash, expiresAt, refreshExpiresAt, createdAt, createdAt, clientType)
+    .run();
+
+  return { accessToken, refreshToken, expiresIn: MOBILE_ACCESS_TTL_SECONDS };
 }
 
 async function cleanExpiredLoginRisk(env) {
@@ -1150,6 +1267,21 @@ function parseCookies(request) {
 
 function readCookie(request, key) {
   return parseCookies(request)[key] || null;
+}
+
+function readBearerToken(request) {
+  const authHeader = String(request.headers.get("authorization") || "");
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  return match[1].trim() || null;
+}
+
+function withJsonBody(request, data) {
+  return new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: JSON.stringify(data),
+  });
 }
 
 function sessionCookie(token, ttlSeconds) {
