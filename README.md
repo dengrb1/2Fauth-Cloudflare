@@ -147,6 +147,7 @@ npx wrangler secret put SESSION_PEPPER
 - `GET /api/status`：检查是否已初始化
 - `POST /api/bootstrap`：创建首个管理员
 - `POST /api/login` / `POST /api/logout`
+- `POST /api/session/close-soon`（仅 Web UI 内部 beforeunload 使用，不建议第三方客户端调用）
 - `GET /api/me`
 - `GET /api/entries` / `POST /api/entries`
 - `PATCH /api/entries/:id`

@@ -3,6 +3,8 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const MOBILE_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const MOBILE_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
+const CLOSE_SOON_HEADER = "x-session-close";
+const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
 // Keep hashing strong while avoiding CPU limit spikes on Workers.
 const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_HASH = "SHA-256";
@@ -290,11 +292,23 @@ async function handleLogout(request, env) {
 async function handleCloseSoon(request, env) {
   const token = readCookie(request, SESSION_COOKIE);
   if (!token) return json({ ok: true });
+  if (!isAllowedCloseSoonRequest(request)) return json({ ok: true });
   const tokenHash = await hashSessionToken(token, env);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + CLOSE_LOGOUT_GRACE_SECONDS * 1000).toISOString();
-  await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?").bind(expiresAt, tokenHash).run();
+  await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND client_type = 'web'")
+    .bind(expiresAt, tokenHash)
+    .run();
   return json({ ok: true });
+}
+
+function isAllowedCloseSoonRequest(request) {
+  const closeHeader = String(request.headers.get(CLOSE_SOON_HEADER) || "").trim().toLowerCase();
+  if (closeHeader === CLOSE_SOON_HEADER_VALUE) return true;
+
+  const fetchMode = String(request.headers.get("sec-fetch-mode") || "").trim().toLowerCase();
+  const fetchDest = String(request.headers.get("sec-fetch-dest") || "").trim().toLowerCase();
+  return fetchMode === "navigate" && fetchDest === "document";
 }
 
 async function handleMe(request, env) {
@@ -990,7 +1004,7 @@ async function createSession(env, userId) {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
   await env.DB.prepare(
-    "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
+    "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
   )
     .bind(userId, tokenHash, expiresAt, now.toISOString())
     .run();
@@ -1847,6 +1861,13 @@ function appHtml(env) {
       try {
         const blob = new Blob(['{}'], { type: "application/json" });
         navigator.sendBeacon("/api/session/close-soon", blob);
+        fetch("/api/session/close-soon", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
+          body: "{}",
+          keepalive: true,
+          credentials: "same-origin"
+        }).catch(function() {});
       } catch {}
     }
 
@@ -2540,6 +2561,5 @@ function appHtml(env) {
 </body>
 </html>`;
 }
-
 
 
