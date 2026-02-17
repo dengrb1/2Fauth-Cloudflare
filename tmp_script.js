@@ -252,7 +252,7 @@
       table.innerHTML = "<tr><th>ID</th><th>Username</th><th>Role</th><th>Action</th></tr>";
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' onclick='switchRole(" + u.id + ","" + next + "")'>Set " + next + "</button> <button class='warn' onclick='deleteUser(" + u.id + ")'>Delete</button></td></tr>";
+        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' onclick='switchRole(" + u.id + ",\"" + next + "\")'>Set " + next + "</button> <button class='warn' onclick='deleteUser(" + u.id + ")'>Delete</button></td></tr>";
       });
     }
 
