@@ -1680,7 +1680,9 @@ function appHtml(env) {
         noIssuer: "无发行方",
         clickGenerate: "点击生成",
         secLeft: "秒后过期",
-        refreshCode: "刷新验证码",
+        copyCode: "复制验证码",
+        codeCopied: "验证码已复制到剪贴板。",
+        noCodeToCopy: "当前没有可复制的验证码。",
         generateHotp: "生成 HOTP",
         edit: "编辑",
         delete: "删除",
@@ -1743,7 +1745,9 @@ function appHtml(env) {
         noIssuer: "No issuer",
         clickGenerate: "Click Generate",
         secLeft: "s left",
-        refreshCode: "Refresh Code",
+        copyCode: "Copy Code",
+        codeCopied: "Code copied to clipboard.",
+        noCodeToCopy: "No code available to copy.",
         generateHotp: "Generate HOTP",
         edit: "Edit",
         delete: "Delete",
@@ -2047,7 +2051,7 @@ function appHtml(env) {
           + '<div class="row" style="margin-top:8px;">'
           + (e.otp_type === "hotp"
             ? '<button onclick="genHotp(' + e.id + ')">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" onclick="refreshCode(' + e.id + ', false, true)">' + esc(t("refreshCode")) + '</button>')
+            : '<button class="ghost" onclick="copyCode(' + e.id + ')">' + esc(t("copyCode")) + '</button>')
           + '<button class="ghost" onclick="editEntry(' + e.id + ')">' + esc(t("edit")) + '</button>'
           + '<button class="warn" onclick="deleteEntry(' + e.id + ')">' + esc(t("delete")) + '</button>'
           + '</div></article>';
@@ -2080,6 +2084,29 @@ function appHtml(env) {
         if (pEl) pEl.style.width = progress + "%";
       } catch (e) {
         if (!silent) alert(e.message);
+      }
+    }
+
+
+    async function copyCode(id) {
+      try {
+        let code = (codeState[id] && codeState[id].code) || "";
+        if (!code || code === "------") {
+          await refreshCode(id, true);
+          code = (codeState[id] && codeState[id].code) || "";
+        }
+        if (!code || code === "------") {
+          alert(t("noCodeToCopy"));
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(code);
+          alert(t("codeCopied"));
+        } else {
+          prompt("Copy code:", code);
+        }
+      } catch (e) {
+        alert(e.message);
       }
     }
 
