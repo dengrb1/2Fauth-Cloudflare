@@ -339,7 +339,7 @@
           + '<div class="row" style="margin-top:8px;">'
           + (e.otp_type === "hotp"
             ? '<button onclick="genHotp(' + e.id + ')">Generate HOTP</button>'
-            : '<button class="ghost" onclick="refreshCode(' + e.id + ')">Refresh Code</button>')
+            : '<button class="ghost" onclick="copyCode(' + e.id + ')">Copy Code</button>')
           + '<button class="ghost" onclick="editEntry(' + e.id + ')">Edit</button>'
           + '<button class="warn" onclick="deleteEntry(' + e.id + ')">Delete</button>'
           + '</div></article>';
@@ -366,6 +366,28 @@
         if (pEl) pEl.style.width = progress + "%";
       } catch (e) {
         if (!silent) alert(e.message);
+      }
+    }
+
+    async function copyCode(id) {
+      try {
+        let code = (codeState[id] && codeState[id].code) || "";
+        if (!code || code === "------") {
+          await refreshCode(id, true);
+          code = (codeState[id] && codeState[id].code) || "";
+        }
+        if (!code || code === "------") {
+          alert("No code available to copy.");
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(code);
+          alert("Code copied to clipboard.");
+        } else {
+          prompt("Copy code:", code);
+        }
+      } catch (e) {
+        alert(e.message);
       }
     }
 
