@@ -1681,8 +1681,11 @@ function appHtml(env) {
         clickGenerate: "点击生成",
         secLeft: "秒后过期",
         copyCode: "复制验证码",
-        codeCopied: "验证码已复制到剪贴板。",
-        noCodeToCopy: "当前没有可复制的验证码。",
+        codeCopied: "验证码已复制",
+        copyFailed: "复制失败，请手动复制",
+        setGroup: "设为分组",
+        removeGroup: "移出分组",
+        groupUpdated: "分组已更新",
         generateHotp: "生成 HOTP",
         edit: "编辑",
         delete: "删除",
@@ -1729,8 +1732,6 @@ function appHtml(env) {
         otpauthImportDone: "otpauth 导入完成",
         importFileLoaded: "文件内容已加载到导入框。",
         turnstileRequired: "请先完成 Cloudflare Turnstile 验证。",
-        manualRefreshed: "已手动刷新",
-        maybeUnchanged: "（当前周期内验证码可能不变）"
       },
       "en-US": {
         loading: "Loading...",
@@ -1746,8 +1747,11 @@ function appHtml(env) {
         clickGenerate: "Click Generate",
         secLeft: "s left",
         copyCode: "Copy Code",
-        codeCopied: "Code copied to clipboard.",
-        noCodeToCopy: "No code available to copy.",
+        codeCopied: "Code copied",
+        copyFailed: "Copy failed, please copy manually",
+        setGroup: "Set Group",
+        removeGroup: "Remove Group",
+        groupUpdated: "Group updated",
         generateHotp: "Generate HOTP",
         edit: "Edit",
         delete: "Delete",
@@ -1794,8 +1798,6 @@ function appHtml(env) {
         otpauthImportDone: "otpauth import completed",
         importFileLoaded: "File content loaded into import box.",
         turnstileRequired: "Please complete Cloudflare Turnstile verification first.",
-        manualRefreshed: "Manually refreshed",
-        maybeUnchanged: "(code may remain unchanged within current period)"
       }
     };
     let currentLang = localStorage.getItem("ui_lang") || "zh-CN";
@@ -2022,6 +2024,17 @@ function appHtml(env) {
       }).join("");
     }
 
+    function groupOptionsHtml(selectedGroupId) {
+      const selected = selectedGroupId === null || selectedGroupId === undefined ? "" : String(selectedGroupId);
+      const opts = ['<option value="">' + esc(t("noGroup")) + '</option>'];
+      groups.forEach(function(g) {
+        const val = String(g.id);
+        const isSelected = val === selected ? " selected" : "";
+        opts.push('<option value="' + esc(val) + '"' + isSelected + '>' + esc(g.name) + '</option>');
+      });
+      return opts.join("");
+    }
+
     function renderEntries() {
       const q = v("search").trim().toLowerCase();
       const gf = v("groupFilter");
@@ -2052,6 +2065,9 @@ function appHtml(env) {
           + (e.otp_type === "hotp"
             ? '<button onclick="genHotp(' + e.id + ')">' + esc(t("generateHotp")) + '</button>'
             : '<button class="ghost" onclick="copyCode(' + e.id + ')">' + esc(t("copyCode")) + '</button>')
+          + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
+          + '<button class="ghost" onclick="setEntryGroup(' + e.id + ')">' + esc(t("setGroup")) + '</button>'
+          + '<button class="ghost" onclick="removeEntryGroup(' + e.id + ')">' + esc(t("removeGroup")) + '</button>'
           + '<button class="ghost" onclick="editEntry(' + e.id + ')">' + esc(t("edit")) + '</button>'
           + '<button class="warn" onclick="deleteEntry(' + e.id + ')">' + esc(t("delete")) + '</button>'
           + '</div></article>';
@@ -2063,7 +2079,7 @@ function appHtml(env) {
       await Promise.all(current.map(function(e) { return refreshCode(e.id, true); }));
     }
 
-    async function refreshCode(id, silent, manual) {
+    async function refreshCode(id, silent) {
       try {
         const r = await api("/api/entries/" + id + "/code?_t=" + Date.now());
         const entry = entries.find(function(x){ return x.id === id; });
@@ -2074,39 +2090,34 @@ function appHtml(env) {
         const exEl = document.getElementById("x-" + id);
         const pEl = document.getElementById("p-" + id);
         if (codeEl) codeEl.textContent = r.code;
-        if (exEl) {
-          if (manual) {
-            exEl.textContent = t("manualRefreshed") + t("maybeUnchanged") + " " + r.expiresIn + t("secLeft");
-          } else {
-            exEl.textContent = r.expiresIn + t("secLeft");
-          }
-        }
+        if (exEl) exEl.textContent = r.expiresIn + t("secLeft");
         if (pEl) pEl.style.width = progress + "%";
       } catch (e) {
         if (!silent) alert(e.message);
       }
     }
 
-
     async function copyCode(id) {
-      try {
-        let code = (codeState[id] && codeState[id].code) || "";
-        if (!code || code === "------") {
+      const state = codeState[id] || {};
+      const code = String(state.code || "").trim();
+      if (!code || code === "------") {
+        try {
           await refreshCode(id, true);
-          code = (codeState[id] && codeState[id].code) || "";
-        }
-        if (!code || code === "------") {
-          alert(t("noCodeToCopy"));
-          return;
-        }
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(code);
-          alert(t("codeCopied"));
-        } else {
-          prompt("Copy code:", code);
-        }
+        } catch {}
+      }
+      const latest = String(((codeState[id] || {}).code) || "").trim();
+      if (!latest || latest === "------") {
+        alert(t("copyFailed"));
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(latest);
+        alert(t("codeCopied"));
       } catch (e) {
-        alert(e.message);
+        const ok = window.prompt(t("copyFailed"), latest);
+        if (ok !== null) {
+          alert(t("codeCopied"));
+        }
       }
     }
 
@@ -2139,6 +2150,26 @@ function appHtml(env) {
         ["eLabel","eIssuer","eSecret","eUri"].forEach(function(id){ document.getElementById(id).value = ""; });
         await refreshAll();
       } catch (e) { msg("entryMsg", e.message, true); }
+    }
+
+    async function setEntryGroup(id) {
+      const el = document.getElementById("entry-group-" + id);
+      const groupId = el && el.value ? Number(el.value) : null;
+      await api("/api/entries/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({ groupId: groupId })
+      });
+      alert(t("groupUpdated"));
+      await refreshAll();
+    }
+
+    async function removeEntryGroup(id) {
+      await api("/api/entries/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({ groupId: null })
+      });
+      alert(t("groupUpdated"));
+      await refreshAll();
     }
 
     async function editEntry(id) {
@@ -2588,5 +2619,4 @@ function appHtml(env) {
 </body>
 </html>`;
 }
-
 
