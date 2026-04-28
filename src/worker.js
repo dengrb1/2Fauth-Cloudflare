@@ -11,6 +11,8 @@ const PBKDF2_HASH = "SHA-256";
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const EXTENSION_CLIENT_TYPE = "edge_extension";
+const EXTENSION_BATCH_MAX_IDS = 100;
 
 export default {
   async fetch(request, env, ctx) {
@@ -49,6 +51,21 @@ export default {
       }
       if (method === "POST" && path === "/api/mobile/logout") {
         return handleMobileLogout(request, env);
+      }
+      if (method === "POST" && path === "/api/extension/login") {
+        return handleExtensionLogin(request, env);
+      }
+      if (method === "POST" && path === "/api/extension/refresh") {
+        return handleExtensionRefresh(request, env);
+      }
+      if (method === "POST" && path === "/api/extension/logout") {
+        return handleExtensionLogout(request, env);
+      }
+      if (method === "GET" && path === "/api/extension/entries") {
+        return handleExtensionEntries(request, env);
+      }
+      if (method === "POST" && path === "/api/extension/codes/batch") {
+        return handleExtensionCodesBatch(request, env);
       }
       if (method === "POST" && path === "/api/logout") {
         return handleLogout(request, env);
@@ -236,48 +253,165 @@ async function handleMobileLogin(request, env) {
 }
 
 async function handleMobileRefresh(request, env) {
-  const body = await parseJson(request);
-  const refreshToken = String(body.refreshToken || "").trim();
-  if (!refreshToken) return json({ error: "refreshToken is required" }, 400);
-
-  const refreshHash = await hashSessionToken(refreshToken, env);
-  const now = nowIso();
-  const row = await env.DB.prepare(
-    "SELECT s.id, s.user_id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.refresh_hash = ? AND s.refresh_expires_at > ?"
-  )
-    .bind(refreshHash, now)
-    .first();
-  if (!row) return json({ error: "Invalid refresh token" }, 401);
-
-  const accessToken = randomHex(32);
-  const newRefreshToken = randomHex(32);
-  const accessHash = await hashSessionToken(accessToken, env);
-  const newRefreshHash = await hashSessionToken(newRefreshToken, env);
-  const nowDate = new Date();
-  const expiresAt = new Date(nowDate.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
-  const refreshExpiresAt = new Date(nowDate.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
-
-  await env.DB.prepare(
-    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ?"
-  )
-    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id)
-    .run();
-
-  return json({
-    ok: true,
-    user: { id: row.user_id, username: row.username, role: row.role },
-    accessToken,
-    refreshToken: newRefreshToken,
-    expiresIn: MOBILE_ACCESS_TTL_SECONDS,
-  });
+  return rotateApiSessionTokens(request, env, "android");
 }
 
 async function handleMobileLogout(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "mobile") return json({ error: "Mobile bearer token required" }, 400);
+  if (auth.sessionKind !== "mobile" || auth.apiClientType !== "android") {
+    return json({ error: "Mobile bearer token required" }, 400);
+  }
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
   return json({ ok: true });
+}
+
+async function handleExtensionLogin(request, env) {
+  const body = await parseJson(request);
+  const username = normalizeUsername(body.username);
+  const password = String(body.password || "");
+  const risk = await applyLoginRiskControl(request, env, username);
+  if (risk.blocked) {
+    return json(
+      {
+        error: "Too many login attempts. Temporarily locked.",
+        retryAfterSeconds: risk.retryAfterSeconds,
+        lockedUntil: new Date(risk.lockUntil * 1000).toISOString(),
+      },
+      429
+    );
+  }
+  if (!username || !password) return json({ error: "Username and password are required" }, 400);
+
+  const row = await env.DB.prepare(
+    "SELECT id, username, role, password_hash, password_salt FROM users WHERE username = ?"
+  )
+    .bind(username)
+    .first();
+  if (!row) return json({ error: "Invalid credentials" }, 401);
+
+  const ok = await verifyPassword(password, row.password_salt, row.password_hash);
+  if (!ok) return json({ error: "Invalid credentials" }, 401);
+
+  const deviceName = normalizeClientMetadata(body.deviceName, 120, "edge");
+  const clientVersion = normalizeClientMetadata(body.clientVersion, 64, "unknown");
+  const clientType = `${EXTENSION_CLIENT_TYPE}:${deviceName}:${clientVersion}`;
+  const apiSession = await createMobileSession(env, row.id, clientType);
+
+  return json({
+    ok: true,
+    user: { id: row.id, username: row.username, role: row.role },
+    accessToken: apiSession.accessToken,
+    refreshToken: apiSession.refreshToken,
+    expiresIn: apiSession.expiresIn,
+    refreshExpiresIn: MOBILE_REFRESH_TTL_SECONDS,
+    sessionId: apiSession.sessionId,
+  });
+}
+
+async function handleExtensionRefresh(request, env) {
+  return rotateApiSessionTokens(request, env, EXTENSION_CLIENT_TYPE, { includeRefreshExpiresIn: true });
+}
+
+async function handleExtensionLogout(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (!isExtensionClientType(auth.apiClientType)) {
+    return json({ error: "Extension bearer token required" }, 400);
+  }
+  await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
+  return json({ ok: true });
+}
+
+async function handleExtensionEntries(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (!isExtensionClientType(auth.apiClientType)) {
+    return json({ error: "Extension bearer token required" }, 400);
+  }
+  return handleListEntries(request, env);
+}
+
+async function handleExtensionCodesBatch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (!isExtensionClientType(auth.apiClientType)) {
+    return json({ error: "Extension bearer token required" }, 400);
+  }
+
+  const body = await parseJson(request);
+  if (!Array.isArray(body.entryIds)) return json({ error: "entryIds must be an array" }, 400);
+
+  const normalizedIds = [];
+  const unique = new Set();
+  for (const rawId of body.entryIds) {
+    const id = Number(rawId);
+    if (!Number.isFinite(id) || id <= 0 || !Number.isInteger(id)) {
+      return json({ error: "entryIds must contain positive integer ids" }, 400);
+    }
+    if (unique.has(id)) continue;
+    unique.add(id);
+    normalizedIds.push(id);
+  }
+  if (normalizedIds.length === 0) return json({ error: "entryIds cannot be empty" }, 400);
+  if (normalizedIds.length > EXTENSION_BATCH_MAX_IDS) {
+    return json({ error: `entryIds cannot exceed ${EXTENSION_BATCH_MAX_IDS}` }, 400);
+  }
+
+  const placeholders = normalizedIds.map(() => "?").join(", ");
+  const baseParams = [...normalizedIds];
+  let query =
+    `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE id IN (${placeholders})`;
+  if (auth.user.role !== "admin") {
+    query += " AND user_id = ?";
+    baseParams.push(auth.user.id);
+  }
+  const rows = await env.DB.prepare(query).bind(...baseParams).all();
+  const rowMap = new Map((rows.results || []).map((row) => [Number(row.id), row]));
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const items = [];
+  for (const id of normalizedIds) {
+    const row = rowMap.get(id);
+    if (!row) {
+      items.push({ id, error: "Entry not found or forbidden" });
+      continue;
+    }
+
+    const otpType = row.otp_type || "totp";
+    if (otpType === "hotp") {
+      items.push({
+        id,
+        otpType: "hotp",
+        counter: Number(row.hotp_counter || 0),
+        error: "Use HOTP endpoint",
+      });
+      continue;
+    }
+
+    try {
+      const period = Number(row.period || 30);
+      const digits = Number(row.digits || 6);
+      const algorithm = String(row.algorithm || "SHA-1");
+      const secret = await decryptText(row.secret_enc, env);
+      const step = Math.floor(nowSec / period);
+      const code = await generateTotp(secret, period, digits, algorithm, step);
+      const expiresIn = period - (nowSec % period);
+      items.push({
+        id,
+        otpType: "totp",
+        code,
+        expiresIn,
+      });
+    } catch {
+      items.push({ id, otpType: "totp", error: "Failed to generate code" });
+    }
+  }
+
+  return json({
+    serverTime: nowSec,
+    items,
+  });
 }
 
 async function handleLogout(request, env) {
@@ -971,7 +1105,7 @@ async function getCurrentUser(request, env) {
     const tokenHash = await hashSessionToken(bearerToken, env);
     const now = nowIso();
     const row = await env.DB.prepare(
-      "SELECT s.id AS session_id, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
+      "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
     )
       .bind(tokenHash, now, now)
       .first();
@@ -981,6 +1115,7 @@ async function getCurrentUser(request, env) {
         user: { id: row.id, username: row.username, role: row.role },
         sessionKind: "mobile",
         sessionId: row.session_id,
+        apiClientType: String(row.client_type || "android"),
       };
     }
   }
@@ -1043,7 +1178,72 @@ async function createMobileSession(env, userId, clientType) {
     .bind(userId, tokenHash, refreshHash, expiresAt, refreshExpiresAt, createdAt, createdAt, clientType)
     .run();
 
-  return { accessToken, refreshToken, expiresIn: MOBILE_ACCESS_TTL_SECONDS };
+  const sessionId = normalizeDbId(
+    (
+      await env.DB.prepare(
+        "SELECT id FROM api_sessions WHERE token_hash = ? AND user_id = ?"
+      ).bind(tokenHash, userId).first()
+    )?.id
+  );
+  return { accessToken, refreshToken, expiresIn: MOBILE_ACCESS_TTL_SECONDS, sessionId };
+}
+
+async function rotateApiSessionTokens(request, env, expectedClientType, options = {}) {
+  const body = await parseJson(request);
+  const refreshToken = String(body.refreshToken || "").trim();
+  if (!refreshToken) return json({ error: "refreshToken is required" }, 400);
+
+  const refreshHash = await hashSessionToken(refreshToken, env);
+  const now = nowIso();
+  const row = await env.DB.prepare(
+    "SELECT s.id, s.client_type, s.user_id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.refresh_hash = ? AND s.refresh_expires_at > ?"
+  )
+    .bind(refreshHash, now)
+    .first();
+  if (!row) return json({ error: "Invalid refresh token" }, 401);
+
+  if (expectedClientType === "android" && String(row.client_type || "") !== "android") {
+    return json({ error: "Invalid refresh token" }, 401);
+  }
+  if (expectedClientType === EXTENSION_CLIENT_TYPE && !isExtensionClientType(String(row.client_type || ""))) {
+    return json({ error: "Invalid refresh token" }, 401);
+  }
+
+  const accessToken = randomHex(32);
+  const newRefreshToken = randomHex(32);
+  const accessHash = await hashSessionToken(accessToken, env);
+  const newRefreshHash = await hashSessionToken(newRefreshToken, env);
+  const nowDate = new Date();
+  const expiresAt = new Date(nowDate.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(nowDate.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+
+  await env.DB.prepare(
+    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ?"
+  )
+    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id)
+    .run();
+
+  const payload = {
+    ok: true,
+    user: { id: row.user_id, username: row.username, role: row.role },
+    accessToken,
+    refreshToken: newRefreshToken,
+    expiresIn: MOBILE_ACCESS_TTL_SECONDS,
+  };
+  if (options.includeRefreshExpiresIn) {
+    payload.refreshExpiresIn = MOBILE_REFRESH_TTL_SECONDS;
+  }
+  return json(payload);
+}
+
+function isExtensionClientType(clientType) {
+  return String(clientType || "") === EXTENSION_CLIENT_TYPE || String(clientType || "").startsWith(`${EXTENSION_CLIENT_TYPE}:`);
+}
+
+function normalizeClientMetadata(value, maxLen, fallback) {
+  const normalized = String(value || "").trim().replace(/[^\w.\- ]+/g, "");
+  if (!normalized) return fallback;
+  return normalized.slice(0, maxLen);
 }
 
 async function cleanExpiredLoginRisk(env) {
