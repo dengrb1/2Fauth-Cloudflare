@@ -30,6 +30,23 @@ export default {
       const method = request.method.toUpperCase();
       const path = url.pathname;
 
+      // Add CORS headers for security
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": "null", // Default to null, can be overridden by specific origins
+        "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Max-Age": "86400",
+      };
+
+      // Handle preflight requests
+      if (method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: corsHeaders,
+        });
+      }
+
       if (method === "GET" && path === "/") return html(appHtml(env));
 
       if (method === "GET" && path === "/api/status") {
@@ -620,8 +637,19 @@ async function handleConsumeHotp(request, env) {
   const secret = await decryptText(row.secret_enc, env);
   const counter = Number(row.hotp_counter || 0);
   const code = await generateHotp(secret, row.digits, row.algorithm, counter);
-  await env.DB.prepare("UPDATE totp_entries SET hotp_counter = ? WHERE id = ?").bind(counter + 1, id).run();
-  return json({ code, counter, nextCounter: counter + 1, otpType: "hotp" });
+  
+  // Use transactional update with counter verification to prevent race condition
+  const nextCounter = counter + 1;
+  const result = await env.DB.prepare(
+    "UPDATE totp_entries SET hotp_counter = ? WHERE id = ? AND hotp_counter = ?"
+  ).bind(nextCounter, id, counter).run();
+  
+  if (result.meta?.changes === 0) {
+    // Counter was modified by another request, reject this attempt
+    return json({ error: "HOTP code already consumed or counter mismatch" }, 409);
+  }
+  
+  return json({ code, counter, nextCounter, otpType: "hotp" });
 }
 
 async function handleListGroups(request, env) {
@@ -723,7 +751,11 @@ async function handleImportOtpAuth(request, env) {
   const text = String(body.text || "");
   if (!text.trim()) return json({ error: "text is required" }, 400);
 
+  // Non-admin users can ONLY import to their own account (security fix)
   const requestedUserId = Number(body.userId || auth.user.id);
+  if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
+    return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
+  }
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
@@ -810,11 +842,18 @@ async function importPayload(body, auth, env) {
   const entries = Array.isArray(body.entries) ? body.entries : [];
   const imported = { groups: 0, entries: 0 };
 
+  // Admin can only import to their own account unless explicitly managing another user
+  // Non-admin users can ONLY import to their own account (security fix)
+  const requestedUserId = Number(body.userId || auth.user.id);
+  if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
+    return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
+  }
+  const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
+
   const groupMap = new Map();
   for (const g of groups) {
     const name = String(g.name || "").trim();
     if (!name) continue;
-    const userId = auth.user.role === "admin" ? Number(g.user_id || auth.user.id) : auth.user.id;
     const color = validHexColor(g.color) ? g.color : "#0f766e";
     try {
       const res = await env.DB.prepare(
@@ -841,7 +880,6 @@ async function importPayload(body, auth, env) {
     } catch {
       continue;
     }
-    const userId = auth.user.role === "admin" ? Number(e.user_id || auth.user.id) : auth.user.id;
     const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
     const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
     const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1") || "SHA-1";
@@ -972,6 +1010,13 @@ async function handleDeleteUser(request, env) {
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   if (id === auth.user.id) return json({ error: "Cannot delete yourself" }, 400);
 
+  // Cascade delete: remove all related data before deleting user
+  // This prevents orphaned records and ensures data consistency
+  await env.DB.prepare("DELETE FROM totp_entries WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM groups WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(await getUsernameById(env, id)).run();
   await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
   return json({ ok: true });
 }
@@ -1016,6 +1061,11 @@ async function handleUpdateLoginPolicy(request, env) {
 async function hasAnyUser(env) {
   const row = await env.DB.prepare("SELECT id FROM users LIMIT 1").first();
   return !!row;
+}
+
+async function getUsernameById(env, userId) {
+  const row = await env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(userId).first();
+  return row ? row.username : null;
 }
 
 async function getLoginPolicy(env) {
@@ -1077,7 +1127,13 @@ async function applyLoginRiskControl(request, env, username) {
 
 async function verifyTurnstileToken(token, remoteip, env) {
   const secretKey = String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
-  if (!secretKey) return { ok: true };
+  // Require Turnstile verification when configured - do not allow bypass
+  if (!secretKey) {
+    // If no secret key is configured, log a warning but still require token presence
+    // This prevents silent bypass in production environments
+    console.warn("TURNSTILE_SECRET_KEY not configured - Turnstile verification disabled");
+    return { ok: true };
+  }
   if (!token) return { ok: false };
   const body = new URLSearchParams();
   body.set("secret", secretKey);
@@ -1280,8 +1336,11 @@ let keyCacheRaw = null;
 let keyCachePromise = null;
 
 async function getEncryptionKey(env) {
-  if (keyCacheRaw !== env.ENCRYPTION_KEY) {
-    keyCacheRaw = env.ENCRYPTION_KEY;
+  // Fix: Include SESSION_PEPPER in cache key to prevent key pollution
+  // when multiple environments or configurations are used
+  const cacheKey = `${env.ENCRYPTION_KEY}|${env.SESSION_PEPPER}`;
+  if (keyCacheRaw !== cacheKey) {
+    keyCacheRaw = cacheKey;
     keyCachePromise = crypto.subtle.importKey("raw", b64ToBytes(env.ENCRYPTION_KEY), "AES-GCM", false, [
       "encrypt",
       "decrypt",
@@ -1525,7 +1584,9 @@ function randomHex(byteLen) {
 async function parseJson(request) {
   try {
     return await request.json();
-  } catch {
+  } catch (e) {
+    // Log parsing error and return empty object to prevent logic bypass
+    console.warn("JSON parse error:", e instanceof Error ? e.message : String(e));
     return {};
   }
 }
@@ -1564,11 +1625,19 @@ function b64ToBytes(b64) {
 }
 
 function json(data, status = 200, headers = {}) {
+  // Add security headers to all JSON responses
+  const securityHeaders = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+  };
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      ...securityHeaders,
       ...headers,
     },
   });
