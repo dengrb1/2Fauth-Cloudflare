@@ -1,0 +1,8 @@
+name = "worker-2fauth"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "worker-2fauth-db"
+database_id = "b388dc9b-021e-4184-a256-5599139acfa6"

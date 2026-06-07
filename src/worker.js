@@ -1,7 +1,7 @@
 ﻿const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const MOBILE_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
-const MOBILE_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
+const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
 const CLOSE_SOON_HEADER = "x-session-close";
 const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
@@ -11,8 +11,64 @@ const PBKDF2_HASH = "SHA-256";
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
+const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
+const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
+
+const API_ROUTES = [
+  ["GET", "/api/status", handleStatus],
+  ["POST", "/api/bootstrap", handleBootstrap],
+  ["POST", "/api/login", handleLogin],
+  ["POST", "/api/mobile/login", handleMobileLogin],
+  ["POST", "/api/mobile/refresh", handleMobileRefresh],
+  ["POST", "/api/mobile/logout", handleMobileLogout],
+  ["POST", "/api/extension/login", handleExtensionLogin],
+  ["POST", "/api/extension/refresh", handleExtensionRefresh],
+  ["POST", "/api/extension/logout", handleExtensionLogout],
+  ["GET", "/api/extension/entries", handleExtensionEntries],
+  ["POST", "/api/extension/codes/batch", handleExtensionCodesBatch],
+  ["GET", "/api/v1/capabilities", handleApiCapabilities],
+  ["POST", "/api/v1/auth/login", handleApiClientLogin],
+  ["POST", "/api/v1/auth/refresh", handleApiClientRefresh],
+  ["POST", "/api/v1/auth/logout", handleApiClientLogout],
+  ["GET", "/api/v1/me", handleMe],
+  ["GET", "/api/v1/entries", handleListEntries],
+  ["POST", "/api/v1/entries", handleCreateEntry],
+  ["PATCH", /^\/api\/v1\/entries\/\d+$/, handleUpdateEntry],
+  ["GET", /^\/api\/v1\/entries\/\d+\/code$/, handleEntryCode],
+  ["POST", /^\/api\/v1\/entries\/\d+\/hotp$/, handleConsumeHotp],
+  ["DELETE", /^\/api\/v1\/entries\/\d+$/, handleDeleteEntry],
+  ["GET", "/api/v1/groups", handleListGroups],
+  ["POST", "/api/v1/groups", handleCreateGroup],
+  ["DELETE", /^\/api\/v1\/groups\/\d+$/, handleDeleteGroup],
+  ["POST", "/api/v1/codes/batch", handleApiCodesBatch],
+  ["POST", "/api/logout", handleLogout],
+  ["POST", "/api/session/close-soon", handleCloseSoon],
+  ["GET", "/api/me", handleMe],
+  ["GET", "/api/entries", handleListEntries],
+  ["POST", "/api/entries", handleCreateEntry],
+  ["PATCH", /^\/api\/entries\/\d+$/, handleUpdateEntry],
+  ["GET", /^\/api\/entries\/\d+\/code$/, handleEntryCode],
+  ["POST", /^\/api\/entries\/\d+\/hotp$/, handleConsumeHotp],
+  ["DELETE", /^\/api\/entries\/\d+$/, handleDeleteEntry],
+  ["GET", "/api/groups", handleListGroups],
+  ["POST", "/api/groups", handleCreateGroup],
+  ["DELETE", /^\/api\/groups\/\d+$/, handleDeleteGroup],
+  ["GET", "/api/export", handleExportData],
+  ["GET", "/api/export/otpauth", handleExportOtpAuth],
+  ["POST", "/api/export/encrypted", handleExportDataEncrypted],
+  ["POST", "/api/import", handleImportData],
+  ["POST", "/api/import/otpauth", handleImportOtpAuth],
+  ["POST", "/api/import/encrypted", handleImportDataEncrypted],
+  ["GET", "/api/users", handleListUsers],
+  ["POST", "/api/users", handleCreateUser],
+  ["PATCH", /^\/api\/users\/\d+\/role$/, handleUpdateUserRole],
+  ["DELETE", /^\/api\/users\/\d+$/, handleDeleteUser],
+  ["GET", "/api/security/login-policy", handleGetLoginPolicy],
+  ["PATCH", "/api/security/login-policy", handleUpdateLoginPolicy],
+];
 
 export default {
   async fetch(request, env, ctx) {
@@ -30,136 +86,14 @@ export default {
       const method = request.method.toUpperCase();
       const path = url.pathname;
 
-      // Add CORS headers for security
-      const corsHeaders = {
-        "Access-Control-Allow-Origin": "null", // Default to null, can be overridden by specific origins
-        "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Max-Age": "86400",
-      };
-
-      // Handle preflight requests
       if (method === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: corsHeaders,
-        });
+        return corsPreflight(request, env);
       }
 
       if (method === "GET" && path === "/") return html(appHtml(env));
 
-      if (method === "GET" && path === "/api/status") {
-        const initialized = await hasAnyUser(env);
-        return json({ initialized });
-      }
-
-      if (method === "POST" && path === "/api/bootstrap") {
-        return handleBootstrap(request, env);
-      }
-      if (method === "POST" && path === "/api/login") {
-        return handleLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/login") {
-        return handleMobileLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/refresh") {
-        return handleMobileRefresh(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/logout") {
-        return handleMobileLogout(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/login") {
-        return handleExtensionLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/refresh") {
-        return handleExtensionRefresh(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/logout") {
-        return handleExtensionLogout(request, env);
-      }
-      if (method === "GET" && path === "/api/extension/entries") {
-        return handleExtensionEntries(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/codes/batch") {
-        return handleExtensionCodesBatch(request, env);
-      }
-      if (method === "POST" && path === "/api/logout") {
-        return handleLogout(request, env);
-      }
-      if (method === "POST" && path === "/api/session/close-soon") {
-        return handleCloseSoon(request, env);
-      }
-      if (method === "GET" && path === "/api/me") {
-        return handleMe(request, env);
-      }
-
-      if (method === "GET" && path === "/api/entries") {
-        return handleListEntries(request, env);
-      }
-      if (method === "POST" && path === "/api/entries") {
-        return handleCreateEntry(request, env);
-      }
-      if (method === "PATCH" && path.match(/^\/api\/entries\/\d+$/)) {
-        return handleUpdateEntry(request, env);
-      }
-      if (method === "GET" && path.match(/^\/api\/entries\/\d+\/code$/)) {
-        return handleEntryCode(request, env);
-      }
-      if (method === "POST" && path.match(/^\/api\/entries\/\d+\/hotp$/)) {
-        return handleConsumeHotp(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/entries\/\d+$/)) {
-        return handleDeleteEntry(request, env);
-      }
-
-      if (method === "GET" && path === "/api/groups") {
-        return handleListGroups(request, env);
-      }
-      if (method === "POST" && path === "/api/groups") {
-        return handleCreateGroup(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/groups\/\d+$/)) {
-        return handleDeleteGroup(request, env);
-      }
-
-      if (method === "GET" && path === "/api/export") {
-        return handleExportData(request, env);
-      }
-      if (method === "GET" && path === "/api/export/otpauth") {
-        return handleExportOtpAuth(request, env);
-      }
-      if (method === "POST" && path === "/api/export/encrypted") {
-        return handleExportDataEncrypted(request, env);
-      }
-      if (method === "POST" && path === "/api/import") {
-        return handleImportData(request, env);
-      }
-      if (method === "POST" && path === "/api/import/otpauth") {
-        return handleImportOtpAuth(request, env);
-      }
-      if (method === "POST" && path === "/api/import/encrypted") {
-        return handleImportDataEncrypted(request, env);
-      }
-
-      if (method === "GET" && path === "/api/users") {
-        return handleListUsers(request, env);
-      }
-      if (method === "POST" && path === "/api/users") {
-        return handleCreateUser(request, env);
-      }
-      if (method === "PATCH" && path.match(/^\/api\/users\/\d+\/role$/)) {
-        return handleUpdateUserRole(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/users\/\d+$/)) {
-        return handleDeleteUser(request, env);
-      }
-      if (method === "GET" && path === "/api/security/login-policy") {
-        return handleGetLoginPolicy(request, env);
-      }
-      if (method === "PATCH" && path === "/api/security/login-policy") {
-        return handleUpdateLoginPolicy(request, env);
-      }
+      const route = findApiRoute(method, path);
+      if (route) return withCors(request, await route.handler(request, env), env);
       if (method === "GET" && path === "/favicon.ico") {
         return new Response(null, { status: 204 });
       }
@@ -167,13 +101,40 @@ export default {
         return html(appHtml(env));
       }
 
-      return json({ error: "Not found" }, 404);
+      return withCors(request, json({ error: "Not found" }, 404), env);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Internal error";
-      return json({ error: "Internal Server Error", detail: message }, 500);
+      if (err instanceof ApiError) {
+        return withCors(request, json({ error: err.message }, err.status), env);
+      }
+      const payload = { error: "Internal Server Error" };
+      if (env.DEBUG_ERRORS) {
+        payload.detail = err instanceof Error ? err.message : "Internal error";
+      }
+      return withCors(request, json(payload, 500), env);
     }
   },
 };
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function findApiRoute(method, path) {
+  for (const [routeMethod, matcher, handler] of API_ROUTES) {
+    if (routeMethod !== method) continue;
+    if (typeof matcher === "string" && matcher === path) return { handler };
+    if (matcher instanceof RegExp && matcher.test(path)) return { handler };
+  }
+  return null;
+}
+
+async function handleStatus(request, env) {
+  const initialized = await hasAnyUser(env);
+  return json({ initialized });
+}
 
 async function handleBootstrap(request, env) {
   const initialized = await hasAnyUser(env);
@@ -225,7 +186,7 @@ async function handleLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
-  if (env.TURNSTILE_SECRET_KEY) {
+  if (hasTurnstileSecret(env)) {
     const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
     const ts = await verifyTurnstileToken(turnstileToken, ip, env);
     if (!ts.ok) {
@@ -242,16 +203,19 @@ async function handleLogin(request, env) {
 
   const ok = await verifyPassword(password, row.password_salt, row.password_hash);
   if (!ok) return json({ error: "Invalid credentials" }, 401);
+  await clearLoginRiskControl(request, env, username).catch(() => {});
 
   const clientType = String(body.clientType || "").trim().toLowerCase();
-  if (clientType === "android") {
-    const mobileSession = await createMobileSession(env, row.id, "android");
+  if (clientType === ANDROID_CLIENT_TYPE) {
+    const apiSession = await createApiSession(env, row.id, ANDROID_CLIENT_TYPE);
     return json({
       ok: true,
       user: { id: row.id, username: row.username, role: row.role },
-      accessToken: mobileSession.accessToken,
-      refreshToken: mobileSession.refreshToken,
-      expiresIn: mobileSession.expiresIn,
+      accessToken: apiSession.accessToken,
+      refreshToken: apiSession.refreshToken,
+      expiresIn: apiSession.expiresIn,
+      refreshExpiresIn: API_REFRESH_TTL_SECONDS,
+      sessionId: apiSession.sessionId,
     });
   }
 
@@ -265,20 +229,84 @@ async function handleLogin(request, env) {
 
 async function handleMobileLogin(request, env) {
   const body = await parseJson(request);
-  body.clientType = "android";
+  body.clientType = ANDROID_CLIENT_TYPE;
   return handleLogin(withJsonBody(request, body), env);
 }
 
 async function handleMobileRefresh(request, env) {
-  return rotateApiSessionTokens(request, env, "android");
+  return rotateApiSessionTokens(request, env, ANDROID_CLIENT_TYPE, { includeRefreshExpiresIn: true });
 }
 
 async function handleMobileLogout(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "mobile" || auth.apiClientType !== "android") {
+  if (auth.sessionKind !== "api" || auth.apiClientType !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Mobile bearer token required" }, 400);
   }
+  await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
+  return json({ ok: true });
+}
+
+async function handleApiCapabilities(request, env) {
+  const corsOrigins = String(env.CORS_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  return json({
+    apiVersion: "v1",
+    compatibleClients: [ANDROID_CLIENT_TYPE, "browser_extension"],
+    auth: {
+      scheme: "Bearer",
+      accessTokenExpiresIn: API_ACCESS_TTL_SECONDS,
+      refreshTokenExpiresIn: API_REFRESH_TTL_SECONDS,
+      refreshTokenRotation: true,
+      turnstileRequired: hasTurnstileSecret(env),
+    },
+    limits: {
+      extensionBatchMaxIds: EXTENSION_BATCH_MAX_IDS,
+    },
+    cors: {
+      exactOriginAllowlist: true,
+      configured: corsOrigins.length > 0,
+    },
+    endpoints: {
+      login: "/api/v1/auth/login",
+      refresh: "/api/v1/auth/refresh",
+      logout: "/api/v1/auth/logout",
+      me: "/api/v1/me",
+      entries: "/api/v1/entries",
+      groups: "/api/v1/groups",
+      codesBatch: "/api/v1/codes/batch",
+    },
+  });
+}
+
+async function handleApiClientLogin(request, env) {
+  const body = await parseJson(request);
+  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
+
+  if (clientType === "browser_extension") {
+    body.clientType = EXTENSION_CLIENT_TYPE;
+    return handleExtensionLogin(withJsonBody(request, body), env);
+  }
+
+  body.clientType = ANDROID_CLIENT_TYPE;
+  return handleLogin(withJsonBody(request, body), env);
+}
+
+async function handleApiClientRefresh(request, env) {
+  const body = await parseJson(request);
+  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
+  const expected = clientType === "browser_extension" ? EXTENSION_CLIENT_TYPE : ANDROID_CLIENT_TYPE;
+  return rotateApiSessionTokens(withJsonBody(request, body), env, expected, { includeRefreshExpiresIn: true });
+}
+
+async function handleApiClientLogout(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
   return json({ ok: true });
 }
@@ -309,11 +337,12 @@ async function handleExtensionLogin(request, env) {
 
   const ok = await verifyPassword(password, row.password_salt, row.password_hash);
   if (!ok) return json({ error: "Invalid credentials" }, 401);
+  await clearLoginRiskControl(request, env, username).catch(() => {});
 
   const deviceName = normalizeClientMetadata(body.deviceName, 120, "edge");
   const clientVersion = normalizeClientMetadata(body.clientVersion, 64, "unknown");
   const clientType = `${EXTENSION_CLIENT_TYPE}:${deviceName}:${clientVersion}`;
-  const apiSession = await createMobileSession(env, row.id, clientType);
+  const apiSession = await createApiSession(env, row.id, clientType);
 
   return json({
     ok: true,
@@ -321,7 +350,7 @@ async function handleExtensionLogin(request, env) {
     accessToken: apiSession.accessToken,
     refreshToken: apiSession.refreshToken,
     expiresIn: apiSession.expiresIn,
-    refreshExpiresIn: MOBILE_REFRESH_TTL_SECONDS,
+    refreshExpiresIn: API_REFRESH_TTL_SECONDS,
     sessionId: apiSession.sessionId,
   });
 }
@@ -355,7 +384,17 @@ async function handleExtensionCodesBatch(request, env) {
   if (!isExtensionClientType(auth.apiClientType)) {
     return json({ error: "Extension bearer token required" }, 400);
   }
+  return handleCodesBatchForAuth(request, env, auth);
+}
 
+async function handleApiCodesBatch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
+  return handleCodesBatchForAuth(request, env, auth);
+}
+
+async function handleCodesBatchForAuth(request, env, auth) {
   const body = await parseJson(request);
   if (!Array.isArray(body.entryIds)) return json({ error: "entryIds must be an array" }, 400);
 
@@ -407,8 +446,8 @@ async function handleExtensionCodesBatch(request, env) {
     }
 
     try {
-      const period = Number(row.period || 30);
-      const digits = Number(row.digits || 6);
+      const period = normalizeTotpPeriod(row.period);
+      const digits = normalizeOtpDigits(row.digits);
       const algorithm = String(row.algorithm || "SHA-1");
       const secret = await decryptText(row.secret_enc, env);
       const step = Math.floor(nowSec / period);
@@ -510,15 +549,17 @@ async function handleCreateEntry(request, env) {
   const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-1");
   const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
   const hotpCounter = Number(payload.hotpCounter || 0);
-  const groupId = payload.groupId ? Number(payload.groupId) : null;
-  const requestedUserId = Number(payload.userId || auth.user.id);
+  const groupId = parseOptionalPositiveId(payload.groupId);
+  const requestedUserId = Number(payload.userId !== undefined ? payload.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
 
   if (!label || !secret) return json({ error: "label and secret are required" }, 400);
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
   if (!algorithm) return json({ error: "algorithm must be SHA-1/SHA-256/SHA-512" }, 400);
-  if (otpType === "hotp" && (!Number.isFinite(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   try {
     const bytes = base32Decode(secret);
@@ -534,7 +575,7 @@ async function handleCreateEntry(request, env) {
   if (groupId) {
     const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
     if (!group) return json({ error: "groupId does not exist" }, 400);
-    if (auth.user.role !== "admin" && group.user_id !== auth.user.id) return json({ error: "Forbidden group" }, 403);
+    if (Number(group.user_id) !== Number(userId)) return json({ error: "groupId must belong to entry user" }, 400);
   }
 
   const secretEnc = await encryptText(secret, env);
@@ -551,7 +592,7 @@ async function handleCreateEntry(request, env) {
 async function handleUpdateEntry(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const existing = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -566,13 +607,14 @@ async function handleUpdateEntry(request, env) {
   const algorithm = body.algorithm ? normalizeAlgorithm(body.algorithm) : existing.algorithm;
   const otpType = body.otpType ? (body.otpType === "hotp" ? "hotp" : "totp") : (existing.otp_type || "totp");
   const hotpCounter = body.hotpCounter !== undefined ? Number(body.hotpCounter) : (existing.hotp_counter || 0);
-  const groupId = body.groupId === null ? null : body.groupId !== undefined ? Number(body.groupId) : existing.group_id;
+  const groupId = body.groupId !== undefined ? parseOptionalPositiveId(body.groupId) : existing.group_id;
 
   if (!label) return json({ error: "label is required" }, 400);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
   if (!algorithm) return json({ error: "algorithm must be SHA-1/SHA-256/SHA-512" }, 400);
-  if (otpType === "hotp" && (!Number.isFinite(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   let secretEnc = existing.secret_enc;
   if (body.secret !== undefined) {
@@ -590,7 +632,7 @@ async function handleUpdateEntry(request, env) {
   if (groupId) {
     const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
     if (!group) return json({ error: "groupId does not exist" }, 400);
-    if (auth.user.role !== "admin" && group.user_id !== auth.user.id) return json({ error: "Forbidden group" }, 403);
+    if (Number(group.user_id) !== Number(existing.user_id)) return json({ error: "groupId must belong to entry user" }, 400);
   }
 
   await env.DB.prepare(
@@ -604,7 +646,7 @@ async function handleUpdateEntry(request, env) {
 async function handleEntryCode(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -617,16 +659,18 @@ async function handleEntryCode(request, env) {
     return json({ error: "Use /api/entries/:id/hotp to generate HOTP code" }, 400);
   }
   const nowSec = Math.floor(Date.now() / 1000);
-  const step = Math.floor(nowSec / row.period);
-  const code = await generateTotp(secret, row.period, row.digits, row.algorithm, step);
-  const expiresIn = row.period - (nowSec % row.period);
+  const period = normalizeTotpPeriod(row.period);
+  const digits = normalizeOtpDigits(row.digits);
+  const step = Math.floor(nowSec / period);
+  const code = await generateTotp(secret, period, digits, row.algorithm, step);
+  const expiresIn = period - (nowSec % period);
   return json({ code, expiresIn, now: nowSec, otpType: "totp" });
 }
 
 async function handleConsumeHotp(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -636,7 +680,8 @@ async function handleConsumeHotp(request, env) {
 
   const secret = await decryptText(row.secret_enc, env);
   const counter = Number(row.hotp_counter || 0);
-  const code = await generateHotp(secret, row.digits, row.algorithm, counter);
+  const digits = normalizeOtpDigits(row.digits);
+  const code = await generateHotp(secret, digits, row.algorithm, counter);
   
   // Use transactional update with counter verification to prevent race condition
   const nextCounter = counter + 1;
@@ -676,9 +721,14 @@ async function handleCreateGroup(request, env) {
   const body = await parseJson(request);
   const name = String(body.name || "").trim();
   const color = validHexColor(body.color) ? body.color : "#0f766e";
-  const requestedUserId = Number(body.userId || auth.user.id);
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
   if (!name) return json({ error: "name is required" }, 400);
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (auth.user.role === "admin") {
+    const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    if (!exists) return json({ error: "userId does not exist" }, 400);
+  }
 
   try {
     const result = await env.DB.prepare(
@@ -695,7 +745,7 @@ async function handleCreateGroup(request, env) {
 async function handleDeleteGroup(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "groups");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(id).first();
@@ -752,11 +802,12 @@ async function handleImportOtpAuth(request, env) {
   if (!text.trim()) return json({ error: "text is required" }, 400);
 
   // Non-admin users can ONLY import to their own account (security fix)
-  const requestedUserId = Number(body.userId || auth.user.id);
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
     return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
   }
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
     if (!exists) return json({ error: "userId does not exist" }, 400);
@@ -783,11 +834,11 @@ async function handleImportOtpAuth(request, env) {
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) throw new Error("invalid");
-      const digits = [6, 7, 8].includes(Number(data.digits)) ? Number(data.digits) : 6;
-      const period = Number(data.period) > 0 ? Number(data.period) : 30;
+      const digits = normalizeOtpDigits(data.digits);
+      const period = normalizeTotpPeriod(data.period);
       const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1") || "SHA-1";
       const otpType = data.otpType === "hotp" ? "hotp" : "totp";
-      const hotpCounter = Number(data.hotpCounter) >= 0 ? Number(data.hotpCounter) : 0;
+      const hotpCounter = normalizeHotpCounter(data.hotpCounter);
       const secretEnc = await encryptText(secret, env);
       await env.DB.prepare(
         "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
@@ -844,11 +895,16 @@ async function importPayload(body, auth, env) {
 
   // Admin can only import to their own account unless explicitly managing another user
   // Non-admin users can ONLY import to their own account (security fix)
-  const requestedUserId = Number(body.userId || auth.user.id);
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
     return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
   }
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (auth.user.role === "admin") {
+    const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    if (!exists) return json({ error: "userId does not exist" }, 400);
+  }
 
   const groupMap = new Map();
   for (const g of groups) {
@@ -883,9 +939,9 @@ async function importPayload(body, auth, env) {
     const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
     const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
     const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1") || "SHA-1";
-    const digits = [6, 7, 8].includes(Number(e.digits)) ? Number(e.digits) : 6;
-    const period = Number(e.period) > 0 ? Number(e.period) : 30;
-    const hotpCounter = Number(e.hotp_counter) >= 0 ? Number(e.hotp_counter) : 0;
+    const digits = normalizeOtpDigits(e.digits);
+    const period = normalizeTotpPeriod(e.period);
+    const hotpCounter = normalizeHotpCounter(e.hotp_counter);
     const secretEnc = await encryptText(secret, env);
 
     await env.DB.prepare(
@@ -936,7 +992,7 @@ async function handleImportDataEncrypted(request, env) {
 async function handleDeleteEntry(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT id, user_id FROM totp_entries WHERE id = ?").bind(id).first();
@@ -988,13 +1044,18 @@ async function handleUpdateUserRole(request, env) {
   if (!auth.ok) return auth.response;
   if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   const body = await parseJson(request);
   const role = body.role === "admin" ? "admin" : body.role === "user" ? "user" : null;
   if (!role) return json({ error: "role must be admin or user" }, 400);
   if (id === auth.user.id && role !== "admin") {
     return json({ error: "Cannot demote yourself" }, 400);
+  }
+  const target = await env.DB.prepare("SELECT id, role FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+  if (target.role === "admin" && role !== "admin" && (await countAdmins(env)) <= 1) {
+    return json({ error: "Cannot remove the last admin" }, 400);
   }
 
   await env.DB.prepare("UPDATE users SET role = ? WHERE id = ?").bind(role, id).run();
@@ -1006,9 +1067,15 @@ async function handleDeleteUser(request, env) {
   if (!auth.ok) return auth.response;
   if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   if (id === auth.user.id) return json({ error: "Cannot delete yourself" }, 400);
+
+  const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+  if (target.role === "admin" && (await countAdmins(env)) <= 1) {
+    return json({ error: "Cannot delete the last admin" }, 400);
+  }
 
   // Cascade delete: remove all related data before deleting user
   // This prevents orphaned records and ensures data consistency
@@ -1016,7 +1083,7 @@ async function handleDeleteUser(request, env) {
   await env.DB.prepare("DELETE FROM groups WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(id).run();
-  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(await getUsernameById(env, id)).run();
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(target.username).run();
   await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
   return json({ ok: true });
 }
@@ -1061,6 +1128,11 @@ async function handleUpdateLoginPolicy(request, env) {
 async function hasAnyUser(env) {
   const row = await env.DB.prepare("SELECT id FROM users LIMIT 1").first();
   return !!row;
+}
+
+async function countAdmins(env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").first();
+  return Number(row?.count || 0);
 }
 
 async function getUsernameById(env, userId) {
@@ -1125,15 +1197,17 @@ async function applyLoginRiskControl(request, env, username) {
   return { blocked: false };
 }
 
+async function clearLoginRiskControl(request, env, username) {
+  const ip = String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
+    .split(",")[0]
+    .trim();
+  const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE key = ?").bind(riskKey).run();
+}
+
 async function verifyTurnstileToken(token, remoteip, env) {
   const secretKey = String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
-  // Require Turnstile verification when configured - do not allow bypass
-  if (!secretKey) {
-    // If no secret key is configured, log a warning but still require token presence
-    // This prevents silent bypass in production environments
-    console.warn("TURNSTILE_SECRET_KEY not configured - Turnstile verification disabled");
-    return { ok: true };
-  }
+  if (!secretKey) return { ok: false };
   if (!token) return { ok: false };
   const body = new URLSearchParams();
   body.set("secret", secretKey);
@@ -1169,9 +1243,9 @@ async function getCurrentUser(request, env) {
       await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
       return {
         user: { id: row.id, username: row.username, role: row.role },
-        sessionKind: "mobile",
+        sessionKind: "api",
         sessionId: row.session_id,
-        apiClientType: String(row.client_type || "android"),
+        apiClientType: String(row.client_type || ANDROID_CLIENT_TYPE),
       };
     }
   }
@@ -1218,15 +1292,15 @@ async function cleanExpiredSessions(env) {
   await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
 }
 
-async function createMobileSession(env, userId, clientType) {
+async function createApiSession(env, userId, clientType) {
   const accessToken = randomHex(32);
   const refreshToken = randomHex(32);
   const tokenHash = await hashSessionToken(accessToken, env);
   const refreshHash = await hashSessionToken(refreshToken, env);
   const now = new Date();
   const createdAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
-  const refreshExpiresAt = new Date(now.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(now.getTime() + API_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(now.getTime() + API_REFRESH_TTL_SECONDS * 1000).toISOString();
 
   await env.DB.prepare(
     "INSERT INTO api_sessions (user_id, token_hash, refresh_hash, expires_at, refresh_expires_at, created_at, last_used_at, client_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -1241,7 +1315,11 @@ async function createMobileSession(env, userId, clientType) {
       ).bind(tokenHash, userId).first()
     )?.id
   );
-  return { accessToken, refreshToken, expiresIn: MOBILE_ACCESS_TTL_SECONDS, sessionId };
+  return { accessToken, refreshToken, expiresIn: API_ACCESS_TTL_SECONDS, sessionId };
+}
+
+function hasTurnstileSecret(env) {
+  return !!String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
 }
 
 async function rotateApiSessionTokens(request, env, expectedClientType, options = {}) {
@@ -1258,7 +1336,7 @@ async function rotateApiSessionTokens(request, env, expectedClientType, options 
     .first();
   if (!row) return json({ error: "Invalid refresh token" }, 401);
 
-  if (expectedClientType === "android" && String(row.client_type || "") !== "android") {
+  if (expectedClientType === ANDROID_CLIENT_TYPE && String(row.client_type || "") !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Invalid refresh token" }, 401);
   }
   if (expectedClientType === EXTENSION_CLIENT_TYPE && !isExtensionClientType(String(row.client_type || ""))) {
@@ -1270,30 +1348,42 @@ async function rotateApiSessionTokens(request, env, expectedClientType, options 
   const accessHash = await hashSessionToken(accessToken, env);
   const newRefreshHash = await hashSessionToken(newRefreshToken, env);
   const nowDate = new Date();
-  const expiresAt = new Date(nowDate.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
-  const refreshExpiresAt = new Date(nowDate.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(nowDate.getTime() + API_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(nowDate.getTime() + API_REFRESH_TTL_SECONDS * 1000).toISOString();
 
-  await env.DB.prepare(
-    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ?"
+  const result = await env.DB.prepare(
+    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ? AND refresh_hash = ?"
   )
-    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id)
+    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id, refreshHash)
     .run();
+  if (result.meta?.changes === 0) {
+    return json({ error: "Refresh token already used" }, 409);
+  }
 
   const payload = {
     ok: true,
     user: { id: row.user_id, username: row.username, role: row.role },
     accessToken,
     refreshToken: newRefreshToken,
-    expiresIn: MOBILE_ACCESS_TTL_SECONDS,
+    expiresIn: API_ACCESS_TTL_SECONDS,
   };
   if (options.includeRefreshExpiresIn) {
-    payload.refreshExpiresIn = MOBILE_REFRESH_TTL_SECONDS;
+    payload.refreshExpiresIn = API_REFRESH_TTL_SECONDS;
   }
   return json(payload);
 }
 
 function isExtensionClientType(clientType) {
   return String(clientType || "") === EXTENSION_CLIENT_TYPE || String(clientType || "").startsWith(`${EXTENSION_CLIENT_TYPE}:`);
+}
+
+function normalizeApiClientType(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === ANDROID_CLIENT_TYPE) return ANDROID_CLIENT_TYPE;
+  if (["browser_extension", "extension", "edge_extension", "chrome_extension"].includes(v)) {
+    return "browser_extension";
+  }
+  return "";
 }
 
 function normalizeClientMetadata(value, maxLen, fallback) {
@@ -1512,6 +1602,21 @@ function normalizeAlgorithm(value) {
   return null;
 }
 
+function normalizeOtpDigits(value) {
+  const digits = Number(value);
+  return [6, 7, 8].includes(digits) ? digits : 6;
+}
+
+function normalizeTotpPeriod(value) {
+  const period = Number(value);
+  return Number.isInteger(period) && period >= 15 && period <= 120 ? period : 30;
+}
+
+function normalizeHotpCounter(value) {
+  const counter = Number(value);
+  return Number.isInteger(counter) && counter >= 0 ? counter : 0;
+}
+
 function normalizeUsername(v) {
   const out = String(v || "").trim().toLowerCase();
   return /^[a-z0-9_.-]{3,40}$/.test(out) ? out : "";
@@ -1550,9 +1655,12 @@ function readBearerToken(request) {
 }
 
 function withJsonBody(request, data) {
+  const headers = new Headers(request.headers);
+  headers.set("content-type", "application/json");
+  headers.delete("content-length");
   return new Request(request.url, {
     method: request.method,
-    headers: request.headers,
+    headers,
     body: JSON.stringify(data),
   });
 }
@@ -1576,18 +1684,32 @@ function normalizeDbId(value) {
   return null;
 }
 
+function pathResourceId(request, resource) {
+  const parts = new URL(request.url).pathname.split("/").filter(Boolean);
+  const idx = parts.indexOf(resource);
+  if (idx < 0 || idx + 1 >= parts.length) return NaN;
+  return Number(parts[idx + 1]);
+}
+
+function parseOptionalPositiveId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  return id;
+}
+
 function randomHex(byteLen) {
   const arr = crypto.getRandomValues(new Uint8Array(byteLen));
   return [...arr].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 async function parseJson(request) {
+  const text = await request.text();
+  if (!text.trim()) return {};
   try {
-    return await request.json();
-  } catch (e) {
-    // Log parsing error and return empty object to prevent logic bypass
-    console.warn("JSON parse error:", e instanceof Error ? e.message : String(e));
-    return {};
+    return JSON.parse(text);
+  } catch {
+    throw new ApiError(400, "Invalid JSON body");
   }
 }
 
@@ -1624,14 +1746,63 @@ function b64ToBytes(b64) {
   return out;
 }
 
-function json(data, status = 200, headers = {}) {
-  // Add security headers to all JSON responses
-  const securityHeaders = {
+function corsPreflight(request, env) {
+  const origin = allowedCorsOrigin(request, env);
+  if (!origin) return new Response(null, { status: 403 });
+  const headers = corsHeaders(origin);
+  headers.set("Access-Control-Max-Age", "86400");
+  return new Response(null, { status: 204, headers });
+}
+
+function withCors(request, response, env) {
+  const origin = allowedCorsOrigin(request, env);
+  if (!origin) return response;
+  const next = new Response(response.body, response);
+  const headers = corsHeaders(origin);
+  for (const [key, value] of headers) next.headers.set(key, value);
+  next.headers.set("Vary", appendVary(next.headers.get("Vary"), "Origin"));
+  return next;
+}
+
+function corsHeaders(origin) {
+  return new Headers({
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": CORS_ALLOWED_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOWED_HEADERS,
+    "Access-Control-Allow-Credentials": "true",
+  });
+}
+
+function allowedCorsOrigin(request, env) {
+  const origin = String(request.headers.get("origin") || "").trim();
+  if (!origin) return "";
+  const allowed = String(env.CORS_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return allowed.includes(origin) ? origin : "";
+}
+
+function appendVary(current, value) {
+  const parts = String(current || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!parts.some((item) => item.toLowerCase() === value.toLowerCase())) parts.push(value);
+  return parts.join(", ");
+}
+
+function commonSecurityHeaders() {
+  return {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "1; mode=block",
     "Referrer-Policy": "strict-origin-when-cross-origin",
   };
+}
+
+function json(data, status = 200, headers = {}) {
+  const securityHeaders = commonSecurityHeaders();
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -1645,7 +1816,22 @@ function json(data, status = 200, headers = {}) {
 
 function html(markup) {
   return new Response(markup, {
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "Content-Security-Policy": [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "connect-src 'self' https://api.qrserver.com https://challenges.cloudflare.com",
+        "frame-src https://challenges.cloudflare.com",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+      ].join("; "),
+      ...commonSecurityHeaders(),
+    },
   });
 }
 
