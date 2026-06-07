@@ -5,8 +5,8 @@ const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
 const CLOSE_SOON_HEADER = "x-session-close";
 const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
-const PBKDF2_ITERATIONS = 600_000;
-const LEGACY_PBKDF2_ITERATIONS = 100_000;
+// Keep hashing strong while avoiding CPU limit spikes on Cloudflare Workers.
+const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_HASH = "SHA-256";
 const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase, number, and symbol";
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
@@ -1686,14 +1686,14 @@ async function verifyPassword(password, saltB64, expectedHashB64) {
 }
 
 async function verifyPasswordDetailed(password, saltB64, expectedHashB64) {
-  const expected = b64ToBytes(expectedHashB64);
-  const current = await hashPassword(password, saltB64, PBKDF2_ITERATIONS);
-  if (constantTimeEqual(b64ToBytes(current.hashB64), expected)) {
-    return { ok: true, needsRehash: false };
-  }
-  const legacy = await hashPassword(password, saltB64, LEGACY_PBKDF2_ITERATIONS);
-  if (constantTimeEqual(b64ToBytes(legacy.hashB64), expected)) {
-    return { ok: true, needsRehash: true };
+  try {
+    const expected = b64ToBytes(expectedHashB64);
+    const current = await hashPassword(password, saltB64, PBKDF2_ITERATIONS);
+    if (constantTimeEqual(b64ToBytes(current.hashB64), expected)) {
+      return { ok: true, needsRehash: false };
+    }
+  } catch {
+    return { ok: false, needsRehash: false };
   }
   return { ok: false, needsRehash: false };
 }

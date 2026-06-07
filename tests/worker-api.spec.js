@@ -89,11 +89,11 @@ function loginRiskDb(state = {}) {
   };
 }
 
-function passwordHash(password, saltB64, iterations = 600_000) {
+function passwordHash(password, saltB64, iterations = 100_000) {
   return pbkdf2Sync(password, Buffer.from(saltB64, "base64"), iterations, 32, "sha256").toString("base64");
 }
 
-function legacyWebLoginDb(state = {}) {
+function legacyWebLoginDb(state = {}, userOverrides = {}) {
   const saltB64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
   const user = {
     id: 1,
@@ -101,6 +101,7 @@ function legacyWebLoginDb(state = {}) {
     role: "admin",
     password_salt: saltB64,
     password_hash: passwordHash("correct horse battery", saltB64),
+    ...userOverrides,
   };
   return {
     prepare(sql) {
@@ -346,6 +347,28 @@ test("web login remains compatible with pre-api-session D1 schema", async () => 
   assert.equal(body.user.username, "admin");
   assert.match(response.headers.get("set-cookie"), /__Host-session=/);
   assert.ok(state.runs.some((sql) => sql === "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"));
+});
+
+test("malformed stored password hashes fail login without a 500", async () => {
+  const state = {};
+  const request = new Request("https://example.com/api/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username: "admin", password: "correct horse battery" }),
+  });
+
+  const response = await worker.fetch(
+    request,
+    envWithDb(legacyWebLoginDb(state, { password_hash: "not valid base64!" })),
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(body.error, "Invalid credentials");
+  assert.equal(state.runs.some((sql) => sql.includes("INSERT INTO sessions")), false);
 });
 
 test("v1 me accepts API bearer sessions", async () => {
