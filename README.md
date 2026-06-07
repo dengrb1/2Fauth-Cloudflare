@@ -58,8 +58,10 @@ Optional settings:
 
 - `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login.
 - `TURNSTILE_SITE_KEY`: renders Turnstile in the Web UI.
-- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions, for example `chrome-extension://<id>,moz-extension://<id>`.
-- `DEBUG_ERRORS`: when truthy, includes internal error details in JSON error responses.
+- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions, for example `chrome-extension://<id>,moz-extension://<id>`. Wildcards are ignored.
+- `ALLOW_PLAINTEXT_EXPORT`: set to `true` only if you need `/api/export` or `/api/export/otpauth`; encrypted export stays available without this.
+- `API_RATE_MAX_REQUESTS_PER_MINUTE`: optional per-session/IP API rate limit, default `120`.
+- `DEBUG_ERRORS`: set to `true` only outside production to include internal error details in JSON error responses.
 
 ## Database Migrations
 
@@ -113,7 +115,8 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 ## Security Notes
 
 - Never commit real secrets or production `wrangler.toml` values.
-- Treat export payloads as sensitive.
-- Prefer encrypted export when sharing backups.
+- Treat export payloads as sensitive. Plaintext export is disabled by default; prefer encrypted export when sharing backups.
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.
 - Configure `CORS_ALLOWED_ORIGINS` with exact browser-extension origins, not wildcards.
+- New passwords must be at least 12 characters and include uppercase, lowercase, number, and symbol.
+- New OTP entries accept SHA-256 or SHA-512 algorithms only.

@@ -205,8 +205,25 @@ test("web UI responses include HTML security headers", async () => {
 
   assert.equal(response.status, 200);
   assert.match(response.headers.get("Content-Security-Policy"), /frame-ancestors 'none'/);
+  assert.doesNotMatch(response.headers.get("Content-Security-Policy"), /unsafe-inline/);
+  assert.match(response.headers.get("Content-Security-Policy"), /'nonce-[0-9a-f]{32}'/);
   assert.equal(response.headers.get("X-Frame-Options"), "DENY");
   assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+});
+
+test("wildcard CORS allowlist is ignored when credentials are enabled", async () => {
+  const request = new Request("https://example.com/api/v1/me", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://evil.example",
+      "Access-Control-Request-Method": "GET",
+    },
+  });
+
+  const response = await worker.fetch(request, { ...envWithDb(emptyDb()), CORS_ALLOWED_ORIGINS: "*" }, ctx());
+
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), null);
 });
 
 test("rejects unconfigured extension origin preflight", async () => {
@@ -276,6 +293,45 @@ test("v1 me accepts API bearer sessions", async () => {
   assert.equal(response.status, 200);
   assert.deepEqual(body.user, { id: 3, username: "alice", role: "user" });
   assert.ok(state.runs.some((sql) => sql.includes("UPDATE api_sessions SET last_used_at")));
+});
+
+test("generic API rate limit rejects excessive authenticated requests", async () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const db = {
+    prepare(sql) {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM login_risk_control")) {
+            return { key: "api-key", window_start: nowSec, request_count: 10, lock_until: 0 };
+          }
+          throw new Error(`Unexpected first() query: ${sql}`);
+        },
+        async run() {
+          return { meta: { changes: 1 } };
+        },
+      };
+      return statement;
+    },
+  };
+  const request = new Request("https://example.com/api/v1/me", {
+    headers: {
+      Authorization: "Bearer access-token",
+    },
+  });
+
+  const response = await worker.fetch(
+    request,
+    { ...envWithDb(db), API_RATE_MAX_REQUESTS_PER_MINUTE: "10" },
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 429);
+  assert.equal(body.error, "Too many API requests");
+  assert.equal(response.headers.get("Retry-After") !== null, true);
 });
 
 test("v1 logout deletes the authenticated API session", async () => {
@@ -360,7 +416,79 @@ test("admin cannot bind an entry to another user's group", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(body.error, "groupId must belong to entry user");
-  assert.equal(db.state.inserts, 0);
+  assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+});
+
+test("plaintext export is disabled unless explicitly enabled", async () => {
+  const db = adminSessionDb({});
+  const request = new Request("https://example.com/api/export?confirm=plaintext", {
+    headers: {
+      Authorization: "Bearer access-token",
+      "x-plaintext-export-confirm": "true",
+    },
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 403);
+  assert.equal(body.error, "Plaintext export is disabled. Use /api/export/encrypted.");
+});
+
+test("creating entries rejects SHA-1 OTP algorithms", async () => {
+  const db = adminSessionDb({});
+  const request = new Request("https://example.com/api/v1/entries", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      label: "Email",
+      secret: "JBSWY3DPEHPK3PXP",
+      algorithm: "SHA-1",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "algorithm must be SHA-256 or SHA-512");
+  assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+});
+
+test("bootstrap rejects weak passwords before hashing", async () => {
+  const db = {
+    prepare(sql) {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          if (sql.includes("SELECT id FROM users LIMIT 1")) return null;
+          throw new Error(`Unexpected first() query: ${sql}`);
+        },
+        async run() {
+          throw new Error(`Unexpected run() query: ${sql}`);
+        },
+      };
+      return statement;
+    },
+  };
+  const request = new Request("https://example.com/api/bootstrap", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username: "admin", password: "longpassword" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /uppercase, lowercase, number, and symbol/);
 });
 
 test("cannot demote the last admin", async () => {

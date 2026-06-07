@@ -47,10 +47,12 @@ Request:
 ```json
 {
   "username": "alice",
-  "password": "long-password",
+  "password": "Long-password-123",
   "clientType": "android"
 }
 ```
+
+Passwords created through bootstrap or user management must be at least 12 characters and include uppercase, lowercase, number, and symbol.
 
 For browser extensions, use `"clientType": "browser_extension"` and optionally include:
 
@@ -101,6 +103,7 @@ All routes below require `Authorization: Bearer <accessToken>`.
 - `POST /api/v1/entries`
 - `PATCH /api/v1/entries/:id`
 - `GET /api/v1/entries/:id/code`
+- `POST /api/v1/entries/:id/verify`
 - `POST /api/v1/entries/:id/hotp`
 - `DELETE /api/v1/entries/:id`
 - `GET /api/v1/groups`
@@ -129,6 +132,35 @@ Batch code response:
 
 HOTP entries are not consumed by the batch endpoint. Use `POST /api/v1/entries/:id/hotp` for HOTP so the counter can be advanced atomically.
 
+New TOTP/HOTP entries accept `SHA-256` or `SHA-512` only. `POST /api/v1/entries/:id/verify` validates a submitted TOTP code with a +/-1 time-step window:
+
+```json
+{
+  "code": "123456"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "valid": true,
+  "window": 0
+}
+```
+
+## Export
+
+Encrypted export is the default safe export path:
+
+- `POST /api/export/encrypted`
+
+Plaintext export endpoints are disabled unless `ALLOW_PLAINTEXT_EXPORT=true` is configured and the request includes `confirm=plaintext` or `x-plaintext-export-confirm: true`:
+
+- `GET /api/export`
+- `GET /api/export/otpauth`
+
 ## Browser Extension CORS
 
 Set `CORS_ALLOWED_ORIGINS` as a comma-separated list of exact extension origins, for example:
@@ -138,6 +170,7 @@ chrome-extension://<extension-id>,moz-extension://<extension-id>
 ```
 
 The Worker does not allow cross-origin API reads by default.
+Wildcard origins are ignored when credentialed CORS is enabled.
 
 ## Legacy Routes
 
