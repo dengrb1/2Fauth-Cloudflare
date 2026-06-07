@@ -517,9 +517,7 @@ async function handleCloseSoon(request, env) {
   const tokenHash = await hashSessionToken(token, env);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + CLOSE_LOGOUT_GRACE_SECONDS * 1000).toISOString();
-  await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND client_type = 'web'")
-    .bind(expiresAt, tokenHash)
-    .run();
+  await updateWebSessionExpiry(env, tokenHash, expiresAt);
   return json({ ok: true });
 }
 
@@ -1230,9 +1228,15 @@ async function getUsernameById(env, userId) {
 }
 
 async function getLoginPolicy(env) {
-  const rows = await env.DB.prepare(
-    "SELECT key, value FROM app_settings WHERE key IN ('risk_max_requests_per_minute', 'risk_lock_minutes')"
-  ).all();
+  let rows;
+  try {
+    rows = await env.DB.prepare(
+      "SELECT key, value FROM app_settings WHERE key IN ('risk_max_requests_per_minute', 'risk_lock_minutes')"
+    ).all();
+  } catch (err) {
+    if (isMissingTableError(err, "app_settings")) return defaultLoginPolicy();
+    throw err;
+  }
   const map = new Map((rows.results || []).map((r) => [r.key, r.value]));
   const maxRequestsPerMinute = Number(map.get("risk_max_requests_per_minute") || DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE);
   const lockMinutes = Number(map.get("risk_lock_minutes") || DEFAULT_RISK_LOCK_MINUTES);
@@ -1242,16 +1246,29 @@ async function getLoginPolicy(env) {
   };
 }
 
+function defaultLoginPolicy() {
+  return {
+    maxRequestsPerMinute: DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE,
+    lockMinutes: DEFAULT_RISK_LOCK_MINUTES,
+  };
+}
+
 async function applyLoginRiskControl(request, env, username) {
   const nowSec = Math.floor(Date.now() / 1000);
   const policy = await getLoginPolicy(env);
   const ip = clientIp(request);
   const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
-  const row = await env.DB.prepare(
-    "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
-  )
-    .bind(riskKey)
-    .first();
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+    )
+      .bind(riskKey)
+      .first();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
+    throw err;
+  }
 
   if (row && Number(row.lock_until) > nowSec) {
     return {
@@ -1272,11 +1289,16 @@ async function applyLoginRiskControl(request, env, username) {
     lockUntil = nowSec + policy.lockMinutes * 60;
   }
 
-  await env.DB.prepare(
-    "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
-  )
-    .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
-    .run();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+    )
+      .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
+      .run();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
+    throw err;
+  }
 
   if (lockUntil > nowSec) {
     return { blocked: true, retryAfterSeconds: lockUntil - nowSec, lockUntil };
@@ -1296,11 +1318,17 @@ async function applyApiRateLimit(request, env, route) {
   const maxRequests = normalizeRateLimit(env.API_RATE_MAX_REQUESTS_PER_MINUTE, DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE);
   const subject = await apiRateLimitSubject(request, env);
   const rateKey = await sha256Base64(`api|${subject}`);
-  const row = await env.DB.prepare(
-    "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
-  )
-    .bind(rateKey)
-    .first();
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+    )
+      .bind(rateKey)
+      .first();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return null;
+    throw err;
+  }
 
   let windowStart = nowSec;
   let requestCount = 1;
@@ -1309,11 +1337,16 @@ async function applyApiRateLimit(request, env, route) {
     requestCount = Number(row.request_count) + 1;
   }
 
-  await env.DB.prepare(
-    "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
-  )
-    .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
-    .run();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+    )
+      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
+      .run();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return null;
+    throw err;
+  }
 
   if (requestCount > maxRequests) {
     return json(
@@ -1356,6 +1389,20 @@ function normalizeRateLimit(value, fallback) {
   return Number.isFinite(n) && n >= 10 && n <= 5000 ? Math.floor(n) : fallback;
 }
 
+function isMissingTableError(err, tableName) {
+  return dbErrorMessage(err).includes(`no such table: ${String(tableName).toLowerCase()}`);
+}
+
+function isMissingColumnError(err, columnName) {
+  const msg = dbErrorMessage(err);
+  const column = String(columnName).toLowerCase();
+  return msg.includes(`no such column: ${column}`) || msg.includes(`has no column named ${column}`);
+}
+
+function dbErrorMessage(err) {
+  return String(err?.message || err || "").toLowerCase();
+}
+
 function clientIp(request) {
   return String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
     .split(",")[0]
@@ -1391,11 +1438,16 @@ async function getCurrentUser(request, env) {
   if (bearerToken) {
     const tokenHash = await hashSessionToken(bearerToken, env);
     const now = nowIso();
-    const row = await env.DB.prepare(
-      "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
-    )
-      .bind(tokenHash, now, now)
-      .first();
+    let row = null;
+    try {
+      row = await env.DB.prepare(
+        "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
+      )
+        .bind(tokenHash, now, now)
+        .first();
+    } catch (err) {
+      if (!isMissingTableError(err, "api_sessions")) throw err;
+    }
     if (row) {
       await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
       return {
@@ -1425,11 +1477,7 @@ async function createSession(env, userId) {
   const tokenHash = await hashSessionToken(token, env);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
-  const result = await env.DB.prepare(
-    "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
-  )
-    .bind(userId, tokenHash, expiresAt, now.toISOString())
-    .run();
+  const result = await insertWebSession(env, userId, tokenHash, expiresAt, now.toISOString());
   let sessionId = normalizeDbId(result.meta?.last_row_id);
   if (!sessionId) {
     const row = await env.DB.prepare("SELECT id FROM sessions WHERE token_hash = ? AND user_id = ?")
@@ -1440,7 +1488,7 @@ async function createSession(env, userId) {
   if (sessionId) {
     await env.DB.prepare("DELETE FROM sessions WHERE user_id = ? AND id <> ?").bind(userId, sessionId).run();
   }
-  await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(userId).run();
+  await deleteApiSessionsForUser(env, userId);
 
   return { cookie: sessionCookie(token, SESSION_TTL_SECONDS) };
 }
@@ -1457,7 +1505,49 @@ async function refreshSessionTtl(request, env) {
 async function cleanExpiredSessions(env) {
   const now = nowIso();
   await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now).run();
-  await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
+  try {
+    await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
+  } catch (err) {
+    if (!isMissingTableError(err, "api_sessions")) throw err;
+  }
+}
+
+async function insertWebSession(env, userId, tokenHash, expiresAt, createdAt) {
+  try {
+    return await env.DB.prepare(
+      "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
+    )
+      .bind(userId, tokenHash, expiresAt, createdAt)
+      .run();
+  } catch (err) {
+    if (!isMissingColumnError(err, "client_type")) throw err;
+    return env.DB.prepare(
+      "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
+    )
+      .bind(userId, tokenHash, expiresAt, createdAt)
+      .run();
+  }
+}
+
+async function updateWebSessionExpiry(env, tokenHash, expiresAt) {
+  try {
+    await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND client_type = 'web'")
+      .bind(expiresAt, tokenHash)
+      .run();
+  } catch (err) {
+    if (!isMissingColumnError(err, "client_type")) throw err;
+    await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+      .bind(expiresAt, tokenHash)
+      .run();
+  }
+}
+
+async function deleteApiSessionsForUser(env, userId) {
+  try {
+    await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(userId).run();
+  } catch (err) {
+    if (!isMissingTableError(err, "api_sessions")) throw err;
+  }
 }
 
 async function createApiSession(env, userId, clientType) {

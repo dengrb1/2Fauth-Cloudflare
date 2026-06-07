@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { pbkdf2Sync } from "node:crypto";
 import test from "node:test";
 
 import worker from "../src/worker.js";
@@ -81,6 +82,54 @@ function loginRiskDb(state = {}) {
         async all() {
           if (sql.includes("FROM app_settings")) return { results: [] };
           throw new Error(`Unexpected all() query: ${sql}`);
+        },
+      };
+      return statement;
+    },
+  };
+}
+
+function passwordHash(password, saltB64, iterations = 600_000) {
+  return pbkdf2Sync(password, Buffer.from(saltB64, "base64"), iterations, 32, "sha256").toString("base64");
+}
+
+function legacyWebLoginDb(state = {}) {
+  const saltB64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
+  const user = {
+    id: 1,
+    username: "admin",
+    role: "admin",
+    password_salt: saltB64,
+    password_hash: passwordHash("correct horse battery", saltB64),
+  };
+  return {
+    prepare(sql) {
+      const statement = {
+        args: [],
+        bind(...args) {
+          statement.args = args;
+          state.binds = state.binds || [];
+          state.binds.push({ sql, args });
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM login_risk_control")) throw new Error("no such table: login_risk_control");
+          if (sql.includes("FROM users WHERE username = ?")) return user;
+          if (sql.includes("SELECT id FROM sessions WHERE token_hash = ?")) return { id: 10 };
+          return null;
+        },
+        async run() {
+          state.runs = state.runs || [];
+          state.runs.push(sql);
+          if (sql.includes("api_sessions")) throw new Error("no such table: api_sessions");
+          if (sql.includes("INSERT INTO sessions") && sql.includes("client_type")) {
+            throw new Error("table sessions has no column named client_type");
+          }
+          return { meta: { changes: 1, last_row_id: sql.includes("INSERT INTO sessions") ? 10 : undefined } };
+        },
+        async all() {
+          if (sql.includes("FROM app_settings")) throw new Error("no such table: app_settings");
+          return { results: [] };
         },
       };
       return statement;
@@ -277,6 +326,26 @@ test("TURNSTILE_KEY also enforces login verification", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(body.error, "Turnstile verification failed");
+});
+
+test("web login remains compatible with pre-api-session D1 schema", async () => {
+  const state = {};
+  const request = new Request("https://example.com/api/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username: "admin", password: "correct horse battery" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(legacyWebLoginDb(state)), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.user.username, "admin");
+  assert.match(response.headers.get("set-cookie"), /__Host-session=/);
+  assert.ok(state.runs.some((sql) => sql === "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"));
 });
 
 test("v1 me accepts API bearer sessions", async () => {
