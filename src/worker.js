@@ -1,18 +1,95 @@
-﻿const SESSION_COOKIE = "__Host-session";
+const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const MOBILE_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
-const MOBILE_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
+const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
 const CLOSE_SOON_HEADER = "x-session-close";
 const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
-// Keep hashing strong while avoiding CPU limit spikes on Workers.
+// Keep hashing strong while avoiding CPU limit spikes on Cloudflare Workers.
 const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_HASH = "SHA-256";
+const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase, number, and symbol";
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
+const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
+const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
+const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
+
+const API_ROUTES = [
+  ["GET", "/api/status", handleStatus],
+  ["POST", "/api/bootstrap", handleBootstrap],
+  ["POST", "/api/login", handleLogin],
+  ["POST", "/api/mobile/login", handleMobileLogin],
+  ["POST", "/api/mobile/refresh", handleMobileRefresh],
+  ["POST", "/api/mobile/logout", handleMobileLogout],
+  ["POST", "/api/extension/login", handleExtensionLogin],
+  ["POST", "/api/extension/refresh", handleExtensionRefresh],
+  ["POST", "/api/extension/logout", handleExtensionLogout],
+  ["GET", "/api/extension/entries", handleExtensionEntries],
+  ["POST", "/api/extension/codes/batch", handleExtensionCodesBatch],
+  ["GET", "/api/v1/capabilities", handleApiCapabilities],
+  ["POST", "/api/v1/auth/login", handleApiClientLogin],
+  ["POST", "/api/v1/auth/refresh", handleApiClientRefresh],
+  ["POST", "/api/v1/auth/logout", handleApiClientLogout],
+  ["GET", "/api/v1/me", handleMe],
+  ["PATCH", "/api/v1/me/password", handleChangeMyPassword],
+  ...entryRoutes("/api/v1"),
+  ...groupRoutes("/api/v1"),
+  ["POST", "/api/v1/codes/batch", handleApiCodesBatch],
+  ["POST", "/api/logout", handleLogout],
+  ["POST", "/api/session/close-soon", handleCloseSoon],
+  ["GET", "/api/me", handleMe],
+  ["PATCH", "/api/me/password", handleChangeMyPassword],
+  ...entryRoutes("/api"),
+  ...groupRoutes("/api"),
+  ["GET", "/api/export", handleExportData],
+  ["POST", "/api/export", handleExportData],
+  ["GET", "/api/export/otpauth", handleExportOtpAuth],
+  ["POST", "/api/export/otpauth", handleExportOtpAuth],
+  ["POST", "/api/export/encrypted", handleExportDataEncrypted],
+  ["POST", "/api/import", handleImportData],
+  ["POST", "/api/import/otpauth", handleImportOtpAuth],
+  ["POST", "/api/import/encrypted", handleImportDataEncrypted],
+  ["GET", "/api/users", handleListUsers],
+  ["POST", "/api/users", handleCreateUser],
+  ["PATCH", /^\/api\/users\/\d+\/role$/, handleUpdateUserRole],
+  ["PATCH", /^\/api\/users\/\d+\/password$/, handleResetUserPassword],
+  ["DELETE", /^\/api\/users\/\d+$/, handleDeleteUser],
+  ["GET", "/api/security/login-policy", handleGetLoginPolicy],
+  ["PATCH", "/api/security/login-policy", handleUpdateLoginPolicy],
+];
+
+function entryRoutes(prefix) {
+  return [
+    ["GET", `${prefix}/entries`, handleListEntries],
+    ["POST", `${prefix}/entries`, handleCreateEntry],
+    ["PATCH", routePattern(prefix, "/entries/\\d+"), handleUpdateEntry],
+    ["GET", routePattern(prefix, "/entries/\\d+/code"), handleEntryCode],
+    ["POST", routePattern(prefix, "/entries/\\d+/verify"), handleVerifyTotp],
+    ["POST", routePattern(prefix, "/entries/\\d+/hotp"), handleConsumeHotp],
+    ["DELETE", routePattern(prefix, "/entries/\\d+"), handleDeleteEntry],
+  ];
+}
+
+function groupRoutes(prefix) {
+  return [
+    ["GET", `${prefix}/groups`, handleListGroups],
+    ["POST", `${prefix}/groups`, handleCreateGroup],
+    ["DELETE", routePattern(prefix, "/groups/\\d+"), handleDeleteGroup],
+  ];
+}
+
+function routePattern(prefix, suffixPattern) {
+  return new RegExp(`^${escapeRegExp(prefix)}${suffixPattern}$`);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -30,144 +107,74 @@ export default {
       const method = request.method.toUpperCase();
       const path = url.pathname;
 
-      if (method === "GET" && path === "/") return html(appHtml(env));
-
-      if (method === "GET" && path === "/api/status") {
-        const initialized = await hasAnyUser(env);
-        return json({ initialized });
+      if (method === "OPTIONS") {
+        return corsPreflight(request, env);
       }
 
-      if (method === "POST" && path === "/api/bootstrap") {
-        return handleBootstrap(request, env);
-      }
-      if (method === "POST" && path === "/api/login") {
-        return handleLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/login") {
-        return handleMobileLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/refresh") {
-        return handleMobileRefresh(request, env);
-      }
-      if (method === "POST" && path === "/api/mobile/logout") {
-        return handleMobileLogout(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/login") {
-        return handleExtensionLogin(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/refresh") {
-        return handleExtensionRefresh(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/logout") {
-        return handleExtensionLogout(request, env);
-      }
-      if (method === "GET" && path === "/api/extension/entries") {
-        return handleExtensionEntries(request, env);
-      }
-      if (method === "POST" && path === "/api/extension/codes/batch") {
-        return handleExtensionCodesBatch(request, env);
-      }
-      if (method === "POST" && path === "/api/logout") {
-        return handleLogout(request, env);
-      }
-      if (method === "POST" && path === "/api/session/close-soon") {
-        return handleCloseSoon(request, env);
-      }
-      if (method === "GET" && path === "/api/me") {
-        return handleMe(request, env);
+      if (method === "GET" && path === "/") {
+        const nonce = randomHex(16);
+        return html(appHtml(env, nonce), nonce);
       }
 
-      if (method === "GET" && path === "/api/entries") {
-        return handleListEntries(request, env);
-      }
-      if (method === "POST" && path === "/api/entries") {
-        return handleCreateEntry(request, env);
-      }
-      if (method === "PATCH" && path.match(/^\/api\/entries\/\d+$/)) {
-        return handleUpdateEntry(request, env);
-      }
-      if (method === "GET" && path.match(/^\/api\/entries\/\d+\/code$/)) {
-        return handleEntryCode(request, env);
-      }
-      if (method === "POST" && path.match(/^\/api\/entries\/\d+\/hotp$/)) {
-        return handleConsumeHotp(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/entries\/\d+$/)) {
-        return handleDeleteEntry(request, env);
-      }
-
-      if (method === "GET" && path === "/api/groups") {
-        return handleListGroups(request, env);
-      }
-      if (method === "POST" && path === "/api/groups") {
-        return handleCreateGroup(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/groups\/\d+$/)) {
-        return handleDeleteGroup(request, env);
-      }
-
-      if (method === "GET" && path === "/api/export") {
-        return handleExportData(request, env);
-      }
-      if (method === "GET" && path === "/api/export/otpauth") {
-        return handleExportOtpAuth(request, env);
-      }
-      if (method === "POST" && path === "/api/export/encrypted") {
-        return handleExportDataEncrypted(request, env);
-      }
-      if (method === "POST" && path === "/api/import") {
-        return handleImportData(request, env);
-      }
-      if (method === "POST" && path === "/api/import/otpauth") {
-        return handleImportOtpAuth(request, env);
-      }
-      if (method === "POST" && path === "/api/import/encrypted") {
-        return handleImportDataEncrypted(request, env);
-      }
-
-      if (method === "GET" && path === "/api/users") {
-        return handleListUsers(request, env);
-      }
-      if (method === "POST" && path === "/api/users") {
-        return handleCreateUser(request, env);
-      }
-      if (method === "PATCH" && path.match(/^\/api\/users\/\d+\/role$/)) {
-        return handleUpdateUserRole(request, env);
-      }
-      if (method === "DELETE" && path.match(/^\/api\/users\/\d+$/)) {
-        return handleDeleteUser(request, env);
-      }
-      if (method === "GET" && path === "/api/security/login-policy") {
-        return handleGetLoginPolicy(request, env);
-      }
-      if (method === "PATCH" && path === "/api/security/login-policy") {
-        return handleUpdateLoginPolicy(request, env);
+      const route = findApiRoute(method, path);
+      if (route) {
+        const limited = await applyApiRateLimit(request, env, route);
+        if (limited) return withCors(request, limited, env);
+        return withCors(request, await route.handler(request, env), env);
       }
       if (method === "GET" && path === "/favicon.ico") {
         return new Response(null, { status: 204 });
       }
       if (method === "GET" && !path.startsWith("/api/")) {
-        return html(appHtml(env));
+        const nonce = randomHex(16);
+        return html(appHtml(env, nonce), nonce);
       }
 
-      return json({ error: "Not found" }, 404);
+      return withCors(request, json({ error: "Not found" }, 404), env);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Internal error";
-      return json({ error: "Internal Server Error", detail: message }, 500);
+      if (err instanceof ApiError) {
+        return withCors(request, json({ error: err.message }, err.status), env);
+      }
+      const payload = { error: "Internal Server Error" };
+      if (debugErrorsEnabled(env)) {
+        payload.detail = err instanceof Error ? err.message : "Internal error";
+      }
+      return withCors(request, json(payload, 500), env);
     }
   },
 };
 
-async function handleBootstrap(request, env) {
-  const initialized = await hasAnyUser(env);
-  if (initialized) return json({ error: "Already initialized" }, 400);
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
+function findApiRoute(method, path) {
+  for (const [routeMethod, matcher, handler] of API_ROUTES) {
+    if (routeMethod !== method) continue;
+    if (typeof matcher === "string" && matcher === path) return { method: routeMethod, matcher, handler };
+    if (matcher instanceof RegExp && matcher.test(path)) return { method: routeMethod, matcher, handler };
+  }
+  return null;
+}
+
+async function handleStatus(request, env) {
+  const initialized = await hasAnyUser(env);
+  return json({ initialized });
+}
+
+async function handleBootstrap(request, env) {
   const body = await parseJson(request);
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
   if (!username || !validPassword(password)) {
-    return json({ error: "Invalid username or password (min 10 chars)" }, 400);
+    return json({ error: `Invalid username or password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
   }
+
+  const initialized = await hasAnyUser(env);
+  if (initialized) return json({ error: "Already initialized" }, 400);
 
   const { hashB64, saltB64 } = await hashPassword(password);
   const now = nowIso();
@@ -208,7 +215,7 @@ async function handleLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
-  if (env.TURNSTILE_SECRET_KEY) {
+  if (hasTurnstileSecret(env)) {
     const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
     const ts = await verifyTurnstileToken(turnstileToken, ip, env);
     if (!ts.ok) {
@@ -223,18 +230,24 @@ async function handleLogin(request, env) {
     .first();
   if (!row) return json({ error: "Invalid credentials" }, 401);
 
-  const ok = await verifyPassword(password, row.password_salt, row.password_hash);
-  if (!ok) return json({ error: "Invalid credentials" }, 401);
+  const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
+  if (passwordCheck.needsRehash) {
+    await upgradePasswordHash(env, row.id, password).catch(() => {});
+  }
+  await clearLoginRiskControl(request, env, username).catch(() => {});
 
   const clientType = String(body.clientType || "").trim().toLowerCase();
-  if (clientType === "android") {
-    const mobileSession = await createMobileSession(env, row.id, "android");
+  if (clientType === ANDROID_CLIENT_TYPE) {
+    const apiSession = await createApiSession(env, row.id, ANDROID_CLIENT_TYPE);
     return json({
       ok: true,
       user: { id: row.id, username: row.username, role: row.role },
-      accessToken: mobileSession.accessToken,
-      refreshToken: mobileSession.refreshToken,
-      expiresIn: mobileSession.expiresIn,
+      accessToken: apiSession.accessToken,
+      refreshToken: apiSession.refreshToken,
+      expiresIn: apiSession.expiresIn,
+      refreshExpiresIn: API_REFRESH_TTL_SECONDS,
+      sessionId: apiSession.sessionId,
     });
   }
 
@@ -248,20 +261,81 @@ async function handleLogin(request, env) {
 
 async function handleMobileLogin(request, env) {
   const body = await parseJson(request);
-  body.clientType = "android";
+  body.clientType = ANDROID_CLIENT_TYPE;
   return handleLogin(withJsonBody(request, body), env);
 }
 
 async function handleMobileRefresh(request, env) {
-  return rotateApiSessionTokens(request, env, "android");
+  return rotateApiSessionTokens(request, env, ANDROID_CLIENT_TYPE, { includeRefreshExpiresIn: true });
 }
 
 async function handleMobileLogout(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "mobile" || auth.apiClientType !== "android") {
+  if (auth.sessionKind !== "api" || auth.apiClientType !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Mobile bearer token required" }, 400);
   }
+  await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
+  return json({ ok: true });
+}
+
+async function handleApiCapabilities(request, env) {
+  const corsOrigins = normalizedAllowedCorsOrigins(env);
+  return json({
+    apiVersion: "v1",
+    compatibleClients: [ANDROID_CLIENT_TYPE, "browser_extension"],
+    auth: {
+      scheme: "Bearer",
+      accessTokenExpiresIn: API_ACCESS_TTL_SECONDS,
+      refreshTokenExpiresIn: API_REFRESH_TTL_SECONDS,
+      refreshTokenRotation: true,
+      turnstileRequired: hasTurnstileSecret(env),
+    },
+    limits: {
+      extensionBatchMaxIds: EXTENSION_BATCH_MAX_IDS,
+    },
+    cors: {
+      exactOriginAllowlist: true,
+      configured: corsOrigins.length > 0,
+    },
+    endpoints: {
+      login: "/api/v1/auth/login",
+      refresh: "/api/v1/auth/refresh",
+      logout: "/api/v1/auth/logout",
+      me: "/api/v1/me",
+      entries: "/api/v1/entries",
+      groups: "/api/v1/groups",
+      codesBatch: "/api/v1/codes/batch",
+    },
+  });
+}
+
+async function handleApiClientLogin(request, env) {
+  const body = await parseJson(request);
+  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
+
+  if (clientType === "browser_extension") {
+    body.clientType = EXTENSION_CLIENT_TYPE;
+    return handleExtensionLogin(withJsonBody(request, body), env);
+  }
+
+  body.clientType = ANDROID_CLIENT_TYPE;
+  return handleLogin(withJsonBody(request, body), env);
+}
+
+async function handleApiClientRefresh(request, env) {
+  const body = await parseJson(request);
+  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
+  const expected = clientType === "browser_extension" ? EXTENSION_CLIENT_TYPE : ANDROID_CLIENT_TYPE;
+  return rotateApiSessionTokens(withJsonBody(request, body), env, expected, { includeRefreshExpiresIn: true });
+}
+
+async function handleApiClientLogout(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
   return json({ ok: true });
 }
@@ -283,6 +357,16 @@ async function handleExtensionLogin(request, env) {
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
 
+  // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
+  const turnstileToken = String(body.turnstileToken || "");
+  if (hasTurnstileSecret(env)) {
+    const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
+    const ts = await verifyTurnstileToken(turnstileToken, ip, env);
+    if (!ts.ok) {
+      return json({ error: "Turnstile verification failed" }, 400);
+    }
+  }
+
   const row = await env.DB.prepare(
     "SELECT id, username, role, password_hash, password_salt FROM users WHERE username = ?"
   )
@@ -290,13 +374,17 @@ async function handleExtensionLogin(request, env) {
     .first();
   if (!row) return json({ error: "Invalid credentials" }, 401);
 
-  const ok = await verifyPassword(password, row.password_salt, row.password_hash);
-  if (!ok) return json({ error: "Invalid credentials" }, 401);
+  const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
+  if (passwordCheck.needsRehash) {
+    await upgradePasswordHash(env, row.id, password).catch(() => {});
+  }
+  await clearLoginRiskControl(request, env, username).catch(() => {});
 
   const deviceName = normalizeClientMetadata(body.deviceName, 120, "edge");
   const clientVersion = normalizeClientMetadata(body.clientVersion, 64, "unknown");
   const clientType = `${EXTENSION_CLIENT_TYPE}:${deviceName}:${clientVersion}`;
-  const apiSession = await createMobileSession(env, row.id, clientType);
+  const apiSession = await createApiSession(env, row.id, clientType);
 
   return json({
     ok: true,
@@ -304,7 +392,7 @@ async function handleExtensionLogin(request, env) {
     accessToken: apiSession.accessToken,
     refreshToken: apiSession.refreshToken,
     expiresIn: apiSession.expiresIn,
-    refreshExpiresIn: MOBILE_REFRESH_TTL_SECONDS,
+    refreshExpiresIn: API_REFRESH_TTL_SECONDS,
     sessionId: apiSession.sessionId,
   });
 }
@@ -338,7 +426,17 @@ async function handleExtensionCodesBatch(request, env) {
   if (!isExtensionClientType(auth.apiClientType)) {
     return json({ error: "Extension bearer token required" }, 400);
   }
+  return handleCodesBatchForAuth(request, env, auth);
+}
 
+async function handleApiCodesBatch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
+  return handleCodesBatchForAuth(request, env, auth);
+}
+
+async function handleCodesBatchForAuth(request, env, auth) {
   const body = await parseJson(request);
   if (!Array.isArray(body.entryIds)) return json({ error: "entryIds must be an array" }, 400);
 
@@ -390,9 +488,13 @@ async function handleExtensionCodesBatch(request, env) {
     }
 
     try {
-      const period = Number(row.period || 30);
-      const digits = Number(row.digits || 6);
-      const algorithm = String(row.algorithm || "SHA-1");
+      const period = normalizeTotpPeriod(row.period);
+      const digits = normalizeOtpDigits(row.digits);
+      const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
+      if (!algorithm) {
+        items.push({ id, otpType: "totp", error: "Unsupported OTP algorithm" });
+        continue;
+      }
       const secret = await decryptText(row.secret_enc, env);
       const step = Math.floor(nowSec / period);
       const code = await generateTotp(secret, period, digits, algorithm, step);
@@ -430,9 +532,7 @@ async function handleCloseSoon(request, env) {
   const tokenHash = await hashSessionToken(token, env);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + CLOSE_LOGOUT_GRACE_SECONDS * 1000).toISOString();
-  await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND client_type = 'web'")
-    .bind(expiresAt, tokenHash)
-    .run();
+  await updateWebSessionExpiry(env, tokenHash, expiresAt);
   return json({ ok: true });
 }
 
@@ -490,18 +590,21 @@ async function handleCreateEntry(request, env) {
   const secret = String(payload.secret || "").trim();
   const digits = Number(payload.digits || 6);
   const period = Number(payload.period || 30);
-  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-1");
+  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-256");
   const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
   const hotpCounter = Number(payload.hotpCounter || 0);
-  const groupId = payload.groupId ? Number(payload.groupId) : null;
-  const requestedUserId = Number(payload.userId || auth.user.id);
+  const groupId = parseOptionalPositiveId(payload.groupId);
+  const requestedUserId = Number(payload.userId !== undefined ? payload.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
 
   if (!label || !secret) return json({ error: "label and secret are required" }, 400);
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-1/SHA-256/SHA-512" }, 400);
-  if (otpType === "hotp" && (!Number.isFinite(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   try {
     const bytes = base32Decode(secret);
@@ -517,7 +620,7 @@ async function handleCreateEntry(request, env) {
   if (groupId) {
     const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
     if (!group) return json({ error: "groupId does not exist" }, 400);
-    if (auth.user.role !== "admin" && group.user_id !== auth.user.id) return json({ error: "Forbidden group" }, 403);
+    if (Number(group.user_id) !== Number(userId)) return json({ error: "groupId must belong to entry user" }, 400);
   }
 
   const secretEnc = await encryptText(secret, env);
@@ -534,7 +637,7 @@ async function handleCreateEntry(request, env) {
 async function handleUpdateEntry(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const existing = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -546,16 +649,17 @@ async function handleUpdateEntry(request, env) {
   const issuer = body.issuer !== undefined ? String(body.issuer).trim() : existing.issuer;
   const digits = body.digits !== undefined ? Number(body.digits) : existing.digits;
   const period = body.period !== undefined ? Number(body.period) : existing.period;
-  const algorithm = body.algorithm ? normalizeAlgorithm(body.algorithm) : existing.algorithm;
+  const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-1");
   const otpType = body.otpType ? (body.otpType === "hotp" ? "hotp" : "totp") : (existing.otp_type || "totp");
   const hotpCounter = body.hotpCounter !== undefined ? Number(body.hotpCounter) : (existing.hotp_counter || 0);
-  const groupId = body.groupId === null ? null : body.groupId !== undefined ? Number(body.groupId) : existing.group_id;
+  const groupId = body.groupId !== undefined ? parseOptionalPositiveId(body.groupId) : existing.group_id;
 
   if (!label) return json({ error: "label is required" }, 400);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-1/SHA-256/SHA-512" }, 400);
-  if (otpType === "hotp" && (!Number.isFinite(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-1, SHA-256, or SHA-512" }, 400);
+  if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   let secretEnc = existing.secret_enc;
   if (body.secret !== undefined) {
@@ -573,7 +677,7 @@ async function handleUpdateEntry(request, env) {
   if (groupId) {
     const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
     if (!group) return json({ error: "groupId does not exist" }, 400);
-    if (auth.user.role !== "admin" && group.user_id !== auth.user.id) return json({ error: "Forbidden group" }, 403);
+    if (Number(group.user_id) !== Number(existing.user_id)) return json({ error: "groupId must belong to entry user" }, 400);
   }
 
   await env.DB.prepare(
@@ -587,7 +691,7 @@ async function handleUpdateEntry(request, env) {
 async function handleEntryCode(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -600,16 +704,51 @@ async function handleEntryCode(request, env) {
     return json({ error: "Use /api/entries/:id/hotp to generate HOTP code" }, 400);
   }
   const nowSec = Math.floor(Date.now() / 1000);
-  const step = Math.floor(nowSec / row.period);
-  const code = await generateTotp(secret, row.period, row.digits, row.algorithm, step);
-  const expiresIn = row.period - (nowSec % row.period);
+  const period = normalizeTotpPeriod(row.period);
+  const digits = normalizeOtpDigits(row.digits);
+  const step = Math.floor(nowSec / period);
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
+  if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
+  const code = await generateTotp(secret, period, digits, algorithm, step);
+  const expiresIn = period - (nowSec % period);
   return json({ code, expiresIn, now: nowSec, otpType: "totp" });
+}
+
+async function handleVerifyTotp(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  const id = pathResourceId(request, "entries");
+  if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
+
+  const body = await parseJson(request);
+  const submittedCode = String(body.code || "").replace(/\s+/g, "");
+  if (!/^\d{6,8}$/.test(submittedCode)) return json({ error: "code must be 6 to 8 digits" }, 400);
+
+  const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
+  if (!row) return json({ error: "Entry not found" }, 404);
+  if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
+  if ((row.otp_type || "totp") === "hotp") return json({ error: "Use /api/entries/:id/hotp for HOTP codes" }, 400);
+
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
+  if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
+  const secret = await decryptText(row.secret_enc, env);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const period = normalizeTotpPeriod(row.period);
+  const digits = normalizeOtpDigits(row.digits);
+  const currentStep = Math.floor(nowSec / period);
+  for (const windowOffset of [-1, 0, 1]) {
+    const expected = await generateTotp(secret, period, digits, algorithm, currentStep + windowOffset);
+    if (constantTimeEqual(enc(submittedCode), enc(expected))) {
+      return json({ ok: true, valid: true, window: windowOffset });
+    }
+  }
+  return json({ ok: true, valid: false });
 }
 
 async function handleConsumeHotp(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
@@ -619,9 +758,23 @@ async function handleConsumeHotp(request, env) {
 
   const secret = await decryptText(row.secret_enc, env);
   const counter = Number(row.hotp_counter || 0);
-  const code = await generateHotp(secret, row.digits, row.algorithm, counter);
-  await env.DB.prepare("UPDATE totp_entries SET hotp_counter = ? WHERE id = ?").bind(counter + 1, id).run();
-  return json({ code, counter, nextCounter: counter + 1, otpType: "hotp" });
+  const digits = normalizeOtpDigits(row.digits);
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
+  if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
+
+  // F-06 fix: atomically increment counter FIRST, then generate code.
+  // This prevents concurrent requests from generating the same code.
+  const nextCounter = counter + 1;
+  const result = await env.DB.prepare(
+    "UPDATE totp_entries SET hotp_counter = ? WHERE id = ? AND hotp_counter = ?"
+  ).bind(nextCounter, id, counter).run();
+
+  if (result.meta?.changes === 0) {
+    return json({ error: "HOTP code already consumed or counter mismatch, please retry" }, 409);
+  }
+
+  const code = await generateHotp(secret, digits, algorithm, counter);
+  return json({ code, counter, nextCounter, otpType: "hotp" });
 }
 
 async function handleListGroups(request, env) {
@@ -648,9 +801,14 @@ async function handleCreateGroup(request, env) {
   const body = await parseJson(request);
   const name = String(body.name || "").trim();
   const color = validHexColor(body.color) ? body.color : "#0f766e";
-  const requestedUserId = Number(body.userId || auth.user.id);
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
   if (!name) return json({ error: "name is required" }, 400);
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (auth.user.role === "admin") {
+    const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    if (!exists) return json({ error: "userId does not exist" }, 400);
+  }
 
   try {
     const result = await env.DB.prepare(
@@ -667,7 +825,7 @@ async function handleCreateGroup(request, env) {
 async function handleDeleteGroup(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "groups");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(id).first();
@@ -681,6 +839,8 @@ async function handleDeleteGroup(request, env) {
 async function handleExportData(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
+  const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
+  if (confirmation) return confirmation;
   return json(await getExportPayload(auth, env));
 }
 
@@ -695,6 +855,8 @@ async function handleImportData(request, env) {
 async function handleExportOtpAuth(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
+  const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
+  if (confirmation) return confirmation;
 
   const entriesQuery =
     auth.user.role === "admin"
@@ -723,8 +885,13 @@ async function handleImportOtpAuth(request, env) {
   const text = String(body.text || "");
   if (!text.trim()) return json({ error: "text is required" }, 400);
 
-  const requestedUserId = Number(body.userId || auth.user.id);
+  // Non-admin users can ONLY import to their own account (security fix)
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
+  if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
+    return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
+  }
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
     if (!exists) return json({ error: "userId does not exist" }, 400);
@@ -732,6 +899,10 @@ async function handleImportOtpAuth(request, env) {
 
   const uris = extractOtpAuthUris(text);
   if (!uris.length) return json({ error: "No otpauth URI found in text" }, 400);
+  // F-10 fix: limit otpauth import size
+  if (uris.length > 500) {
+    return json({ error: "Too many otpauth URIs (max 500)" }, 400);
+  }
 
   let imported = 0;
   const errors = [];
@@ -751,11 +922,15 @@ async function handleImportOtpAuth(request, env) {
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) throw new Error("invalid");
-      const digits = [6, 7, 8].includes(Number(data.digits)) ? Number(data.digits) : 6;
-      const period = Number(data.period) > 0 ? Number(data.period) : 30;
-      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1") || "SHA-1";
+      const digits = normalizeOtpDigits(data.digits);
+      const period = normalizeTotpPeriod(data.period);
+      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1");
+      if (!algorithm) {
+        errors.push("Unsupported OTP algorithm");
+        continue;
+      }
       const otpType = data.otpType === "hotp" ? "hotp" : "totp";
-      const hotpCounter = Number(data.hotpCounter) >= 0 ? Number(data.hotpCounter) : 0;
+      const hotpCounter = normalizeHotpCounter(data.hotpCounter);
       const secretEnc = await encryptText(secret, env);
       await env.DB.prepare(
         "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
@@ -775,6 +950,33 @@ async function handleImportOtpAuth(request, env) {
     failed: uris.length - imported,
     errors: errors.slice(0, 5),
   });
+}
+
+async function requirePlaintextExportConfirmation(request, env, auth) {
+  if (String(env.ALLOW_PLAINTEXT_EXPORT || "").toLowerCase() !== "true") {
+    return json({ error: "Plaintext export is disabled. Use /api/export/encrypted." }, 403);
+  }
+  // Read password from request body for re-verification
+  let password;
+  try {
+    const body = await parseJson(request.clone());
+    password = String(body.confirmPassword || "");
+  } catch {
+    return json({ error: "Password confirmation required for plaintext export." }, 400);
+  }
+  if (!password) {
+    return json({ error: "Password confirmation required for plaintext export." }, 400);
+  }
+  // Retrieve user's current password hash for verification
+  const userRow = await env.DB.prepare(
+    "SELECT password_hash, password_salt FROM users WHERE id = ?"
+  ).bind(auth.user.id).first();
+  if (!userRow) return json({ error: "User not found" }, 401);
+  const passwordCheck = await verifyPassword(password, userRow.password_salt, userRow.password_hash);
+  if (!passwordCheck) {
+    return json({ error: "Invalid password confirmation" }, 401);
+  }
+  return null;
 }
 
 async function getExportPayload(auth, env) {
@@ -808,13 +1010,35 @@ async function getExportPayload(auth, env) {
 async function importPayload(body, auth, env) {
   const groups = Array.isArray(body.groups) ? body.groups : [];
   const entries = Array.isArray(body.entries) ? body.entries : [];
+
+  // F-10 fix: limit import size to prevent DoS
+  const MAX_IMPORT_ENTRIES = 500;
+  const MAX_IMPORT_GROUPS = 100;
+  if (groups.length > MAX_IMPORT_GROUPS) {
+    return json({ error: `groups cannot exceed ${MAX_IMPORT_GROUPS}` }, 400);
+  }
+  if (entries.length > MAX_IMPORT_ENTRIES) {
+    return json({ error: `entries cannot exceed ${MAX_IMPORT_ENTRIES}` }, 400);
+  }
   const imported = { groups: 0, entries: 0 };
+
+  // Admin can only import to their own account unless explicitly managing another user
+  // Non-admin users can ONLY import to their own account (security fix)
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
+  if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
+    return json({ error: "Forbidden: cannot import data to another user's account" }, 403);
+  }
+  const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
+  if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
+  if (auth.user.role === "admin") {
+    const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    if (!exists) return json({ error: "userId does not exist" }, 400);
+  }
 
   const groupMap = new Map();
   for (const g of groups) {
     const name = String(g.name || "").trim();
     if (!name) continue;
-    const userId = auth.user.role === "admin" ? Number(g.user_id || auth.user.id) : auth.user.id;
     const color = validHexColor(g.color) ? g.color : "#0f766e";
     try {
       const res = await env.DB.prepare(
@@ -841,13 +1065,13 @@ async function importPayload(body, auth, env) {
     } catch {
       continue;
     }
-    const userId = auth.user.role === "admin" ? Number(e.user_id || auth.user.id) : auth.user.id;
     const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
     const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
-    const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1") || "SHA-1";
-    const digits = [6, 7, 8].includes(Number(e.digits)) ? Number(e.digits) : 6;
-    const period = Number(e.period) > 0 ? Number(e.period) : 30;
-    const hotpCounter = Number(e.hotp_counter) >= 0 ? Number(e.hotp_counter) : 0;
+    const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1");
+    if (!algorithm) continue;
+    const digits = normalizeOtpDigits(e.digits);
+    const period = normalizeTotpPeriod(e.period);
+    const hotpCounter = normalizeHotpCounter(e.hotp_counter);
     const secretEnc = await encryptText(secret, env);
 
     await env.DB.prepare(
@@ -898,7 +1122,7 @@ async function handleImportDataEncrypted(request, env) {
 async function handleDeleteEntry(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
 
   const row = await env.DB.prepare("SELECT id, user_id FROM totp_entries WHERE id = ?").bind(id).first();
@@ -928,7 +1152,7 @@ async function handleCreateUser(request, env) {
   const password = String(body.password || "");
   const role = body.role === "admin" ? "admin" : "user";
   if (!username || !validPassword(password)) {
-    return json({ error: "Invalid username or password (min 10 chars)" }, 400);
+    return json({ error: `Invalid username or password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
   }
 
   const { hashB64, saltB64 } = await hashPassword(password);
@@ -945,18 +1169,80 @@ async function handleCreateUser(request, env) {
   }
 }
 
+async function handleChangeMyPassword(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await parseJson(request);
+  const currentPassword = String(body.currentPassword || body.oldPassword || "");
+  const newPassword = String(body.newPassword || body.password || "");
+  if (!currentPassword || !newPassword) {
+    return json({ error: "currentPassword and newPassword are required" }, 400);
+  }
+  if (!validPassword(newPassword)) {
+    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, username, password_hash, password_salt FROM users WHERE id = ?")
+    .bind(auth.user.id)
+    .first();
+  if (!target) return json({ error: "User not found" }, 404);
+
+  const passwordCheck = await verifyPasswordDetailed(currentPassword, target.password_salt, target.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid current password" }, 401);
+
+  await upgradePasswordHash(env, auth.user.id, newPassword);
+  await deleteUserSessions(env, auth.user.id);
+  await clearLoginRiskForUsername(env, target.username);
+
+  const headers = auth.sessionKind === "web" ? { "set-cookie": clearSessionCookie() } : {};
+  return json({ ok: true }, 200, headers);
+}
+
+async function handleResetUserPassword(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
+
+  const id = pathResourceId(request, "users");
+  if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
+  if (id === auth.user.id) {
+    return json({ error: "Use /api/me/password to change your own password" }, 400);
+  }
+
+  const body = await parseJson(request);
+  const newPassword = String(body.newPassword || body.password || "");
+  if (!validPassword(newPassword)) {
+    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+
+  await upgradePasswordHash(env, id, newPassword);
+  await deleteUserSessions(env, id);
+  await clearLoginRiskForUsername(env, target.username);
+
+  return json({ ok: true });
+}
+
 async function handleUpdateUserRole(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
   if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   const body = await parseJson(request);
   const role = body.role === "admin" ? "admin" : body.role === "user" ? "user" : null;
   if (!role) return json({ error: "role must be admin or user" }, 400);
   if (id === auth.user.id && role !== "admin") {
     return json({ error: "Cannot demote yourself" }, 400);
+  }
+  const target = await env.DB.prepare("SELECT id, role FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+  if (target.role === "admin" && role !== "admin" && (await countAdmins(env)) <= 1) {
+    return json({ error: "Cannot remove the last admin" }, 400);
   }
 
   await env.DB.prepare("UPDATE users SET role = ? WHERE id = ?").bind(role, id).run();
@@ -968,10 +1254,23 @@ async function handleDeleteUser(request, env) {
   if (!auth.ok) return auth.response;
   if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
-  const id = Number(new URL(request.url).pathname.split("/")[3]);
+  const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   if (id === auth.user.id) return json({ error: "Cannot delete yourself" }, 400);
 
+  const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+  if (target.role === "admin" && (await countAdmins(env)) <= 1) {
+    return json({ error: "Cannot delete the last admin" }, 400);
+  }
+
+  // Cascade delete: remove all related data before deleting user
+  // This prevents orphaned records and ensures data consistency
+  await env.DB.prepare("DELETE FROM totp_entries WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM groups WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(target.username).run();
   await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
   return json({ ok: true });
 }
@@ -1018,10 +1317,26 @@ async function hasAnyUser(env) {
   return !!row;
 }
 
+async function countAdmins(env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").first();
+  return Number(row?.count || 0);
+}
+
+async function getUsernameById(env, userId) {
+  const row = await env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(userId).first();
+  return row ? row.username : null;
+}
+
 async function getLoginPolicy(env) {
-  const rows = await env.DB.prepare(
-    "SELECT key, value FROM app_settings WHERE key IN ('risk_max_requests_per_minute', 'risk_lock_minutes')"
-  ).all();
+  let rows;
+  try {
+    rows = await env.DB.prepare(
+      "SELECT key, value FROM app_settings WHERE key IN ('risk_max_requests_per_minute', 'risk_lock_minutes')"
+    ).all();
+  } catch (err) {
+    if (isMissingTableError(err, "app_settings")) return defaultLoginPolicy();
+    throw err;
+  }
   const map = new Map((rows.results || []).map((r) => [r.key, r.value]));
   const maxRequestsPerMinute = Number(map.get("risk_max_requests_per_minute") || DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE);
   const lockMinutes = Number(map.get("risk_lock_minutes") || DEFAULT_RISK_LOCK_MINUTES);
@@ -1031,18 +1346,29 @@ async function getLoginPolicy(env) {
   };
 }
 
+function defaultLoginPolicy() {
+  return {
+    maxRequestsPerMinute: DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE,
+    lockMinutes: DEFAULT_RISK_LOCK_MINUTES,
+  };
+}
+
 async function applyLoginRiskControl(request, env, username) {
   const nowSec = Math.floor(Date.now() / 1000);
   const policy = await getLoginPolicy(env);
-  const ip = String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
-    .split(",")[0]
-    .trim();
+  const ip = clientIp(request);
   const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
-  const row = await env.DB.prepare(
-    "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
-  )
-    .bind(riskKey)
-    .first();
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+    )
+      .bind(riskKey)
+      .first();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
+    throw err;
+  }
 
   if (row && Number(row.lock_until) > nowSec) {
     return {
@@ -1063,11 +1389,16 @@ async function applyLoginRiskControl(request, env, username) {
     lockUntil = nowSec + policy.lockMinutes * 60;
   }
 
-  await env.DB.prepare(
-    "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
-  )
-    .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
-    .run();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+    )
+      .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
+      .run();
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
+    throw err;
+  }
 
   if (lockUntil > nowSec) {
     return { blocked: true, retryAfterSeconds: lockUntil - nowSec, lockUntil };
@@ -1075,9 +1406,126 @@ async function applyLoginRiskControl(request, env, username) {
   return { blocked: false };
 }
 
+async function clearLoginRiskControl(request, env, username) {
+  const ip = clientIp(request);
+  const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE key = ?").bind(riskKey).run();
+}
+
+async function clearLoginRiskForUsername(env, username) {
+  const normalized = String(username || "").trim();
+  if (!normalized) return;
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(normalized).run();
+}
+
+async function deleteUserSessions(env, userId) {
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run().catch((err) => {
+    if (isMissingTableError(err, "sessions")) return;
+    throw err;
+  });
+  await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(userId).run().catch((err) => {
+    if (isMissingTableError(err, "api_sessions")) return;
+    throw err;
+  });
+}
+
+async function applyApiRateLimit(request, env, route) {
+  if (!shouldRateLimitRoute(request, route)) return null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const maxRequests = normalizeRateLimit(env.API_RATE_MAX_REQUESTS_PER_MINUTE, DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE);
+  const subject = await apiRateLimitSubject(request, env);
+  const rateKey = await sha256Base64(`api|${subject}`);
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+    )
+      .bind(rateKey)
+      .first();
+  } catch (err) {
+    return null;
+  }
+
+  let windowStart = nowSec;
+  let requestCount = 1;
+  if (row && nowSec - Number(row.window_start) < 60) {
+    windowStart = Number(row.window_start);
+    requestCount = Number(row.request_count) + 1;
+  }
+
+  try {
+    await env.DB.prepare(
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+    )
+      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
+      .run();
+  } catch (err) {
+    return null;
+  }
+
+  if (requestCount > maxRequests) {
+    return json(
+      { error: "Too many API requests", retryAfterSeconds: Math.max(1, 60 - (nowSec - windowStart)) },
+      429,
+      { "Retry-After": String(Math.max(1, 60 - (nowSec - windowStart))) }
+    );
+  }
+  return null;
+}
+
+function shouldRateLimitRoute(request, route) {
+  if (request.method.toUpperCase() === "OPTIONS") return false;
+  const path = new URL(request.url).pathname;
+  if (path === "/api/status" || path === "/api/v1/capabilities") return false;
+  if (
+    [
+      "/api/login",
+      "/api/mobile/login",
+      "/api/extension/login",
+      "/api/v1/auth/login",
+    ].includes(path)
+  ) {
+    return false;
+  }
+  return !!route;
+}
+
+async function apiRateLimitSubject(request, env) {
+  const bearerToken = readBearerToken(request);
+  if (bearerToken) return `bearer:${await hashSessionToken(bearerToken, env)}`;
+  const sessionToken = readCookie(request, SESSION_COOKIE);
+  if (sessionToken) return `cookie:${await hashSessionToken(sessionToken, env)}`;
+  return `ip:${clientIp(request)}`;
+}
+
+function normalizeRateLimit(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 10 && n <= 5000 ? Math.floor(n) : fallback;
+}
+
+function isMissingTableError(err, tableName) {
+  return dbErrorMessage(err).includes(`no such table: ${String(tableName).toLowerCase()}`);
+}
+
+function isMissingColumnError(err, columnName) {
+  const msg = dbErrorMessage(err);
+  const column = String(columnName).toLowerCase();
+  return msg.includes(`no such column: ${column}`) || msg.includes(`has no column named ${column}`);
+}
+
+function dbErrorMessage(err) {
+  return String(err?.message || err || "").toLowerCase();
+}
+
+function clientIp(request) {
+  return String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
+    .split(",")[0]
+    .trim() || "unknown";
+}
+
 async function verifyTurnstileToken(token, remoteip, env) {
   const secretKey = String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
-  if (!secretKey) return { ok: true };
+  if (!secretKey) return { ok: false };
   if (!token) return { ok: false };
   const body = new URLSearchParams();
   body.set("secret", secretKey);
@@ -1104,18 +1552,23 @@ async function getCurrentUser(request, env) {
   if (bearerToken) {
     const tokenHash = await hashSessionToken(bearerToken, env);
     const now = nowIso();
-    const row = await env.DB.prepare(
-      "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
-    )
-      .bind(tokenHash, now, now)
-      .first();
+    let row = null;
+    try {
+      row = await env.DB.prepare(
+        "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
+      )
+        .bind(tokenHash, now, now)
+        .first();
+    } catch (err) {
+      if (!isMissingTableError(err, "api_sessions")) throw err;
+    }
     if (row) {
       await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
       return {
         user: { id: row.id, username: row.username, role: row.role },
-        sessionKind: "mobile",
+        sessionKind: "api",
         sessionId: row.session_id,
-        apiClientType: String(row.client_type || "android"),
+        apiClientType: String(row.client_type || ANDROID_CLIENT_TYPE),
       };
     }
   }
@@ -1138,11 +1591,18 @@ async function createSession(env, userId) {
   const tokenHash = await hashSessionToken(token, env);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
-  await env.DB.prepare(
-    "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
-  )
-    .bind(userId, tokenHash, expiresAt, now.toISOString())
-    .run();
+  const result = await insertWebSession(env, userId, tokenHash, expiresAt, now.toISOString());
+  let sessionId = normalizeDbId(result.meta?.last_row_id);
+  if (!sessionId) {
+    const row = await env.DB.prepare("SELECT id FROM sessions WHERE token_hash = ? AND user_id = ?")
+      .bind(tokenHash, userId)
+      .first();
+    sessionId = normalizeDbId(row?.id);
+  }
+  if (sessionId) {
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id = ? AND id <> ?").bind(userId, sessionId).run();
+  }
+  await deleteApiSessionsForUser(env, userId);
 
   return { cookie: sessionCookie(token, SESSION_TTL_SECONDS) };
 }
@@ -1159,18 +1619,60 @@ async function refreshSessionTtl(request, env) {
 async function cleanExpiredSessions(env) {
   const now = nowIso();
   await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now).run();
-  await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
+  try {
+    await env.DB.prepare("DELETE FROM api_sessions WHERE refresh_expires_at <= ?").bind(now).run();
+  } catch (err) {
+    if (!isMissingTableError(err, "api_sessions")) throw err;
+  }
 }
 
-async function createMobileSession(env, userId, clientType) {
+async function insertWebSession(env, userId, tokenHash, expiresAt, createdAt) {
+  try {
+    return await env.DB.prepare(
+      "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
+    )
+      .bind(userId, tokenHash, expiresAt, createdAt)
+      .run();
+  } catch (err) {
+    if (!isMissingColumnError(err, "client_type")) throw err;
+    return env.DB.prepare(
+      "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
+    )
+      .bind(userId, tokenHash, expiresAt, createdAt)
+      .run();
+  }
+}
+
+async function updateWebSessionExpiry(env, tokenHash, expiresAt) {
+  try {
+    await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND client_type = 'web'")
+      .bind(expiresAt, tokenHash)
+      .run();
+  } catch (err) {
+    if (!isMissingColumnError(err, "client_type")) throw err;
+    await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+      .bind(expiresAt, tokenHash)
+      .run();
+  }
+}
+
+async function deleteApiSessionsForUser(env, userId) {
+  try {
+    await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(userId).run();
+  } catch (err) {
+    if (!isMissingTableError(err, "api_sessions")) throw err;
+  }
+}
+
+async function createApiSession(env, userId, clientType) {
   const accessToken = randomHex(32);
   const refreshToken = randomHex(32);
   const tokenHash = await hashSessionToken(accessToken, env);
   const refreshHash = await hashSessionToken(refreshToken, env);
   const now = new Date();
   const createdAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
-  const refreshExpiresAt = new Date(now.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(now.getTime() + API_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(now.getTime() + API_REFRESH_TTL_SECONDS * 1000).toISOString();
 
   await env.DB.prepare(
     "INSERT INTO api_sessions (user_id, token_hash, refresh_hash, expires_at, refresh_expires_at, created_at, last_used_at, client_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -1185,7 +1687,17 @@ async function createMobileSession(env, userId, clientType) {
       ).bind(tokenHash, userId).first()
     )?.id
   );
-  return { accessToken, refreshToken, expiresIn: MOBILE_ACCESS_TTL_SECONDS, sessionId };
+  if (sessionId) {
+    await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ? AND id <> ?")
+      .bind(userId, sessionId)
+      .run();
+  }
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();
+  return { accessToken, refreshToken, expiresIn: API_ACCESS_TTL_SECONDS, sessionId };
+}
+
+function hasTurnstileSecret(env) {
+  return !!String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
 }
 
 async function rotateApiSessionTokens(request, env, expectedClientType, options = {}) {
@@ -1202,7 +1714,7 @@ async function rotateApiSessionTokens(request, env, expectedClientType, options 
     .first();
   if (!row) return json({ error: "Invalid refresh token" }, 401);
 
-  if (expectedClientType === "android" && String(row.client_type || "") !== "android") {
+  if (expectedClientType === ANDROID_CLIENT_TYPE && String(row.client_type || "") !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Invalid refresh token" }, 401);
   }
   if (expectedClientType === EXTENSION_CLIENT_TYPE && !isExtensionClientType(String(row.client_type || ""))) {
@@ -1214,30 +1726,42 @@ async function rotateApiSessionTokens(request, env, expectedClientType, options 
   const accessHash = await hashSessionToken(accessToken, env);
   const newRefreshHash = await hashSessionToken(newRefreshToken, env);
   const nowDate = new Date();
-  const expiresAt = new Date(nowDate.getTime() + MOBILE_ACCESS_TTL_SECONDS * 1000).toISOString();
-  const refreshExpiresAt = new Date(nowDate.getTime() + MOBILE_REFRESH_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(nowDate.getTime() + API_ACCESS_TTL_SECONDS * 1000).toISOString();
+  const refreshExpiresAt = new Date(nowDate.getTime() + API_REFRESH_TTL_SECONDS * 1000).toISOString();
 
-  await env.DB.prepare(
-    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ?"
+  const result = await env.DB.prepare(
+    "UPDATE api_sessions SET token_hash = ?, refresh_hash = ?, expires_at = ?, refresh_expires_at = ?, last_used_at = ? WHERE id = ? AND refresh_hash = ?"
   )
-    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id)
+    .bind(accessHash, newRefreshHash, expiresAt, refreshExpiresAt, nowDate.toISOString(), row.id, refreshHash)
     .run();
+  if (result.meta?.changes === 0) {
+    return json({ error: "Refresh token already used" }, 409);
+  }
 
   const payload = {
     ok: true,
     user: { id: row.user_id, username: row.username, role: row.role },
     accessToken,
     refreshToken: newRefreshToken,
-    expiresIn: MOBILE_ACCESS_TTL_SECONDS,
+    expiresIn: API_ACCESS_TTL_SECONDS,
   };
   if (options.includeRefreshExpiresIn) {
-    payload.refreshExpiresIn = MOBILE_REFRESH_TTL_SECONDS;
+    payload.refreshExpiresIn = API_REFRESH_TTL_SECONDS;
   }
   return json(payload);
 }
 
 function isExtensionClientType(clientType) {
   return String(clientType || "") === EXTENSION_CLIENT_TYPE || String(clientType || "").startsWith(`${EXTENSION_CLIENT_TYPE}:`);
+}
+
+function normalizeApiClientType(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === ANDROID_CLIENT_TYPE) return ANDROID_CLIENT_TYPE;
+  if (["browser_extension", "extension", "edge_extension", "chrome_extension"].includes(v)) {
+    return "browser_extension";
+  }
+  return "";
 }
 
 function normalizeClientMetadata(value, maxLen, fallback) {
@@ -1260,11 +1784,11 @@ async function hashSessionToken(token, env) {
   return sha256Base64(`${token}:${env.SESSION_PEPPER}`);
 }
 
-async function hashPassword(password, saltB64) {
+async function hashPassword(password, saltB64, iterations = PBKDF2_ITERATIONS) {
   const salt = saltB64 ? b64ToBytes(saltB64) : crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey("raw", enc(String(password)), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: PBKDF2_HASH, iterations: PBKDF2_ITERATIONS, salt },
+    { name: "PBKDF2", hash: PBKDF2_HASH, iterations, salt },
     key,
     256
   );
@@ -1272,22 +1796,43 @@ async function hashPassword(password, saltB64) {
 }
 
 async function verifyPassword(password, saltB64, expectedHashB64) {
-  const { hashB64 } = await hashPassword(password, saltB64);
-  return constantTimeEqual(b64ToBytes(hashB64), b64ToBytes(expectedHashB64));
+  return (await verifyPasswordDetailed(password, saltB64, expectedHashB64)).ok;
 }
 
-let keyCacheRaw = null;
-let keyCachePromise = null;
+async function verifyPasswordDetailed(password, saltB64, expectedHashB64) {
+  try {
+    const expected = b64ToBytes(expectedHashB64);
+    const current = await hashPassword(password, saltB64, PBKDF2_ITERATIONS);
+    if (constantTimeEqual(b64ToBytes(current.hashB64), expected)) {
+      return { ok: true, needsRehash: false };
+    }
+  } catch {
+    return { ok: false, needsRehash: false };
+  }
+  return { ok: false, needsRehash: false };
+}
+
+async function upgradePasswordHash(env, userId, password) {
+  const { hashB64, saltB64 } = await hashPassword(password);
+  await env.DB.prepare("UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?")
+    .bind(hashB64, saltB64, userId)
+    .run();
+}
+
+const encryptionKeyCache = new Map();
 
 async function getEncryptionKey(env) {
-  if (keyCacheRaw !== env.ENCRYPTION_KEY) {
-    keyCacheRaw = env.ENCRYPTION_KEY;
-    keyCachePromise = crypto.subtle.importKey("raw", b64ToBytes(env.ENCRYPTION_KEY), "AES-GCM", false, [
+  // F-02 fix: hash secrets instead of storing plaintext secrets in Map key
+  const raw = `${env.ENVIRONMENT || env.NODE_ENV || "default"}|${env.ENCRYPTION_KEY}|${env.SESSION_PEPPER}`;
+  const cacheKey = await sha256Base64(raw);
+  if (!encryptionKeyCache.has(cacheKey)) {
+    if (encryptionKeyCache.size >= 8) encryptionKeyCache.clear();
+    encryptionKeyCache.set(cacheKey, crypto.subtle.importKey("raw", b64ToBytes(env.ENCRYPTION_KEY), "AES-GCM", false, [
       "encrypt",
       "decrypt",
-    ]);
+    ]));
   }
-  return keyCachePromise;
+  return encryptionKeyCache.get(cacheKey);
 }
 
 async function encryptText(plain, env) {
@@ -1369,6 +1914,7 @@ function parseOtpAuthUri(uri) {
     const period = Number(url.searchParams.get("period") || 30);
     const hotpCounter = Number(url.searchParams.get("counter") || 0);
     const algorithm = normalizeAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
+    if (!algorithm) return { ok: false, error: "otpauth URI algorithm must be SHA-1, SHA-256, or SHA-512" };
     return {
       ok: true,
       data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, otpType, hotpCounter },
@@ -1392,7 +1938,7 @@ function buildOtpAuthUri(entry) {
   const params = new URLSearchParams();
   params.set("secret", String(entry.secret || ""));
   if (entry.issuer) params.set("issuer", String(entry.issuer));
-  params.set("algorithm", String(entry.algorithm || "SHA-1").replace("-", ""));
+  params.set("algorithm", String(normalizeAlgorithm(entry.algorithm || "SHA-1") || "SHA-1").replace("-", ""));
   params.set("digits", String(Number(entry.digits || 6)));
   if (otpType === "hotp") {
     params.set("counter", String(Number(entry.hotp_counter || 0)));
@@ -1404,7 +1950,8 @@ function buildOtpAuthUri(entry) {
 
 async function generateTotp(secretBase32, period, digits, algorithm, counter) {
   const secretBytes = base32Decode(secretBase32);
-  const algo = normalizeAlgorithm(algorithm) || "SHA-1";
+  const algo = normalizeAlgorithm(algorithm);
+  if (!algo) throw new Error("Unsupported OTP algorithm");
   const key = await crypto.subtle.importKey("raw", secretBytes, { name: "HMAC", hash: { name: algo } }, false, [
     "sign",
   ]);
@@ -1453,13 +2000,35 @@ function normalizeAlgorithm(value) {
   return null;
 }
 
+function normalizeOtpDigits(value) {
+  const digits = Number(value);
+  return [6, 7, 8].includes(digits) ? digits : 6;
+}
+
+function normalizeTotpPeriod(value) {
+  const period = Number(value);
+  return Number.isInteger(period) && period >= 15 && period <= 120 ? period : 30;
+}
+
+function normalizeHotpCounter(value) {
+  const counter = Number(value);
+  return Number.isInteger(counter) && counter >= 0 ? counter : 0;
+}
+
 function normalizeUsername(v) {
   const out = String(v || "").trim().toLowerCase();
   return /^[a-z0-9_.-]{3,40}$/.test(out) ? out : "";
 }
 
 function validPassword(p) {
-  return typeof p === "string" && p.length >= 10;
+  return (
+    typeof p === "string" &&
+    p.length >= 12 &&
+    /[a-z]/.test(p) &&
+    /[A-Z]/.test(p) &&
+    /[0-9]/.test(p) &&
+    /[^A-Za-z0-9]/.test(p)
+  );
 }
 
 function validHexColor(v) {
@@ -1491,9 +2060,12 @@ function readBearerToken(request) {
 }
 
 function withJsonBody(request, data) {
+  const headers = new Headers(request.headers);
+  headers.set("content-type", "application/json");
+  headers.delete("content-length");
   return new Request(request.url, {
     method: request.method,
-    headers: request.headers,
+    headers,
     body: JSON.stringify(data),
   });
 }
@@ -1517,16 +2089,32 @@ function normalizeDbId(value) {
   return null;
 }
 
+function pathResourceId(request, resource) {
+  const parts = new URL(request.url).pathname.split("/").filter(Boolean);
+  const idx = parts.indexOf(resource);
+  if (idx < 0 || idx + 1 >= parts.length) return NaN;
+  return Number(parts[idx + 1]);
+}
+
+function parseOptionalPositiveId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  return id;
+}
+
 function randomHex(byteLen) {
   const arr = crypto.getRandomValues(new Uint8Array(byteLen));
   return [...arr].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 async function parseJson(request) {
+  const text = await request.text();
+  if (!text.trim()) return {};
   try {
-    return await request.json();
+    return JSON.parse(text);
   } catch {
-    return {};
+    throw new ApiError(400, "Invalid JSON body");
   }
 }
 
@@ -1563,24 +2151,126 @@ function b64ToBytes(b64) {
   return out;
 }
 
+function corsPreflight(request, env) {
+  const origin = allowedCorsOrigin(request, env);
+  if (!origin) return new Response(null, { status: 403 });
+  const headers = corsHeaders(origin);
+  headers.set("Access-Control-Max-Age", "86400");
+  headers.set("Vary", "Origin");
+  return new Response(null, { status: 204, headers });
+}
+
+function withCors(request, response, env) {
+  const origin = allowedCorsOrigin(request, env);
+  if (!origin) return response;
+  const next = new Response(response.body, response);
+  const headers = corsHeaders(origin);
+  for (const [key, value] of headers) next.headers.set(key, value);
+  next.headers.set("Vary", appendVary(next.headers.get("Vary"), "Origin"));
+  return next;
+}
+
+function corsHeaders(origin) {
+  return new Headers({
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": CORS_ALLOWED_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOWED_HEADERS,
+    "Access-Control-Allow-Credentials": "true",
+  });
+}
+
+function allowedCorsOrigin(request, env) {
+  const origin = String(request.headers.get("origin") || "").trim();
+  if (!origin) return "";
+  if (!isSafeCorsOrigin(origin)) return "";
+  const allowed = normalizedAllowedCorsOrigins(env);
+  return allowed.includes(origin) ? origin : "";
+}
+
+function normalizedAllowedCorsOrigins(env) {
+  return String(env.CORS_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item && item !== "*" && item !== "null" && isSafeCorsOrigin(item));
+}
+
+function isSafeCorsOrigin(origin) {
+  // F-11 fix: no longer automatically trust all browser extensions.
+  // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
+  if (/^(https?|chrome-extension|edge-extension|moz-extension):\/\/[A-Za-z0-9_-]+$/.test(origin)) {
+    return true;
+  }
+  try {
+    const url = new URL(origin);
+    return origin === url.origin && ["https:", "http:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function appendVary(current, value) {
+  const parts = String(current || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!parts.some((item) => item.toLowerCase() === value.toLowerCase())) parts.push(value);
+  return parts.join(", ");
+}
+
+function commonSecurityHeaders() {
+  return {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+  };
+}
+
+function debugErrorsEnabled(env) {
+  const enabled = String(env.DEBUG_ERRORS || "").toLowerCase() === "true";
+  const environment = String(env.ENVIRONMENT || env.NODE_ENV || "").toLowerCase();
+  return enabled && environment !== "production";
+}
+
 function json(data, status = 200, headers = {}) {
+  const securityHeaders = commonSecurityHeaders();
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      ...securityHeaders,
       ...headers,
     },
   });
 }
 
-function html(markup) {
+function html(markup, nonce) {
+  // F-08 fix: jsQR has SRI integrity; cdn.jsdelivr.net still needed for fetch. Inlining jsQR would eliminate this risk.
+  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"];
+  const styleSrc = ["'self'", `'nonce-${nonce}'`];
   return new Response(markup, {
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "Content-Security-Policy": [
+        "default-src 'self'",
+        `script-src ${scriptSrc.join(" ")}`,
+        `style-src ${styleSrc.join(" ")}`,
+        "img-src 'self' data: blob:",
+        "connect-src 'self' https://api.qrserver.com https://challenges.cloudflare.com",
+        "frame-src https://challenges.cloudflare.com",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+      ].join("; "),
+      ...commonSecurityHeaders(),
+    },
   });
 }
 
-function appHtml(env) {
+function appHtml(env, nonce) {
   const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
   return `<!doctype html>
 <html lang="zh-CN">
@@ -1588,7 +2278,7 @@ function appHtml(env) {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>2FAuth 验证器</title>
-  <style>
+  <style nonce="${nonce}">
     :root {
       --bg: #f3f7f6;
       --ink: #102a2c;
@@ -1627,6 +2317,28 @@ function appHtml(env) {
     }
     .grid { display: grid; grid-template-columns: 320px 1fr; gap: 12px; align-items: start; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .flush { margin: 0; }
+    .hidden { display: none; }
+    .visible { display: block !important; }
+    .top-actions { justify-content: space-between; align-items: center; }
+    .narrow-74 { width: 74px; }
+    .narrow-86 { width: 86px; }
+    .narrow-110 { width: 110px; }
+    .mt-8 { margin-top: 8px; }
+    .group-row {
+      justify-content: space-between;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 7px;
+    }
+    .swatch {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #0f766e;
+    }
     .stack { display: grid; gap: 8px; }
     input, select, button, textarea {
       border-radius: 10px;
@@ -1715,11 +2427,11 @@ function appHtml(env) {
         <div id="state" class="sub">加载中...</div>
       </div>
       <div class="row">
-        <select id="langSelect" onchange="changeLang(this.value)">
+        <select id="langSelect">
           <option value="zh-CN">简体中文</option>
           <option value="en-US">English</option>
         </select>
-        <select id="autoLogoutSelect" onchange="changeAutoLogout(this.value)">
+        <select id="autoLogoutSelect">
           <option value="15">15分钟自动退出</option>
           <option value="30">30分钟自动退出</option>
           <option value="60">60分钟自动退出</option>
@@ -1731,51 +2443,52 @@ function appHtml(env) {
     </div>
 
     <section id="bootstrap" class="panel stack">
-      <h3 style="margin:0;">初始化管理员</h3>
+      <h3 class="flush">初始化管理员</h3>
       <div class="row">
         <input id="bsUser" placeholder="管理员用户名" />
-        <input id="bsPass" type="password" placeholder="密码（至少10位）" />
-        <button type="button" onclick="bootstrap(event)">初始化</button>
+        <input id="bsPass" type="password" placeholder="密码（至少12位，含大小写/数字/符号）" />
+        <button type="button" data-action="bootstrap">初始化</button>
       </div>
       <div id="bsMsg" class="muted"></div>
     </section>
 
     <section id="login" class="panel stack">
-      <h3 style="margin:0;">登录</h3>
+      <h3 class="flush">登录</h3>
       <div class="row">
         <input id="loginUser" placeholder="用户名" />
         <input id="loginPass" type="password" placeholder="密码" />
-        <button type="button" onclick="login(event)">登录</button>
+        <button type="button" data-action="login">登录</button>
       </div>
-      <div id="turnstileBox" class="row" style="display:none;"></div>
+      <div id="turnstileBox" class="row hidden"></div>
       <div id="loginMsg" class="muted"></div>
     </section>
 
     <section id="app">
-      <div class="panel row" style="justify-content:space-between;align-items:center;">
+      <div class="panel row top-actions">
         <div class="row">
-          <input id="search" placeholder="搜索标签/发行方..." oninput="renderEntries()" />
-          <select id="groupFilter" onchange="renderEntries()"><option value="">全部分组</option></select>
-          <button class="ghost" onclick="refreshAll()">刷新</button>
+          <input id="search" placeholder="搜索标签/发行方..." />
+          <select id="groupFilter"><option value="">全部分组</option></select>
+          <button class="ghost" data-action="refresh-all">刷新</button>
         </div>
         <div class="row">
-          <button class="ghost" onclick="exportData()">导出</button>
-          <button class="ghost" onclick="exportOtpAuthTxt()">导出 otpauth 文本</button>
-          <button class="ghost" onclick="exportDataEncrypted()">加密导出</button>
-          <button class="ghost" onclick="toggleImport()">导入</button>
-          <button type="button" class="warn" onclick="logout(event)">退出登录</button>
+          <button class="ghost" data-action="export-data">导出</button>
+          <button class="ghost" data-action="export-otpauth">导出 otpauth 文本</button>
+          <button class="ghost" data-action="export-encrypted">加密导出</button>
+          <button class="ghost" data-action="toggle-import">导入</button>
+          <button class="ghost" data-action="change-my-password">修改密码</button>
+          <button type="button" class="warn" data-action="logout">退出登录</button>
         </div>
       </div>
 
-      <div id="importPanel" class="panel stack" style="display:none;">
-        <h3 style="margin:0;">导入备份 JSON</h3>
+      <div id="importPanel" class="panel stack hidden">
+        <h3 class="flush">导入备份 JSON</h3>
         <textarea id="importText" placeholder='粘贴 /api/export 的 JSON'></textarea>
         <div class="row">
-          <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" onchange="loadImportFile(event)" />
+          <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" />
           <input id="importPassphrase" type="password" placeholder="口令（用于加密备份）" />
-          <button onclick="importData()">执行导入</button>
-          <button class="ghost" onclick="importOtpAuthText()">导入 otpauth 文本</button>
-          <button class="ghost" onclick="importDataEncrypted()">执行加密导入</button>
+          <button data-action="import-data">执行导入</button>
+          <button class="ghost" data-action="import-otpauth">导入 otpauth 文本</button>
+          <button class="ghost" data-action="import-encrypted">执行加密导入</button>
         </div>
         <div id="importMsg" class="muted"></div>
       </div>
@@ -1783,62 +2496,62 @@ function appHtml(env) {
       <div class="grid">
         <div class="stack">
           <div class="panel stack">
-            <h3 style="margin:0;">新建条目</h3>
+            <h3 class="flush">新建条目</h3>
             <input id="eLabel" placeholder="标签（如 GitHub）" />
             <input id="eIssuer" placeholder="发行方（可选）" />
             <input id="eSecret" placeholder="Base32 密钥" />
             <input id="eUri" placeholder="或 otpauth://totp/... / otpauth://hotp/..." />
             <div class="row">
-              <button class="ghost" onclick="startScan()">摄像头扫码</button>
-              <button class="ghost" onclick="stopScan()">停止扫码</button>
-              <button class="ghost" onclick="recognizeCurrentFrameByApi()">API识别当前画面</button>
+              <button class="ghost" data-action="start-scan">摄像头扫码</button>
+              <button class="ghost" data-action="stop-scan">停止扫码</button>
+              <button class="ghost" data-action="recognize-frame">API识别当前画面</button>
               <select id="scanMode">
+                <option value="local" selected>仅本地识别（推荐）</option>
                 <option value="auto">自动（本地优先，失败走API）</option>
-                <option value="local">仅本地识别</option>
                 <option value="api">仅API识别</option>
               </select>
-              <input id="qrImageFile" type="file" accept="image/*" onchange="scanImageFile(event)" />
+              <input id="qrImageFile" type="file" accept="image/*" />
             </div>
-            <video id="scanVideo" autoplay playsinline style="display:none;"></video>
+            <video id="scanVideo" autoplay playsinline class="hidden"></video>
             <div id="scanMsg" class="muted"></div>
             <div class="row">
               <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
               <select id="eAlgo"><option>SHA-1</option><option>SHA-256</option><option>SHA-512</option></select>
-              <input id="eDigits" value="6" style="width:74px;" />
-              <input id="ePeriod" value="30" style="width:74px;" />
-              <input id="eCounter" value="0" style="width:86px;" />
+              <input id="eDigits" value="6" class="narrow-74" />
+              <input id="ePeriod" value="30" class="narrow-74" />
+              <input id="eCounter" value="0" class="narrow-86" />
             </div>
             <select id="eGroup"><option value="">不分组</option></select>
-            <button onclick="createEntry()">保存条目</button>
+            <button data-action="create-entry">保存条目</button>
             <div id="entryMsg" class="muted"></div>
           </div>
 
           <div class="panel stack">
-            <h3 style="margin:0;">分组</h3>
+            <h3 class="flush">分组</h3>
             <div class="row">
               <input id="gName" placeholder="分组名称" />
-              <input id="gColor" value="#0f766e" style="width:110px;" />
-              <button onclick="createGroup()">新增</button>
+              <input id="gColor" value="#0f766e" class="narrow-110" />
+              <button data-action="create-group">新增</button>
             </div>
             <div id="groupsList" class="stack"></div>
           </div>
 
-          <div id="adminPanel" class="panel stack" style="display:none;">
-            <h3 style="margin:0;">用户管理（管理员）</h3>
+          <div id="adminPanel" class="panel stack hidden">
+            <h3 class="flush">用户管理（管理员）</h3>
             <div class="row">
               <input id="uName" placeholder="用户名" />
-              <input id="uPass" type="password" placeholder="密码 >=10 位" />
+              <input id="uPass" type="password" placeholder="密码 >=12 位，含大小写/数字/符号" />
               <select id="uRole"><option value="user">user</option><option value="admin">admin</option></select>
-              <button onclick="createUser()">创建</button>
+              <button data-action="create-user">创建</button>
             </div>
             <div id="userMsg" class="muted"></div>
             <table id="usersTable"></table>
-            <div class="panel stack" style="margin-top:8px;">
-              <h4 style="margin:0;">登录风控设置</h4>
+            <div class="panel stack mt-8">
+              <h4 class="flush">登录风控设置</h4>
               <div class="row">
                 <input id="riskMaxReq" type="number" min="3" max="100" placeholder="每分钟请求阈值（默认10）" />
                 <input id="riskLockMin" type="number" min="1" max="1440" placeholder="锁定分钟数（默认15）" />
-                <button onclick="saveLoginPolicy()">保存风控设置</button>
+                <button data-action="save-login-policy">保存风控设置</button>
               </div>
               <div id="riskMsg" class="muted"></div>
             </div>
@@ -1846,15 +2559,16 @@ function appHtml(env) {
         </div>
 
         <div class="panel stack">
-          <h3 style="margin:0;">我的验证码</h3>
+          <h3 class="flush">我的验证码</h3>
           <div id="entries" class="entry-grid"></div>
         </div>
       </div>
     </section>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     const TURNSTILE_SITE_KEY = ${JSON.stringify(turnstileSiteKey)};
+    const PLAINTEXT_EXPORT_ENABLED = ${JSON.stringify(String((env && env.ALLOW_PLAINTEXT_EXPORT) || "").toLowerCase() === "true")};
     let currentUser = null;
     let entries = [];
     let groups = [];
@@ -1894,6 +2608,8 @@ function appHtml(env) {
         deleteUserConfirm: "确认删除用户？",
         backupCopied: "备份 JSON 已复制到剪贴板。",
         encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
+        plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
+        plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
         setBackupPassphrase: "设置备份口令（至少10位）",
         copyExportJson: "复制导出 JSON",
         copyEncryptedExportJson: "复制加密导出 JSON",
@@ -1915,6 +2631,13 @@ function appHtml(env) {
         scanImageFailed: "图片扫码失败：",
         saved: "已保存",
         userCreated: "用户已创建",
+        changePassword: "修改密码",
+        resetPassword: "重置密码",
+        currentPassword: "当前密码",
+        newPassword: "新密码",
+        passwordChanged: "密码已修改，请重新登录。",
+        passwordReset: "密码已重置",
+        passwordResetConfirm: "确认重置该用户的密码？",
         labelPrompt: "标签",
         issuerPrompt: "发行方",
         groupIdPrompt: "分组 ID（留空代表不分组）",
@@ -1960,6 +2683,8 @@ function appHtml(env) {
         deleteUserConfirm: "Delete user?",
         backupCopied: "Backup JSON copied to clipboard.",
         encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
+        plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
+        plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
         setBackupPassphrase: "Set backup passphrase (>=10 chars):",
         copyExportJson: "Copy export JSON:",
         copyEncryptedExportJson: "Copy encrypted export JSON:",
@@ -1981,6 +2706,13 @@ function appHtml(env) {
         scanImageFailed: "Failed to scan image: ",
         saved: "Saved",
         userCreated: "User created",
+        changePassword: "Change Password",
+        resetPassword: "Reset Password",
+        currentPassword: "Current password",
+        newPassword: "New password",
+        passwordChanged: "Password changed. Please login again.",
+        passwordReset: "Password reset",
+        passwordResetConfirm: "Confirm reset this user's password?",
         labelPrompt: "Label",
         issuerPrompt: "Issuer",
         groupIdPrompt: "Group ID (empty for none)",
@@ -2027,9 +2759,18 @@ function appHtml(env) {
       document.documentElement.lang = currentLang;
       document.getElementById("langSelect").value = currentLang;
       document.getElementById("autoLogoutSelect").value = String(autoLogoutMinutes);
+      syncPlaintextExportUi();
       if (!currentUser) {
         document.getElementById("state").textContent = t("loading");
       }
+    }
+
+    function syncPlaintextExportUi() {
+      const buttons = document.querySelectorAll('[data-action="export-data"], [data-action="export-otpauth"]');
+      buttons.forEach(function(button) {
+        button.disabled = !PLAINTEXT_EXPORT_ENABLED;
+        button.title = PLAINTEXT_EXPORT_ENABLED ? "" : t("plaintextExportDisabled");
+      });
     }
 
     async function timeoutLogout() {
@@ -2081,7 +2822,7 @@ function appHtml(env) {
       if (!TURNSTILE_SITE_KEY) return;
       const box = document.getElementById("turnstileBox");
       if (!box) return;
-      box.style.display = "block";
+      box.classList.remove("hidden");
 
       let tries = 0;
       const tryRender = function() {
@@ -2124,23 +2865,23 @@ function appHtml(env) {
         const status = await api("/api/status");
         if (!status.initialized) {
           document.getElementById("state").textContent = t("systemNotInitialized");
-          document.getElementById("bootstrap").style.display = "block";
+          document.getElementById("bootstrap").classList.add("visible");
           return;
         }
         const me = await api("/api/me").catch(() => null);
         if (!me) {
           document.getElementById("state").textContent = t("pleaseLogin");
-          document.getElementById("login").style.display = "block";
+          document.getElementById("login").classList.add("visible");
           initTurnstile();
           return;
         }
         currentUser = me.user;
         document.getElementById("state").textContent = t("ready");
         document.getElementById("whoami").textContent = me.user.username + " (" + me.user.role + ")";
-        document.getElementById("app").style.display = "block";
+        document.getElementById("app").classList.add("visible");
         bindActivityEvents();
         scheduleAutoLogout();
-        if (me.user.role === "admin") document.getElementById("adminPanel").style.display = "block";
+        if (me.user.role === "admin") document.getElementById("adminPanel").classList.remove("hidden");
         await refreshAll();
         if (me.user.role === "admin") {
           await refreshUsers();
@@ -2217,11 +2958,12 @@ function appHtml(env) {
       const box = document.getElementById("groupsList");
       if (!groups.length) { box.innerHTML = '<div class="muted">' + esc(t("noGroupsYet")) + '</div>'; return; }
       box.innerHTML = groups.map(function(g) {
-        return '<div class="row" style="justify-content:space-between;align-items:center;border:1px solid var(--line);border-radius:10px;padding:7px;">'
-          + '<span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:999px;background:' + esc(g.color || "#0f766e") + ';"></i>' + esc(g.name) + '</span>'
-          + '<button class="warn" onclick="deleteGroup(' + g.id + ')">' + esc(t("delete")) + '</button>'
+        return '<div class="row group-row">'
+          + '<span class="chip"><i class="swatch" data-color="' + esc(g.color || "#0f766e") + '"></i>' + esc(g.name) + '</span>'
+          + '<button class="warn" data-action="delete-group" data-id="' + g.id + '">' + esc(t("delete")) + '</button>'
           + '</div>';
       }).join("");
+      applyDynamicStyles();
     }
 
     function groupOptionsHtml(selectedGroupId) {
@@ -2251,7 +2993,7 @@ function appHtml(env) {
         const code = state.code || "------";
         const ex = state.expiresIn || "";
         const progress = state.progress || 0;
-        const group = e.group_name ? '<span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:999px;background:' + esc(e.group_color || "#0f766e") + ';"></i>' + esc(e.group_name) + '</span>' : '';
+        const group = e.group_name ? '<span class="chip"><i class="swatch" data-color="' + esc(e.group_color || "#0f766e") + '"></i>' + esc(e.group_name) + '</span>' : '';
         const otpTag = '<span class="chip">' + esc((e.otp_type || "totp").toUpperCase()) + '</span>';
         const counter = (e.otp_type === "hotp") ? ('<span class="chip">counter ' + Number(e.hotp_counter || 0) + '</span>') : '';
         return '<article class="entry">'
@@ -2260,18 +3002,19 @@ function appHtml(env) {
           + '<div class="row">' + otpTag + group + counter + '</div>'
           + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
           + '<div class="muted" id="x-' + e.id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
-          + '<div class="bar"><i id="p-' + e.id + '" style="width:' + progress + '%;"></i></div>'
-          + '<div class="row" style="margin-top:8px;">'
+          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + progress + '"></i></div>'
+          + '<div class="row mt-8">'
           + (e.otp_type === "hotp"
-            ? '<button onclick="genHotp(' + e.id + ')">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" onclick="copyCode(' + e.id + ')">' + esc(t("copyCode")) + '</button>')
+            ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
+            : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
           + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
-          + '<button class="ghost" onclick="setEntryGroup(' + e.id + ')">' + esc(t("setGroup")) + '</button>'
-          + '<button class="ghost" onclick="removeEntryGroup(' + e.id + ')">' + esc(t("removeGroup")) + '</button>'
-          + '<button class="ghost" onclick="editEntry(' + e.id + ')">' + esc(t("edit")) + '</button>'
-          + '<button class="warn" onclick="deleteEntry(' + e.id + ')">' + esc(t("delete")) + '</button>'
+          + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
+          + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
+          + '<button class="ghost" data-action="edit-entry" data-id="' + e.id + '">' + esc(t("edit")) + '</button>'
+          + '<button class="warn" data-action="delete-entry" data-id="' + e.id + '">' + esc(t("delete")) + '</button>'
           + '</div></article>';
       }).join("");
+      applyDynamicStyles();
     }
 
     async function refreshVisibleCodes() {
@@ -2455,13 +3198,44 @@ function appHtml(env) {
       table.innerHTML = "<tr><th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th></tr>";
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' onclick='switchRole(" + u.id + ",\\\"" + next + "\\\")'>" + esc(t("setRole")) + " " + next + "</button> <button class='warn' onclick='deleteUser(" + u.id + ")'>" + esc(t("delete")) + "</button></td></tr>";
+        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
+        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
       });
     }
 
     async function switchRole(id, role) {
+      // F-03 fix: properly implemented switchRole body
       await api("/api/users/" + id + "/role", { method: "PATCH", body: JSON.stringify({ role: role }) });
       await refreshUsers();
+    }
+
+    async function changeMyPassword() {
+      const currentPassword = prompt(t("currentPassword"));
+      if (!currentPassword) return;
+      const newPassword = prompt(t("newPassword"));
+      if (!newPassword) return;
+      try {
+        await api("/api/me/password", {
+          method: "PATCH",
+          body: JSON.stringify({ currentPassword: currentPassword, newPassword: newPassword })
+        });
+        alert(t("passwordChanged"));
+        location.reload();
+      } catch (e) { alert(e.message); }
+    }
+
+    async function resetPassword(id) {
+      if (!confirm(t("passwordResetConfirm"))) return;
+      const newPassword = prompt(t("newPassword"));
+      if (!newPassword) return;
+      try {
+        await api("/api/users/" + id + "/password", {
+          method: "PATCH",
+          body: JSON.stringify({ newPassword: newPassword })
+        });
+        alert(t("passwordReset"));
+        await refreshUsers();
+      } catch (e) { alert(e.message); }
     }
 
     async function deleteUser(id) {
@@ -2472,11 +3246,21 @@ function appHtml(env) {
 
     function toggleImport() {
       const el = document.getElementById("importPanel");
-      el.style.display = el.style.display === "none" ? "block" : "none";
+      el.classList.toggle("hidden");
     }
 
     async function exportData() {
-      const d = await api("/api/export");
+      if (!PLAINTEXT_EXPORT_ENABLED) {
+        alert(t("plaintextExportDisabled"));
+        return;
+      }
+      if (!confirm(t("plaintextExportConfirm"))) return;
+      const password = prompt(t("currentPassword"));
+      if (!password) return;
+      const d = await api("/api/export", {
+        method: "POST",
+        body: JSON.stringify({ confirmPassword: password })
+      });
       const text = JSON.stringify(d, null, 2);
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(text);
@@ -2488,7 +3272,19 @@ function appHtml(env) {
 
     async function exportOtpAuthTxt() {
       try {
-        const resp = await fetch("/api/export/otpauth", { credentials: "include" });
+        if (!PLAINTEXT_EXPORT_ENABLED) {
+          alert(t("plaintextExportDisabled"));
+          return;
+        }
+        if (!confirm(t("plaintextExportConfirm"))) return;
+        const password = prompt(t("currentPassword"));
+        if (!password) return;
+        const resp = await fetch("/api/export/otpauth", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmPassword: password })
+        });
         if (!resp.ok) {
           let err = "HTTP " + resp.status;
           try {
@@ -2569,7 +3365,7 @@ function appHtml(env) {
         const video = document.getElementById("scanVideo");
         scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
         video.srcObject = scanStream;
-        video.style.display = "block";
+        video.classList.remove("hidden");
         msg("scanMsg", t("cameraStarted"));
         const canUseBarcodeDetector = "BarcodeDetector" in window;
         let detector = null;
@@ -2614,7 +3410,7 @@ function appHtml(env) {
       const video = document.getElementById("scanVideo");
       if (video) {
         video.srcObject = null;
-        video.style.display = "none";
+        video.classList.add("hidden");
       }
     }
 
@@ -2694,6 +3490,8 @@ function appHtml(env) {
         }
         const s = document.createElement("script");
         s.src = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js";
+        s.integrity = "sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx";
+        s.crossOrigin = "anonymous";
         s.async = true;
         s.dataset.jsqr = "1";
         s.onload = resolve;
@@ -2808,12 +3606,79 @@ function appHtml(env) {
         .replace(/'/g, "&#39;");
     }
 
+    function bindUiEvents() {
+      document.addEventListener("click", function(evt) {
+        const target = evt.target.closest("[data-action]");
+        if (!target) return;
+        const action = target.dataset.action;
+        const id = Number(target.dataset.id || 0);
+        const role = target.dataset.role || "";
+        const run = {
+          "bootstrap": function() { return bootstrap(evt); },
+          "login": function() { return login(evt); },
+          "logout": function() { return logout(evt); },
+          "refresh-all": refreshAll,
+          "export-data": exportData,
+          "export-otpauth": exportOtpAuthTxt,
+          "export-encrypted": exportDataEncrypted,
+          "toggle-import": toggleImport,
+          "import-data": importData,
+          "import-otpauth": importOtpAuthText,
+          "import-encrypted": importDataEncrypted,
+          "start-scan": startScan,
+          "stop-scan": stopScan,
+          "recognize-frame": recognizeCurrentFrameByApi,
+          "create-entry": createEntry,
+          "create-group": createGroup,
+          "create-user": createUser,
+          "save-login-policy": saveLoginPolicy,
+          "delete-group": function() { return deleteGroup(id); },
+          "gen-hotp": function() { return genHotp(id); },
+          "copy-code": function() { return copyCode(id); },
+          "set-entry-group": function() { return setEntryGroup(id); },
+          "remove-entry-group": function() { return removeEntryGroup(id); },
+          "edit-entry": function() { return editEntry(id); },
+          "delete-entry": function() { return deleteEntry(id); },
+          "switch-role": function() { return switchRole(id, role); },
+          "change-my-password": changeMyPassword,
+          "reset-password": function() { return resetPassword(id); },
+          "delete-user": function() { return deleteUser(id); },
+        }[action];
+        if (!run) return;
+        evt.preventDefault();
+        Promise.resolve(run()).catch(function(e) { alert(e.message || String(e)); });
+      });
+
+      document.getElementById("langSelect").addEventListener("change", function(evt) {
+        changeLang(evt.target.value);
+      });
+      document.getElementById("autoLogoutSelect").addEventListener("change", function(evt) {
+        changeAutoLogout(evt.target.value);
+      });
+      document.getElementById("search").addEventListener("input", renderEntries);
+      document.getElementById("groupFilter").addEventListener("change", renderEntries);
+      document.getElementById("importFile").addEventListener("change", loadImportFile);
+      document.getElementById("qrImageFile").addEventListener("change", scanImageFile);
+    }
+
+    function applyDynamicStyles() {
+      document.querySelectorAll(".swatch[data-color]").forEach(function(el) {
+        const color = el.getAttribute("data-color") || "#0f766e";
+        if (/^#[0-9a-fA-F]{6}$/.test(color)) el.style.backgroundColor = color;
+      });
+      document.querySelectorAll(".bar > i[data-progress]").forEach(function(el) {
+        const progress = Math.max(0, Math.min(100, Number(el.getAttribute("data-progress") || 0)));
+        el.style.width = progress + "%";
+      });
+    }
+
     setInterval(function() {
       entries.forEach(function(e) {
         if (e.otp_type !== "hotp") refreshCode(e.id, true);
       });
     }, 5000);
 
+    bindUiEvents();
     init();
   </script>
 </body>
