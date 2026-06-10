@@ -1,2 +1,5 @@
-(src/worker.js)
+node_modules/
+.wrangler/
+.codex-remote-attachments/
+tmp_*
 SECURITY-AUDIT-REPORT.md
