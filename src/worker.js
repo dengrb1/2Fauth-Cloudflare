@@ -1,4 +1,4 @@
-﻿const SESSION_COOKIE = "__Host-session";
+const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
@@ -490,7 +490,7 @@ async function handleCodesBatchForAuth(request, env, auth) {
     try {
       const period = normalizeTotpPeriod(row.period);
       const digits = normalizeOtpDigits(row.digits);
-      const algorithm = normalizeAlgorithm(row.algorithm || "SHA-256");
+      const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
       if (!algorithm) {
         items.push({ id, otpType: "totp", error: "Unsupported OTP algorithm" });
         continue;
@@ -590,7 +590,7 @@ async function handleCreateEntry(request, env) {
   const secret = String(payload.secret || "").trim();
   const digits = Number(payload.digits || 6);
   const period = Number(payload.period || 30);
-  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-256");
+  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-1");
   const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
   const hotpCounter = Number(payload.hotpCounter || 0);
   const groupId = parseOptionalPositiveId(payload.groupId);
@@ -602,7 +602,7 @@ async function handleCreateEntry(request, env) {
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-1, SHA-256, or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   try {
@@ -648,7 +648,7 @@ async function handleUpdateEntry(request, env) {
   const issuer = body.issuer !== undefined ? String(body.issuer).trim() : existing.issuer;
   const digits = body.digits !== undefined ? Number(body.digits) : existing.digits;
   const period = body.period !== undefined ? Number(body.period) : existing.period;
-  const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-256");
+  const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-1");
   const otpType = body.otpType ? (body.otpType === "hotp" ? "hotp" : "totp") : (existing.otp_type || "totp");
   const hotpCounter = body.hotpCounter !== undefined ? Number(body.hotpCounter) : (existing.hotp_counter || 0);
   const groupId = body.groupId !== undefined ? parseOptionalPositiveId(body.groupId) : existing.group_id;
@@ -657,7 +657,7 @@ async function handleUpdateEntry(request, env) {
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-1, SHA-256, or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   let secretEnc = existing.secret_enc;
@@ -706,7 +706,7 @@ async function handleEntryCode(request, env) {
   const period = normalizeTotpPeriod(row.period);
   const digits = normalizeOtpDigits(row.digits);
   const step = Math.floor(nowSec / period);
-  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-256");
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
   const code = await generateTotp(secret, period, digits, algorithm, step);
   const expiresIn = period - (nowSec % period);
@@ -728,7 +728,7 @@ async function handleVerifyTotp(request, env) {
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
   if ((row.otp_type || "totp") === "hotp") return json({ error: "Use /api/entries/:id/hotp for HOTP codes" }, 400);
 
-  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-256");
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
   const secret = await decryptText(row.secret_enc, env);
   const nowSec = Math.floor(Date.now() / 1000);
@@ -758,7 +758,7 @@ async function handleConsumeHotp(request, env) {
   const secret = await decryptText(row.secret_enc, env);
   const counter = Number(row.hotp_counter || 0);
   const digits = normalizeOtpDigits(row.digits);
-  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-256");
+  const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
 
   // F-06 fix: atomically increment counter FIRST, then generate code.
@@ -923,7 +923,7 @@ async function handleImportOtpAuth(request, env) {
       if (!secretBytes.length) throw new Error("invalid");
       const digits = normalizeOtpDigits(data.digits);
       const period = normalizeTotpPeriod(data.period);
-      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-256");
+      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1");
       if (!algorithm) {
         errors.push("Unsupported OTP algorithm");
         continue;
@@ -1066,7 +1066,7 @@ async function importPayload(body, auth, env) {
     }
     const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
     const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
-    const algorithm = normalizeAlgorithm(e.algorithm || "SHA-256");
+    const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1");
     if (!algorithm) continue;
     const digits = normalizeOtpDigits(e.digits);
     const period = normalizeTotpPeriod(e.period);
@@ -1897,8 +1897,8 @@ function parseOtpAuthUri(uri) {
     const digits = Number(url.searchParams.get("digits") || 6);
     const period = Number(url.searchParams.get("period") || 30);
     const hotpCounter = Number(url.searchParams.get("counter") || 0);
-    const algorithm = normalizeAlgorithm(url.searchParams.get("algorithm") || "SHA-256");
-    if (!algorithm) return { ok: false, error: "otpauth URI algorithm must be SHA-256 or SHA-512" };
+    const algorithm = normalizeAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
+    if (!algorithm) return { ok: false, error: "otpauth URI algorithm must be SHA-1, SHA-256, or SHA-512" };
     return {
       ok: true,
       data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, otpType, hotpCounter },
@@ -1922,7 +1922,7 @@ function buildOtpAuthUri(entry) {
   const params = new URLSearchParams();
   params.set("secret", String(entry.secret || ""));
   if (entry.issuer) params.set("issuer", String(entry.issuer));
-  params.set("algorithm", String(normalizeAlgorithm(entry.algorithm || "SHA-256") || "SHA-256").replace("-", ""));
+  params.set("algorithm", String(normalizeAlgorithm(entry.algorithm || "SHA-1") || "SHA-1").replace("-", ""));
   params.set("digits", String(Number(entry.digits || 6)));
   if (otpType === "hotp") {
     params.set("counter", String(Number(entry.hotp_counter || 0)));
@@ -1978,6 +1978,7 @@ function base32Decode(input) {
 
 function normalizeAlgorithm(value) {
   const v = String(value || "").toUpperCase();
+  if (v === "SHA1" || v === "SHA-1") return "SHA-1";
   if (v === "SHA256" || v === "SHA-256") return "SHA-256";
   if (v === "SHA512" || v === "SHA-512") return "SHA-512";
   return null;
@@ -2496,7 +2497,7 @@ function appHtml(env, nonce) {
             <div id="scanMsg" class="muted"></div>
             <div class="row">
               <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
-              <select id="eAlgo"><option>SHA-256</option><option>SHA-512</option></select>
+              <select id="eAlgo"><option>SHA-1</option><option>SHA-256</option><option>SHA-512</option></select>
               <input id="eDigits" value="6" class="narrow-74" />
               <input id="ePeriod" value="30" class="narrow-74" />
               <input id="eCounter" value="0" class="narrow-86" />
