@@ -166,15 +166,15 @@ async function handleStatus(request, env) {
 }
 
 async function handleBootstrap(request, env) {
-  const initialized = await hasAnyUser(env);
-  if (initialized) return json({ error: "Already initialized" }, 400);
-
   const body = await parseJson(request);
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
   if (!username || !validPassword(password)) {
     return json({ error: `Invalid username or password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
   }
+
+  const initialized = await hasAnyUser(env);
+  if (initialized) return json({ error: "Already initialized" }, 400);
 
   const { hashB64, saltB64 } = await hashPassword(password);
   const now = nowIso();
@@ -590,7 +590,7 @@ async function handleCreateEntry(request, env) {
   const secret = String(payload.secret || "").trim();
   const digits = Number(payload.digits || 6);
   const period = Number(payload.period || 30);
-  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-1");
+  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-256");
   const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
   const hotpCounter = Number(payload.hotpCounter || 0);
   const groupId = parseOptionalPositiveId(payload.groupId);
@@ -602,7 +602,8 @@ async function handleCreateEntry(request, env) {
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-1, SHA-256, or SHA-512" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   try {
@@ -1411,6 +1412,23 @@ async function clearLoginRiskControl(request, env, username) {
   await env.DB.prepare("DELETE FROM login_risk_control WHERE key = ?").bind(riskKey).run();
 }
 
+async function clearLoginRiskForUsername(env, username) {
+  const normalized = String(username || "").trim();
+  if (!normalized) return;
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE username = ?").bind(normalized).run();
+}
+
+async function deleteUserSessions(env, userId) {
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run().catch((err) => {
+    if (isMissingTableError(err, "sessions")) return;
+    throw err;
+  });
+  await env.DB.prepare("DELETE FROM api_sessions WHERE user_id = ?").bind(userId).run().catch((err) => {
+    if (isMissingTableError(err, "api_sessions")) return;
+    throw err;
+  });
+}
+
 async function applyApiRateLimit(request, env, route) {
   if (!shouldRateLimitRoute(request, route)) return null;
   const nowSec = Math.floor(Date.now() / 1000);
@@ -1425,8 +1443,7 @@ async function applyApiRateLimit(request, env, route) {
       .bind(rateKey)
       .first();
   } catch (err) {
-    if (isMissingTableError(err, "login_risk_control")) return null;
-    throw err;
+    return null;
   }
 
   let windowStart = nowSec;
@@ -1443,8 +1460,7 @@ async function applyApiRateLimit(request, env, route) {
       .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
       .run();
   } catch (err) {
-    if (isMissingTableError(err, "login_risk_control")) return null;
-    throw err;
+    return null;
   }
 
   if (requestCount > maxRequests) {
@@ -2181,6 +2197,9 @@ function normalizedAllowedCorsOrigins(env) {
 function isSafeCorsOrigin(origin) {
   // F-11 fix: no longer automatically trust all browser extensions.
   // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
+  if (/^(https?|chrome-extension|edge-extension|moz-extension):\/\/[A-Za-z0-9_-]+$/.test(origin)) {
+    return true;
+  }
   try {
     const url = new URL(origin);
     return origin === url.origin && ["https:", "http:"].includes(url.protocol);
@@ -2549,6 +2568,7 @@ function appHtml(env, nonce) {
 
   <script nonce="${nonce}">
     const TURNSTILE_SITE_KEY = ${JSON.stringify(turnstileSiteKey)};
+    const PLAINTEXT_EXPORT_ENABLED = ${JSON.stringify(String((env && env.ALLOW_PLAINTEXT_EXPORT) || "").toLowerCase() === "true")};
     let currentUser = null;
     let entries = [];
     let groups = [];
@@ -2589,6 +2609,7 @@ function appHtml(env, nonce) {
         backupCopied: "备份 JSON 已复制到剪贴板。",
         encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
         plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
+        plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
         setBackupPassphrase: "设置备份口令（至少10位）",
         copyExportJson: "复制导出 JSON",
         copyEncryptedExportJson: "复制加密导出 JSON",
@@ -2663,6 +2684,7 @@ function appHtml(env, nonce) {
         backupCopied: "Backup JSON copied to clipboard.",
         encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
         plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
+        plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
         setBackupPassphrase: "Set backup passphrase (>=10 chars):",
         copyExportJson: "Copy export JSON:",
         copyEncryptedExportJson: "Copy encrypted export JSON:",
@@ -2737,9 +2759,18 @@ function appHtml(env, nonce) {
       document.documentElement.lang = currentLang;
       document.getElementById("langSelect").value = currentLang;
       document.getElementById("autoLogoutSelect").value = String(autoLogoutMinutes);
+      syncPlaintextExportUi();
       if (!currentUser) {
         document.getElementById("state").textContent = t("loading");
       }
+    }
+
+    function syncPlaintextExportUi() {
+      const buttons = document.querySelectorAll('[data-action="export-data"], [data-action="export-otpauth"]');
+      buttons.forEach(function(button) {
+        button.disabled = !PLAINTEXT_EXPORT_ENABLED;
+        button.title = PLAINTEXT_EXPORT_ENABLED ? "" : t("plaintextExportDisabled");
+      });
     }
 
     async function timeoutLogout() {
@@ -3219,6 +3250,10 @@ function appHtml(env, nonce) {
     }
 
     async function exportData() {
+      if (!PLAINTEXT_EXPORT_ENABLED) {
+        alert(t("plaintextExportDisabled"));
+        return;
+      }
       if (!confirm(t("plaintextExportConfirm"))) return;
       const password = prompt(t("currentPassword"));
       if (!password) return;
@@ -3237,6 +3272,10 @@ function appHtml(env, nonce) {
 
     async function exportOtpAuthTxt() {
       try {
+        if (!PLAINTEXT_EXPORT_ENABLED) {
+          alert(t("plaintextExportDisabled"));
+          return;
+        }
         if (!confirm(t("plaintextExportConfirm"))) return;
         const password = prompt(t("currentPassword"));
         if (!password) return;

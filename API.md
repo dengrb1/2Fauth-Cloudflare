@@ -156,10 +156,12 @@ Encrypted export is the default safe export path:
 
 - `POST /api/export/encrypted`
 
-Plaintext export endpoints are disabled unless `ALLOW_PLAINTEXT_EXPORT=true` is configured and the request includes `confirm=plaintext` or `x-plaintext-export-confirm: true`:
+Plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password confirmation in the POST body:
 
-- `GET /api/export`
-- `GET /api/export/otpauth`
+- `POST /api/export` with `{ "confirmPassword": "<current password>" }`
+- `POST /api/export/otpauth` with `{ "confirmPassword": "<current password>" }`
+
+When the flag is disabled, both endpoints return `403`.
 
 ## Browser Extension CORS
 
