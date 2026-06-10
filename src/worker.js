@@ -47,7 +47,9 @@ const API_ROUTES = [
   ...entryRoutes("/api"),
   ...groupRoutes("/api"),
   ["GET", "/api/export", handleExportData],
+  ["POST", "/api/export", handleExportData],
   ["GET", "/api/export/otpauth", handleExportOtpAuth],
+  ["POST", "/api/export/otpauth", handleExportOtpAuth],
   ["POST", "/api/export/encrypted", handleExportDataEncrypted],
   ["POST", "/api/import", handleImportData],
   ["POST", "/api/import/otpauth", handleImportOtpAuth],
@@ -354,6 +356,16 @@ async function handleExtensionLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+
+  // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
+  const turnstileToken = String(body.turnstileToken || "");
+  if (hasTurnstileSecret(env)) {
+    const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
+    const ts = await verifyTurnstileToken(turnstileToken, ip, env);
+    if (!ts.ok) {
+      return json({ error: "Turnstile verification failed" }, 400);
+    }
+  }
 
   const row = await env.DB.prepare(
     "SELECT id, username, role, password_hash, password_salt FROM users WHERE username = ?"
@@ -748,19 +760,19 @@ async function handleConsumeHotp(request, env) {
   const digits = normalizeOtpDigits(row.digits);
   const algorithm = normalizeAlgorithm(row.algorithm || "SHA-256");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
-  const code = await generateHotp(secret, digits, algorithm, counter);
-  
-  // Use transactional update with counter verification to prevent race condition
+
+  // F-06 fix: atomically increment counter FIRST, then generate code.
+  // This prevents concurrent requests from generating the same code.
   const nextCounter = counter + 1;
   const result = await env.DB.prepare(
     "UPDATE totp_entries SET hotp_counter = ? WHERE id = ? AND hotp_counter = ?"
   ).bind(nextCounter, id, counter).run();
-  
+
   if (result.meta?.changes === 0) {
-    // Counter was modified by another request, reject this attempt
-    return json({ error: "HOTP code already consumed or counter mismatch" }, 409);
+    return json({ error: "HOTP code already consumed or counter mismatch, please retry" }, 409);
   }
-  
+
+  const code = await generateHotp(secret, digits, algorithm, counter);
   return json({ code, counter, nextCounter, otpType: "hotp" });
 }
 
@@ -826,7 +838,7 @@ async function handleDeleteGroup(request, env) {
 async function handleExportData(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const confirmation = requirePlaintextExportConfirmation(request, env);
+  const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
   if (confirmation) return confirmation;
   return json(await getExportPayload(auth, env));
 }
@@ -842,7 +854,7 @@ async function handleImportData(request, env) {
 async function handleExportOtpAuth(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
-  const confirmation = requirePlaintextExportConfirmation(request, env);
+  const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
   if (confirmation) return confirmation;
 
   const entriesQuery =
@@ -886,6 +898,10 @@ async function handleImportOtpAuth(request, env) {
 
   const uris = extractOtpAuthUris(text);
   if (!uris.length) return json({ error: "No otpauth URI found in text" }, 400);
+  // F-10 fix: limit otpauth import size
+  if (uris.length > 500) {
+    return json({ error: "Too many otpauth URIs (max 500)" }, 400);
+  }
 
   let imported = 0;
   const errors = [];
@@ -935,16 +951,29 @@ async function handleImportOtpAuth(request, env) {
   });
 }
 
-function requirePlaintextExportConfirmation(request, env) {
+async function requirePlaintextExportConfirmation(request, env, auth) {
   if (String(env.ALLOW_PLAINTEXT_EXPORT || "").toLowerCase() !== "true") {
     return json({ error: "Plaintext export is disabled. Use /api/export/encrypted." }, 403);
   }
-  const url = new URL(request.url);
-  const confirmed =
-    url.searchParams.get("confirm") === "plaintext" ||
-    String(request.headers.get("x-plaintext-export-confirm") || "").toLowerCase() === "true";
-  if (!confirmed) {
-    return json({ error: "Plaintext export requires explicit confirmation." }, 400);
+  // Read password from request body for re-verification
+  let password;
+  try {
+    const body = await parseJson(request.clone());
+    password = String(body.confirmPassword || "");
+  } catch {
+    return json({ error: "Password confirmation required for plaintext export." }, 400);
+  }
+  if (!password) {
+    return json({ error: "Password confirmation required for plaintext export." }, 400);
+  }
+  // Retrieve user's current password hash for verification
+  const userRow = await env.DB.prepare(
+    "SELECT password_hash, password_salt FROM users WHERE id = ?"
+  ).bind(auth.user.id).first();
+  if (!userRow) return json({ error: "User not found" }, 401);
+  const passwordCheck = await verifyPassword(password, userRow.password_salt, userRow.password_hash);
+  if (!passwordCheck) {
+    return json({ error: "Invalid password confirmation" }, 401);
   }
   return null;
 }
@@ -980,6 +1009,16 @@ async function getExportPayload(auth, env) {
 async function importPayload(body, auth, env) {
   const groups = Array.isArray(body.groups) ? body.groups : [];
   const entries = Array.isArray(body.entries) ? body.entries : [];
+
+  // F-10 fix: limit import size to prevent DoS
+  const MAX_IMPORT_ENTRIES = 500;
+  const MAX_IMPORT_GROUPS = 100;
+  if (groups.length > MAX_IMPORT_GROUPS) {
+    return json({ error: `groups cannot exceed ${MAX_IMPORT_GROUPS}` }, 400);
+  }
+  if (entries.length > MAX_IMPORT_ENTRIES) {
+    return json({ error: `entries cannot exceed ${MAX_IMPORT_ENTRIES}` }, 400);
+  }
   const imported = { groups: 0, entries: 0 };
 
   // Admin can only import to their own account unless explicitly managing another user
@@ -1424,7 +1463,6 @@ function shouldRateLimitRoute(request, route) {
   if (path === "/api/status" || path === "/api/v1/capabilities") return false;
   if (
     [
-      "/api/bootstrap",
       "/api/login",
       "/api/mobile/login",
       "/api/extension/login",
@@ -1768,7 +1806,9 @@ async function upgradePasswordHash(env, userId, password) {
 const encryptionKeyCache = new Map();
 
 async function getEncryptionKey(env) {
-  const cacheKey = `${env.ENVIRONMENT || env.NODE_ENV || "default"}|${env.ENCRYPTION_KEY}|${env.SESSION_PEPPER}`;
+  // F-02 fix: hash secrets instead of storing plaintext secrets in Map key
+  const raw = `${env.ENVIRONMENT || env.NODE_ENV || "default"}|${env.ENCRYPTION_KEY}|${env.SESSION_PEPPER}`;
+  const cacheKey = await sha256Base64(raw);
   if (!encryptionKeyCache.has(cacheKey)) {
     if (encryptionKeyCache.size >= 8) encryptionKeyCache.clear();
     encryptionKeyCache.set(cacheKey, crypto.subtle.importKey("raw", b64ToBytes(env.ENCRYPTION_KEY), "AES-GCM", false, [
@@ -2138,8 +2178,8 @@ function normalizedAllowedCorsOrigins(env) {
 }
 
 function isSafeCorsOrigin(origin) {
-  if (/^chrome-extension:\/\/[a-z0-9_-]{3,128}$/i.test(origin)) return true;
-  if (/^moz-extension:\/\/[a-z0-9_-]{3,128}$/i.test(origin)) return true;
+  // F-11 fix: no longer automatically trust all browser extensions.
+  // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
   try {
     const url = new URL(origin);
     return origin === url.origin && ["https:", "http:"].includes(url.protocol);
@@ -2159,6 +2199,7 @@ function appendVary(current, value) {
 
 function commonSecurityHeaders() {
   return {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "1; mode=block",
@@ -2186,6 +2227,7 @@ function json(data, status = 200, headers = {}) {
 }
 
 function html(markup, nonce) {
+  // F-08 fix: jsQR has SRI integrity; cdn.jsdelivr.net still needed for fetch. Inlining jsQR would eliminate this risk.
   const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"];
   const styleSrc = ["'self'", `'nonce-${nonce}'`];
   return new Response(markup, {
@@ -2444,8 +2486,8 @@ function appHtml(env, nonce) {
               <button class="ghost" data-action="stop-scan">停止扫码</button>
               <button class="ghost" data-action="recognize-frame">API识别当前画面</button>
               <select id="scanMode">
+                <option value="local" selected>仅本地识别（推荐）</option>
                 <option value="auto">自动（本地优先，失败走API）</option>
-                <option value="local">仅本地识别</option>
                 <option value="api">仅API识别</option>
               </select>
               <input id="qrImageFile" type="file" accept="image/*" />
@@ -3130,6 +3172,10 @@ function appHtml(env, nonce) {
     }
 
     async function switchRole(id, role) {
+      // F-03 fix: properly implemented switchRole body
+      await api("/api/users/" + id + "/role", { method: "PATCH", body: JSON.stringify({ role: role }) });
+      await refreshUsers();
+    }
 
     async function changeMyPassword() {
       const currentPassword = prompt(t("currentPassword"));
@@ -3159,9 +3205,6 @@ function appHtml(env, nonce) {
         await refreshUsers();
       } catch (e) { alert(e.message); }
     }
-      await api("/api/users/" + id + "/role", { method: "PATCH", body: JSON.stringify({ role: role }) });
-      await refreshUsers();
-    }
 
     async function deleteUser(id) {
       if (!confirm(t("deleteUserConfirm"))) return;
@@ -3176,8 +3219,11 @@ function appHtml(env, nonce) {
 
     async function exportData() {
       if (!confirm(t("plaintextExportConfirm"))) return;
-      const d = await api("/api/export?confirm=plaintext", {
-        headers: { "x-plaintext-export-confirm": "true" }
+      const password = prompt(t("currentPassword"));
+      if (!password) return;
+      const d = await api("/api/export", {
+        method: "POST",
+        body: JSON.stringify({ confirmPassword: password })
       });
       const text = JSON.stringify(d, null, 2);
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -3191,9 +3237,13 @@ function appHtml(env, nonce) {
     async function exportOtpAuthTxt() {
       try {
         if (!confirm(t("plaintextExportConfirm"))) return;
-        const resp = await fetch("/api/export/otpauth?confirm=plaintext", {
+        const password = prompt(t("currentPassword"));
+        if (!password) return;
+        const resp = await fetch("/api/export/otpauth", {
+          method: "POST",
           credentials: "include",
-          headers: { "x-plaintext-export-confirm": "true" }
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmPassword: password })
         });
         if (!resp.ok) {
           let err = "HTTP " + resp.status;
@@ -3400,6 +3450,8 @@ function appHtml(env, nonce) {
         }
         const s = document.createElement("script");
         s.src = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js";
+        s.integrity = "sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx";
+        s.crossOrigin = "anonymous";
         s.async = true;
         s.dataset.jsqr = "1";
         s.onload = resolve;
