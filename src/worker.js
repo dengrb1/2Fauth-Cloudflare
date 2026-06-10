@@ -36,12 +36,14 @@ const API_ROUTES = [
   ["POST", "/api/v1/auth/refresh", handleApiClientRefresh],
   ["POST", "/api/v1/auth/logout", handleApiClientLogout],
   ["GET", "/api/v1/me", handleMe],
+  ["PATCH", "/api/v1/me/password", handleChangeMyPassword],
   ...entryRoutes("/api/v1"),
   ...groupRoutes("/api/v1"),
   ["POST", "/api/v1/codes/batch", handleApiCodesBatch],
   ["POST", "/api/logout", handleLogout],
   ["POST", "/api/session/close-soon", handleCloseSoon],
   ["GET", "/api/me", handleMe],
+  ["PATCH", "/api/me/password", handleChangeMyPassword],
   ...entryRoutes("/api"),
   ...groupRoutes("/api"),
   ["GET", "/api/export", handleExportData],
@@ -53,6 +55,7 @@ const API_ROUTES = [
   ["GET", "/api/users", handleListUsers],
   ["POST", "/api/users", handleCreateUser],
   ["PATCH", /^\/api\/users\/\d+\/role$/, handleUpdateUserRole],
+  ["PATCH", /^\/api\/users\/\d+\/password$/, handleResetUserPassword],
   ["DELETE", /^\/api\/users\/\d+$/, handleDeleteUser],
   ["GET", "/api/security/login-policy", handleGetLoginPolicy],
   ["PATCH", "/api/security/login-policy", handleUpdateLoginPolicy],
@@ -1124,6 +1127,63 @@ async function handleCreateUser(request, env) {
   } catch {
     return json({ error: "Username already exists" }, 409);
   }
+}
+
+async function handleChangeMyPassword(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await parseJson(request);
+  const currentPassword = String(body.currentPassword || body.oldPassword || "");
+  const newPassword = String(body.newPassword || body.password || "");
+  if (!currentPassword || !newPassword) {
+    return json({ error: "currentPassword and newPassword are required" }, 400);
+  }
+  if (!validPassword(newPassword)) {
+    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, username, password_hash, password_salt FROM users WHERE id = ?")
+    .bind(auth.user.id)
+    .first();
+  if (!target) return json({ error: "User not found" }, 404);
+
+  const passwordCheck = await verifyPasswordDetailed(currentPassword, target.password_salt, target.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid current password" }, 401);
+
+  await upgradePasswordHash(env, auth.user.id, newPassword);
+  await deleteUserSessions(env, auth.user.id);
+  await clearLoginRiskForUsername(env, target.username);
+
+  const headers = auth.sessionKind === "web" ? { "set-cookie": clearSessionCookie() } : {};
+  return json({ ok: true }, 200, headers);
+}
+
+async function handleResetUserPassword(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
+
+  const id = pathResourceId(request, "users");
+  if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
+  if (id === auth.user.id) {
+    return json({ error: "Use /api/me/password to change your own password" }, 400);
+  }
+
+  const body = await parseJson(request);
+  const newPassword = String(body.newPassword || body.password || "");
+  if (!validPassword(newPassword)) {
+    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
+  if (!target) return json({ error: "User not found" }, 404);
+
+  await upgradePasswordHash(env, id, newPassword);
+  await deleteUserSessions(env, id);
+  await clearLoginRiskForUsername(env, target.username);
+
+  return json({ ok: true });
 }
 
 async function handleUpdateUserRole(request, env) {
@@ -2353,6 +2413,7 @@ function appHtml(env, nonce) {
           <button class="ghost" data-action="export-otpauth">导出 otpauth 文本</button>
           <button class="ghost" data-action="export-encrypted">加密导出</button>
           <button class="ghost" data-action="toggle-import">导入</button>
+          <button class="ghost" data-action="change-my-password">修改密码</button>
           <button type="button" class="warn" data-action="logout">退出登录</button>
         </div>
       </div>
@@ -2506,6 +2567,13 @@ function appHtml(env, nonce) {
         scanImageFailed: "图片扫码失败：",
         saved: "已保存",
         userCreated: "用户已创建",
+        changePassword: "修改密码",
+        resetPassword: "重置密码",
+        currentPassword: "当前密码",
+        newPassword: "新密码",
+        passwordChanged: "密码已修改，请重新登录。",
+        passwordReset: "密码已重置",
+        passwordResetConfirm: "确认重置该用户的密码？",
         labelPrompt: "标签",
         issuerPrompt: "发行方",
         groupIdPrompt: "分组 ID（留空代表不分组）",
@@ -2573,6 +2641,13 @@ function appHtml(env, nonce) {
         scanImageFailed: "Failed to scan image: ",
         saved: "Saved",
         userCreated: "User created",
+        changePassword: "Change Password",
+        resetPassword: "Reset Password",
+        currentPassword: "Current password",
+        newPassword: "New password",
+        passwordChanged: "Password changed. Please login again.",
+        passwordReset: "Password reset",
+        passwordResetConfirm: "Confirm reset this user's password?",
         labelPrompt: "Label",
         issuerPrompt: "Issuer",
         groupIdPrompt: "Group ID (empty for none)",
@@ -3050,10 +3125,40 @@ function appHtml(env, nonce) {
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
         table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
+        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
       });
     }
 
     async function switchRole(id, role) {
+
+    async function changeMyPassword() {
+      const currentPassword = prompt(t("currentPassword"));
+      if (!currentPassword) return;
+      const newPassword = prompt(t("newPassword"));
+      if (!newPassword) return;
+      try {
+        await api("/api/me/password", {
+          method: "PATCH",
+          body: JSON.stringify({ currentPassword: currentPassword, newPassword: newPassword })
+        });
+        alert(t("passwordChanged"));
+        location.reload();
+      } catch (e) { alert(e.message); }
+    }
+
+    async function resetPassword(id) {
+      if (!confirm(t("passwordResetConfirm"))) return;
+      const newPassword = prompt(t("newPassword"));
+      if (!newPassword) return;
+      try {
+        await api("/api/users/" + id + "/password", {
+          method: "PATCH",
+          body: JSON.stringify({ newPassword: newPassword })
+        });
+        alert(t("passwordReset"));
+        await refreshUsers();
+      } catch (e) { alert(e.message); }
+    }
       await api("/api/users/" + id + "/role", { method: "PATCH", body: JSON.stringify({ role: role }) });
       await refreshUsers();
     }
@@ -3443,6 +3548,8 @@ function appHtml(env, nonce) {
           "edit-entry": function() { return editEntry(id); },
           "delete-entry": function() { return deleteEntry(id); },
           "switch-role": function() { return switchRole(id, role); },
+          "change-my-password": changeMyPassword,
+          "reset-password": function() { return resetPassword(id); },
           "delete-user": function() { return deleteUser(id); },
         }[action];
         if (!run) return;

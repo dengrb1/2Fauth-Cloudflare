@@ -633,3 +633,97 @@ test("cannot delete the last admin", async () => {
   assert.equal(body.error, "Cannot delete the last admin");
   assert.equal(db.state.runs.some((sql) => sql.includes("DELETE FROM users WHERE id = ?")), false);
 });
+
+test("change own password requires currentPassword and newPassword validation", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("FROM users WHERE id = ?")) {
+        return { id: 1, username: "admin", password_hash: "hash", password_salt: "salt" };
+      }
+      if (sql.includes("COUNT") && sql.includes("admin")) return { count: 1 };
+      return null;
+    },
+  });
+
+  const request = new Request("https://example.com/api/v1/me/password", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+    body: JSON.stringify({ currentPassword: "short" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "currentPassword and newPassword are required");
+});
+
+test("change own password rejects weak new password", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("FROM users WHERE id = ?")) {
+        return { id: 1, username: "admin", password_hash: "hash", password_salt: "salt" };
+      }
+      if (sql.includes("COUNT") && sql.includes("admin")) return { count: 1 };
+      return null;
+    },
+  });
+
+  const request = new Request("https://example.com/api/v1/me/password", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+    body: JSON.stringify({ currentPassword: "some-old-password", newPassword: "weak" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /uppercase, lowercase, number, and symbol/);
+});
+
+test("admin can reset any user password", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id, username FROM users WHERE id = ?")) {
+        return { id: 2, username: "alice" };
+      }
+      if (sql.includes("COUNT") && sql.includes("admin")) return { count: 1 };
+      return null;
+    },
+  });
+
+  const request = new Request("https://example.com/api/users/2/password", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+    body: JSON.stringify({ newPassword: "NewSecure-Pass123" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.ok(db.state.runs.some((sql) => sql.includes("UPDATE users SET password_hash = ?")));
+});
+
+test("admin cannot reset own password via user endpoint", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("COUNT") && sql.includes("admin")) return { count: 1 };
+      return null;
+    },
+  });
+
+  const request = new Request("https://example.com/api/users/1/password", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+    body: JSON.stringify({ newPassword: "NewSecure-Pass123" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "Use /api/me/password to change your own password");
+});
