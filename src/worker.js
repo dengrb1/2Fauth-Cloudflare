@@ -178,8 +178,9 @@ async function handleBootstrap(request, env) {
   const body = await parseJson(request);
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
-  if (!username || !validPassword(password)) {
-    return json({ error: `Invalid username or password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+    if (!username || !validPassword(password)) {
+      // F-04: vague error — do not disclose password policy details.
+      return json({ error: "Invalid username or password" }, 400);
   }
 
   const initialized = await hasAnyUser(env);
@@ -249,6 +250,7 @@ async function handleLogin(request, env) {
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
   await revokePresentedWebSession(request, env);
+  // F-05: session fixation prevention — old session revoked, new random token generated below.
 
   const clientType = String(body.clientType || "").trim().toLowerCase();
   if (clientType === ANDROID_CLIENT_TYPE) {
@@ -474,10 +476,11 @@ async function handleCodesBatchForAuth(request, env, auth) {
     return json({ error: `entryIds cannot exceed ${EXTENSION_BATCH_MAX_IDS}` }, 400);
   }
 
-  const placeholders = normalizedIds.map(() => "?").join(", ");
-  const baseParams = [...normalizedIds];
-  let query =
-    `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE id IN (${placeholders})`;
+  // F-01: safe IN-clause query builder — no string interpolation of SQL.
+  // Every element was already validated as a positive integer above.
+  const { placeholders, params: inParams } = buildInClause(normalizedIds);
+  let query = `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE id IN (${placeholders})`;
+  const baseParams = [...inParams];
   if (auth.user.role !== "admin") {
     query += " AND user_id = ?";
     baseParams.push(auth.user.id);
@@ -1192,8 +1195,8 @@ async function handleCreateUser(request, env) {
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
   const role = body.role === "admin" ? "admin" : "user";
-  if (!username || !validPassword(password)) {
-    return json({ error: `Invalid username or password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+    if (!username || !validPassword(password)) {
+      return json({ error: "Invalid username or password" }, 400);
   }
 
   const { hashB64, saltB64 } = await hashPassword(password);
@@ -1220,8 +1223,8 @@ async function handleChangeMyPassword(request, env) {
   if (!currentPassword || !newPassword) {
     return json({ error: "currentPassword and newPassword are required" }, 400);
   }
-  if (!validPassword(newPassword)) {
-    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+    if (!validPassword(newPassword)) {
+      return json({ error: "Invalid new password" }, 400);
   }
 
   const target = await env.DB.prepare("SELECT id, username, password_hash, password_salt FROM users WHERE id = ?")
@@ -1254,7 +1257,7 @@ async function handleResetUserPassword(request, env) {
   const body = await parseJson(request);
   const newPassword = String(body.newPassword || body.password || "");
   if (!validPassword(newPassword)) {
-    return json({ error: `Invalid new password (${PASSWORD_POLICY_DESCRIPTION})` }, 400);
+    return json({ error: "Invalid new password" }, 400);
   }
 
   const target = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
@@ -1989,6 +1992,10 @@ async function derivePassphraseKey(passphrase, salt, iterations = 180000) {
 
 function parseOtpAuthUri(uri) {
   try {
+    // F-07: limit input length to prevent ReDoS via URL parser.
+    if (typeof uri !== "string" || uri.length > 1024) {
+      return { ok: false, error: "otpauth URI too long" };
+    }
     const url = new URL(uri);
     if (url.protocol !== "otpauth:" || !["totp", "hotp"].includes(url.hostname)) {
       return { ok: false, error: "Only otpauth://totp or otpauth://hotp URI is supported" };
@@ -1997,7 +2004,8 @@ function parseOtpAuthUri(uri) {
     const secret = String(url.searchParams.get("secret") || "").trim();
     if (!secret) return { ok: false, error: "otpauth URI missing secret" };
     const issuerQ = String(url.searchParams.get("issuer") || "").trim();
-    const labelRaw = decodeURIComponent(url.pathname.replace(/^\//, ""));
+    // F-07: use substring instead of regex to avoid any backtracking risk.
+    const labelRaw = decodeURIComponent(url.pathname.startsWith("/") ? url.pathname.slice(1) : url.pathname);
     let issuer = issuerQ;
     let label = labelRaw;
     if (labelRaw.includes(":")) {
@@ -2020,6 +2028,8 @@ function parseOtpAuthUri(uri) {
 }
 
 function extractOtpAuthUris(text) {
+  // F-07: limit input length to prevent DoS via regex on large payloads.
+  if (typeof text !== "string" || text.length > 65536) return [];
   const out = [];
   const re = /otpauth:\/\/[^\s"'<>]+/gi;
   let m;
@@ -2184,6 +2194,13 @@ function normalizeDbId(value) {
   return null;
 }
 
+// F-01: safe IN-clause builder. Returns only "?" placeholders — never interpolates user values into SQL.
+function buildInClause(values) {
+  // values must be pre-validated (e.g. positive integers) by the caller.
+  const placeholders = Array(values.length).fill("?").join(", ");
+  return { placeholders, params: [...values] };
+}
+
 function pathResourceId(request, resource) {
   const parts = new URL(request.url).pathname.split("/").filter(Boolean);
   const idx = parts.indexOf(resource);
@@ -2278,9 +2295,7 @@ function corsHeaders(origin, env) {
     "Access-Control-Allow-Methods": CORS_ALLOWED_METHODS,
     "Access-Control-Allow-Headers": CORS_ALLOWED_HEADERS,
   });
-  if (corsCredentialsEnabled(env)) {
-    headers.set("Access-Control-Allow-Credentials", "true");
-  }
+  // F-03: never allow credentials in CORS responses.
   return headers;
 }
 
@@ -2300,15 +2315,14 @@ function normalizedAllowedCorsOrigins(env) {
 }
 
 function corsCredentialsEnabled(env) {
-  return ["true", "1", "yes"].includes(String(env.CORS_ALLOW_CREDENTIALS || "").trim().toLowerCase());
+  // F-03: credentials are never allowed.
+  return false;
 }
 
 function isSafeCorsOrigin(origin) {
   // F-11 fix: no longer automatically trust all browser extensions.
   // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
-  if (/^(https?|chrome-extension|edge-extension|moz-extension):\/\/[A-Za-z0-9_-]+$/.test(origin)) {
-    return true;
-  }
+  // F-03: reject extension protocols and only allow http/https via URL parser.
   try {
     const url = new URL(origin);
     return origin === url.origin && ["https:", "http:"].includes(url.protocol);
@@ -2339,13 +2353,16 @@ function commonSecurityHeaders() {
 function debugErrorsEnabled(env) {
   const enabled = String(env.DEBUG_ERRORS || "").toLowerCase() === "true";
   const environment = String(env.ENVIRONMENT || env.NODE_ENV || "").toLowerCase();
-  return enabled && environment !== "production";
+  // F-06: only expose details in explicit development/staging with opt-in flag.
+  const isNonProd = environment === "development" || environment === "staging";
+  return enabled && isNonProd;
 }
 
 function canExposeErrorDetail(request, env) {
   if (!debugErrorsEnabled(env)) return false;
+  // F-06: only expose to same-origin requests, never via API or curl.
   const origin = String(request.headers.get("origin") || "").trim();
-  if (!origin) return true;
+  if (!origin) return false;
   try {
     return origin === new URL(request.url).origin;
   } catch {
@@ -2380,7 +2397,7 @@ function html(markup, nonce) {
         `script-src ${scriptSrc.join(" ")}`,
         `style-src ${styleSrc.join(" ")}`,
         "img-src 'self' data: blob:",
-        "connect-src 'self' https://api.qrserver.com https://challenges.cloudflare.com",
+        "connect-src 'self' https://challenges.cloudflare.com",
         "frame-src https://challenges.cloudflare.com",
         "base-uri 'none'",
         "frame-ancestors 'none'",
@@ -2625,12 +2642,6 @@ function appHtml(env, nonce) {
             <div class="row">
               <button class="ghost" data-action="start-scan">摄像头扫码</button>
               <button class="ghost" data-action="stop-scan">停止扫码</button>
-              <button class="ghost" data-action="recognize-frame">API识别当前画面</button>
-              <select id="scanMode">
-                <option value="local" selected>仅本地识别（推荐）</option>
-                <option value="auto">自动（本地优先，失败走API）</option>
-                <option value="api">仅API识别</option>
-              </select>
               <input id="qrImageFile" type="file" accept="image/*" />
             </div>
             <video id="scanVideo" autoplay playsinline class="hidden"></video>
@@ -2744,11 +2755,6 @@ function appHtml(env, nonce) {
         cameraDenied: "无法访问摄像头：",
         noQrFound: "图片中未识别到二维码。",
         qrFromImage: "图片二维码识别成功。",
-        qrFromApi: "第三方 API 识别成功。",
-        apiDetecting: "正在调用第三方 API 识别...",
-        apiUnavailable: "第三方 API 识别失败：",
-        apiFrameNeedCamera: "请先启动摄像头扫码后再使用该功能。",
-        apiNoData: "第三方 API 未识别到二维码内容。",
         scanImageFailed: "图片扫码失败：",
         saved: "已保存",
         userCreated: "用户已创建",
@@ -2819,11 +2825,6 @@ function appHtml(env, nonce) {
         cameraDenied: "Camera access denied or unavailable: ",
         noQrFound: "No QR code found in image.",
         qrFromImage: "QR detected from image.",
-        qrFromApi: "Third-party API decoded QR successfully.",
-        apiDetecting: "Calling third-party API...",
-        apiUnavailable: "Third-party API failed: ",
-        apiFrameNeedCamera: "Please start camera scanning first.",
-        apiNoData: "Third-party API returned no QR payload.",
         scanImageFailed: "Failed to scan image: ",
         saved: "Saved",
         userCreated: "User created",
@@ -3551,9 +3552,8 @@ function appHtml(env, nonce) {
       try {
         const file = ev && ev.target && ev.target.files && ev.target.files[0];
         if (!file) return;
-        const mode = getScanMode();
         let raw = "";
-        if (mode !== "api") {
+        // F-02: use local-only QR detection — no third-party API.
           if ("BarcodeDetector" in window) {
             const bmp = await createImageBitmap(file);
             const detector = new BarcodeDetector({ formats: ["qr_code"] });
@@ -3564,12 +3564,6 @@ function appHtml(env, nonce) {
             await ensureJsQrLoaded();
             raw = await detectQrFromImageFileByJsQr(file);
           }
-        }
-        if (!raw && mode !== "local") {
-          msg("scanMsg", t("apiDetecting"));
-          raw = await detectQrByThirdPartyApiFromFile(file);
-          if (raw) msg("scanMsg", t("qrFromApi"));
-        }
         if (!raw) {
           msg("scanMsg", t("noQrFound"), true);
           return;
@@ -3578,32 +3572,6 @@ function appHtml(env, nonce) {
         msg("scanMsg", t("qrFromImage"));
       } catch (e) {
         msg("scanMsg", t("scanImageFailed") + e.message, true);
-      }
-    }
-
-    function getScanMode() {
-      const modeEl = document.getElementById("scanMode");
-      const mode = modeEl ? String(modeEl.value || "auto") : "auto";
-      return ["auto", "local", "api"].includes(mode) ? mode : "auto";
-    }
-
-    async function recognizeCurrentFrameByApi() {
-      try {
-        const video = document.getElementById("scanVideo");
-        if (!video || !scanStream) {
-          msg("scanMsg", t("apiFrameNeedCamera"), true);
-          return;
-        }
-        msg("scanMsg", t("apiDetecting"));
-        const raw = await detectQrByThirdPartyApiFromVideo(video);
-        if (!raw) {
-          msg("scanMsg", t("apiNoData"), true);
-          return;
-        }
-        applyScannedOtpUri(raw);
-        msg("scanMsg", t("qrFromApi"));
-      } catch (e) {
-        msg("scanMsg", t("apiUnavailable") + e.message, true);
       }
     }
 
@@ -3662,42 +3630,6 @@ function appHtml(env, nonce) {
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const result = window.jsQR(imageData.data, canvas.width, canvas.height, { inversionAttempts: "attemptBoth" });
       return result && result.data ? String(result.data) : "";
-    }
-
-    async function detectQrByThirdPartyApiFromFile(file) {
-      const blob = file instanceof Blob ? file : new Blob([file], { type: "image/png" });
-      return detectQrByThirdPartyApiFromBlob(blob);
-    }
-
-    async function detectQrByThirdPartyApiFromVideo(video) {
-      const w = video.videoWidth || 0;
-      const h = video.videoHeight || 0;
-      if (!w || !h) return "";
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(video, 0, 0, w, h);
-      const blob = await new Promise(function(resolve) {
-        canvas.toBlob(function(b) { resolve(b); }, "image/jpeg", 0.92);
-      });
-      if (!blob) return "";
-      return detectQrByThirdPartyApiFromBlob(blob);
-    }
-
-    async function detectQrByThirdPartyApiFromBlob(blob) {
-      const form = new FormData();
-      form.append("file", blob, "qr-image.jpg");
-      const resp = await fetch("https://api.qrserver.com/v1/read-qr-code/", {
-        method: "POST",
-        body: form
-      });
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      const data = await resp.json();
-      const item = Array.isArray(data) && data[0] ? data[0] : null;
-      const symbol = item && Array.isArray(item.symbol) && item.symbol[0] ? item.symbol[0] : null;
-      const raw = symbol && typeof symbol.data === "string" ? symbol.data.trim() : "";
-      return raw || "";
     }
 
     function fileToDataUrl(file) {
@@ -3760,7 +3692,6 @@ function appHtml(env, nonce) {
           "import-encrypted": importDataEncrypted,
           "start-scan": startScan,
           "stop-scan": stopScan,
-          "recognize-frame": recognizeCurrentFrameByApi,
           "create-entry": createEntry,
           "create-group": createGroup,
           "create-user": createUser,
