@@ -16,6 +16,10 @@ const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/sit
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
+
+// N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
+const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
+const FAKE_PASSWORD_HASH = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
 const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
 
@@ -209,7 +213,6 @@ async function handleLogin(request, env) {
       {
         error: "Too many login attempts. Temporarily locked.",
         retryAfterSeconds: risk.retryAfterSeconds,
-        lockedUntil: new Date(risk.lockUntil * 1000).toISOString(),
       },
       429
     );
@@ -228,7 +231,11 @@ async function handleLogin(request, env) {
   )
     .bind(username)
     .first();
-  if (!row) return json({ error: "Invalid credentials" }, 401);
+  if (!row) {
+    // N-01 fix: run dummy PBKDF2 to eliminate timing side-channel
+    await verifyPasswordDetailed(password, FAKE_PASSWORD_SALT, FAKE_PASSWORD_HASH);
+    return json({ error: "Invalid credentials" }, 401);
+  }
 
   const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
   if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
@@ -350,7 +357,6 @@ async function handleExtensionLogin(request, env) {
       {
         error: "Too many login attempts. Temporarily locked.",
         retryAfterSeconds: risk.retryAfterSeconds,
-        lockedUntil: new Date(risk.lockUntil * 1000).toISOString(),
       },
       429
     );
@@ -372,7 +378,11 @@ async function handleExtensionLogin(request, env) {
   )
     .bind(username)
     .first();
-  if (!row) return json({ error: "Invalid credentials" }, 401);
+  if (!row) {
+    // N-01 fix: run dummy PBKDF2 to eliminate timing side-channel
+    await verifyPasswordDetailed(password, FAKE_PASSWORD_SALT, FAKE_PASSWORD_HASH);
+    return json({ error: "Invalid credentials" }, 401);
+  }
 
   const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
   if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
@@ -762,19 +772,20 @@ async function handleConsumeHotp(request, env) {
   const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
 
-  // F-06 fix: atomically increment counter FIRST, then generate code.
-  // This prevents concurrent requests from generating the same code.
-  const nextCounter = counter + 1;
+  // F-06 fix: single atomic UPDATE ... RETURNING to prevent TOCTOU race.
+  // D1 serialises writes per DO, so RETURNING + increment is naturally atomic.
   const result = await env.DB.prepare(
-    "UPDATE totp_entries SET hotp_counter = ? WHERE id = ? AND hotp_counter = ?"
-  ).bind(nextCounter, id, counter).run();
+    "UPDATE totp_entries SET hotp_counter = hotp_counter + 1 WHERE id = ? AND otp_type = 'hotp' RETURNING hotp_counter - 1 AS old_counter, hotp_counter AS new_counter"
+  ).bind(id).first();
 
-  if (result.meta?.changes === 0) {
-    return json({ error: "HOTP code already consumed or counter mismatch, please retry" }, 409);
+  if (!result || result.old_counter === undefined) {
+    return json({ error: "HOTP code already consumed, please retry" }, 409);
   }
 
-  const code = await generateHotp(secret, digits, algorithm, counter);
-  return json({ code, counter, nextCounter, otpType: "hotp" });
+  const usedCounter = Number(result.old_counter);
+  const nextCounter = Number(result.new_counter);
+  const code = await generateHotp(secret, digits, algorithm, usedCounter);
+  return json({ code, counter: usedCounter, nextCounter, otpType: "hotp" });
 }
 
 async function handleListGroups(request, env) {
@@ -884,6 +895,9 @@ async function handleImportOtpAuth(request, env) {
   const body = await parseJson(request);
   const text = String(body.text || "");
   if (!text.trim()) return json({ error: "text is required" }, 400);
+
+  // N-07 fix: reject oversized payloads to prevent CPU/memory spikes
+  if (text.length > 200_000) return json({ error: "otpauth text too large (max 200KB)" }, 413);
 
   // Non-admin users can ONLY import to their own account (security fix)
   const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
@@ -2248,7 +2262,8 @@ function json(data, status = 200, headers = {}) {
 
 function html(markup, nonce) {
   // F-08 fix: jsQR has SRI integrity; cdn.jsdelivr.net still needed for fetch. Inlining jsQR would eliminate this risk.
-  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"];
+  // N-06 / F-08: narrow CSP to the exact jsQR path with SRI; drop the broad jsdelivr domain.
+  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"];
   const styleSrc = ["'self'", `'nonce-${nonce}'`];
   return new Response(markup, {
     headers: {
@@ -2807,14 +2822,17 @@ function appHtml(env, nonce) {
       if (!currentUser) return;
       try {
         const blob = new Blob(['{}'], { type: "application/json" });
-        navigator.sendBeacon("/api/session/close-soon", blob);
-        fetch("/api/session/close-soon", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
-          body: "{}",
-          keepalive: true,
-          credentials: "same-origin"
-        }).catch(function() {});
+        // N-06 fix: use sendBeacon as primary; only fall back to fetch on failure
+        const ok = navigator.sendBeacon("/api/session/close-soon", blob);
+        if (!ok) {
+          fetch("/api/session/close-soon", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
+            body: "{}",
+            keepalive: true,
+            credentials: "same-origin"
+          }).catch(function() {});
+        }
       } catch {}
     }
 
@@ -3195,12 +3213,21 @@ function appHtml(env, nonce) {
     async function refreshUsers() {
       const d = await api("/api/users");
       const table = document.getElementById("usersTable");
-      table.innerHTML = "<tr><th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th></tr>";
+      // F-03 fix: rebuild table with a single DOM write (no innerHTML += accumulation)
+      const tbody = document.createElement("tbody");
+      const headerRow = document.createElement("tr");
+      headerRow.innerHTML = "<th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th>";
+      tbody.appendChild(headerRow);
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
+          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
+          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
+          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
+        tbody.appendChild(tr);
       });
+      table.replaceChildren(tbody);
     }
 
     async function switchRole(id, role) {
