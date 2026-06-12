@@ -12,6 +12,7 @@ const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
+const DEFAULT_API_RATE_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
@@ -527,6 +528,12 @@ async function handleCodesBatchForAuth(request, env, auth) {
 }
 
 async function handleLogout(request, env) {
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    const url = new URL(request.url);
+    const expectedOrigin = `${url.protocol}//${url.host}`;
+    if (origin !== expectedOrigin) return json({ error: "Invalid origin" }, 403);
+  }
   const token = readCookie(request, SESSION_COOKIE);
   if (token) {
     const tokenHash = await hashSessionToken(token, env);
@@ -843,6 +850,7 @@ async function handleDeleteGroup(request, env) {
   if (!row) return json({ error: "Group not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
 
+  await env.DB.prepare("UPDATE totp_entries SET group_id = NULL WHERE group_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM groups WHERE id = ?").bind(id).run();
   return json({ ok: true });
 }
@@ -1393,8 +1401,8 @@ async function applyLoginRiskControl(request, env, username) {
   }
 
   let windowStart = nowSec;
-  let requestCount = 1;
   let lockUntil = 0;
+  let requestCount = 1;
   if (row && nowSec - Number(row.window_start) < 60) {
     windowStart = Number(row.window_start);
     requestCount = Number(row.request_count) + 1;
@@ -1445,6 +1453,11 @@ async function deleteUserSessions(env, userId) {
 
 async function applyApiRateLimit(request, env, route) {
   if (!shouldRateLimitRoute(request, route)) return null;
+
+  try {
+    if (await isAdminRequest(request, env)) return null;
+  } catch { /* fall through to rate limit */ }
+
   const nowSec = Math.floor(Date.now() / 1000);
   const maxRequests = normalizeRateLimit(env.API_RATE_MAX_REQUESTS_PER_MINUTE, DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE);
   const subject = await apiRateLimitSubject(request, env);
@@ -1460,18 +1473,31 @@ async function applyApiRateLimit(request, env, route) {
     return null;
   }
 
+  if (row && Number(row.lock_until) > nowSec) {
+    return json(
+      { error: "Too many API requests. Temporarily locked.", retryAfterSeconds: Number(row.lock_until) - nowSec },
+      429,
+      { "Retry-After": String(Number(row.lock_until) - nowSec) }
+    );
+  }
+
   let windowStart = nowSec;
+  let lockUntil = 0;
   let requestCount = 1;
   if (row && nowSec - Number(row.window_start) < 60) {
     windowStart = Number(row.window_start);
     requestCount = Number(row.request_count) + 1;
   }
+  if (requestCount > maxRequests) {
+    const lockMinutes = normalizeRateLimit(env.API_RATE_LOCK_MINUTES, DEFAULT_API_RATE_LOCK_MINUTES);
+    lockUntil = nowSec + lockMinutes * 60;
+  }
 
   try {
     await env.DB.prepare(
-      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
     )
-      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
+      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, lockUntil, nowSec)
       .run();
   } catch (err) {
     return null;
@@ -1479,9 +1505,9 @@ async function applyApiRateLimit(request, env, route) {
 
   if (requestCount > maxRequests) {
     return json(
-      { error: "Too many API requests", retryAfterSeconds: Math.max(1, 60 - (nowSec - windowStart)) },
+      { error: "Too many API requests. Temporarily locked.", retryAfterSeconds: lockUntil - nowSec },
       429,
-      { "Retry-After": String(Math.max(1, 60 - (nowSec - windowStart))) }
+      { "Retry-After": String(lockUntil - nowSec) }
     );
   }
   return null;
@@ -1512,6 +1538,30 @@ async function apiRateLimitSubject(request, env) {
   return `ip:${clientIp(request)}`;
 }
 
+async function isAdminRequest(request, env) {
+  const bearerToken = readBearerToken(request);
+  if (bearerToken) {
+    try {
+      const tokenHash = await hashSessionToken(bearerToken, env);
+      const row = await env.DB.prepare(
+        "SELECT u.role FROM api_sessions a JOIN users u ON u.id = a.user_id WHERE a.token_hash = ? AND a.expires_at > ?"
+      ).bind(tokenHash, nowIso()).first();
+      if (row && row.role === "admin") return true;
+    } catch { /* fall through */ }
+  }
+  const sessionToken = readCookie(request, SESSION_COOKIE);
+  if (sessionToken) {
+    try {
+      const tokenHash = await hashSessionToken(sessionToken, env);
+      const row = await env.DB.prepare(
+        "SELECT u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
+      ).bind(tokenHash, nowIso()).first();
+      if (row && row.role === "admin") return true;
+    } catch { /* fall through */ }
+  }
+  return false;
+}
+
 function normalizeRateLimit(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 10 && n <= 5000 ? Math.floor(n) : fallback;
@@ -1532,7 +1582,7 @@ function dbErrorMessage(err) {
 }
 
 function clientIp(request) {
-  return String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
+  return String(request.headers.get("cf-connecting-ip") || "unknown")
     .split(",")[0]
     .trim() || "unknown";
 }
