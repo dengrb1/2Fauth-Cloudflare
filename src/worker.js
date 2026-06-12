@@ -12,10 +12,19 @@ const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
+const ENTRY_LABEL_MAX_LENGTH = 200;
+const ENTRY_ISSUER_MAX_LENGTH = 100;
+const GROUP_NAME_MAX_LENGTH = 60;
+const DEFAULT_API_RATE_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
+const DB_ID_PATH_PATTERN = "[1-9]\\d{0,15}";
+
+// N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
+const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
+const FAKE_PASSWORD_HASH = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
 const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
 
@@ -56,9 +65,9 @@ const API_ROUTES = [
   ["POST", "/api/import/encrypted", handleImportDataEncrypted],
   ["GET", "/api/users", handleListUsers],
   ["POST", "/api/users", handleCreateUser],
-  ["PATCH", /^\/api\/users\/\d+\/role$/, handleUpdateUserRole],
-  ["PATCH", /^\/api\/users\/\d+\/password$/, handleResetUserPassword],
-  ["DELETE", /^\/api\/users\/\d+$/, handleDeleteUser],
+  ["PATCH", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}/role`), handleUpdateUserRole],
+  ["PATCH", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}/password`), handleResetUserPassword],
+  ["DELETE", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}`), handleDeleteUser],
   ["GET", "/api/security/login-policy", handleGetLoginPolicy],
   ["PATCH", "/api/security/login-policy", handleUpdateLoginPolicy],
 ];
@@ -67,11 +76,11 @@ function entryRoutes(prefix) {
   return [
     ["GET", `${prefix}/entries`, handleListEntries],
     ["POST", `${prefix}/entries`, handleCreateEntry],
-    ["PATCH", routePattern(prefix, "/entries/\\d+"), handleUpdateEntry],
-    ["GET", routePattern(prefix, "/entries/\\d+/code"), handleEntryCode],
-    ["POST", routePattern(prefix, "/entries/\\d+/verify"), handleVerifyTotp],
-    ["POST", routePattern(prefix, "/entries/\\d+/hotp"), handleConsumeHotp],
-    ["DELETE", routePattern(prefix, "/entries/\\d+"), handleDeleteEntry],
+    ["PATCH", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleUpdateEntry],
+    ["GET", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/code`), handleEntryCode],
+    ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/verify`), handleVerifyTotp],
+    ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/hotp`), handleConsumeHotp],
+    ["DELETE", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleDeleteEntry],
   ];
 }
 
@@ -79,7 +88,7 @@ function groupRoutes(prefix) {
   return [
     ["GET", `${prefix}/groups`, handleListGroups],
     ["POST", `${prefix}/groups`, handleCreateGroup],
-    ["DELETE", routePattern(prefix, "/groups/\\d+"), handleDeleteGroup],
+    ["DELETE", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleDeleteGroup],
   ];
 }
 
@@ -136,7 +145,7 @@ export default {
         return withCors(request, json({ error: err.message }, err.status), env);
       }
       const payload = { error: "Internal Server Error" };
-      if (debugErrorsEnabled(env)) {
+      if (canExposeErrorDetail(request, env)) {
         payload.detail = err instanceof Error ? err.message : "Internal error";
       }
       return withCors(request, json(payload, 500), env);
@@ -190,7 +199,7 @@ async function handleBootstrap(request, env) {
     userId = normalizeDbId(row?.id);
   }
   if (!userId) return json({ error: "Failed to create user id" }, 500);
-  const { cookie } = await createSession(env, userId);
+  const { cookie } = await regenerateWebSession(request, env, userId);
   return json(
     { ok: true, user: { id: userId, username, role: "admin" } },
     201,
@@ -209,7 +218,6 @@ async function handleLogin(request, env) {
       {
         error: "Too many login attempts. Temporarily locked.",
         retryAfterSeconds: risk.retryAfterSeconds,
-        lockedUntil: new Date(risk.lockUntil * 1000).toISOString(),
       },
       429
     );
@@ -228,7 +236,11 @@ async function handleLogin(request, env) {
   )
     .bind(username)
     .first();
-  if (!row) return json({ error: "Invalid credentials" }, 401);
+  if (!row) {
+    // N-01 fix: run dummy PBKDF2 to eliminate timing side-channel
+    await verifyPasswordDetailed(password, FAKE_PASSWORD_SALT, FAKE_PASSWORD_HASH);
+    return json({ error: "Invalid credentials" }, 401);
+  }
 
   const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
   if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
@@ -236,6 +248,7 @@ async function handleLogin(request, env) {
     await upgradePasswordHash(env, row.id, password).catch(() => {});
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
+  await revokePresentedWebSession(request, env);
 
   const clientType = String(body.clientType || "").trim().toLowerCase();
   if (clientType === ANDROID_CLIENT_TYPE) {
@@ -297,6 +310,7 @@ async function handleApiCapabilities(request, env) {
     cors: {
       exactOriginAllowlist: true,
       configured: corsOrigins.length > 0,
+      credentials: corsCredentialsEnabled(env),
     },
     endpoints: {
       login: "/api/v1/auth/login",
@@ -350,7 +364,6 @@ async function handleExtensionLogin(request, env) {
       {
         error: "Too many login attempts. Temporarily locked.",
         retryAfterSeconds: risk.retryAfterSeconds,
-        lockedUntil: new Date(risk.lockUntil * 1000).toISOString(),
       },
       429
     );
@@ -372,7 +385,11 @@ async function handleExtensionLogin(request, env) {
   )
     .bind(username)
     .first();
-  if (!row) return json({ error: "Invalid credentials" }, 401);
+  if (!row) {
+    // N-01 fix: run dummy PBKDF2 to eliminate timing side-channel
+    await verifyPasswordDetailed(password, FAKE_PASSWORD_SALT, FAKE_PASSWORD_HASH);
+    return json({ error: "Invalid credentials" }, 401);
+  }
 
   const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
   if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
@@ -380,6 +397,7 @@ async function handleExtensionLogin(request, env) {
     await upgradePasswordHash(env, row.id, password).catch(() => {});
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
+  await revokePresentedWebSession(request, env);
 
   const deviceName = normalizeClientMetadata(body.deviceName, 120, "edge");
   const clientVersion = normalizeClientMetadata(body.clientVersion, 64, "unknown");
@@ -517,6 +535,12 @@ async function handleCodesBatchForAuth(request, env, auth) {
 }
 
 async function handleLogout(request, env) {
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    const url = new URL(request.url);
+    const expectedOrigin = `${url.protocol}//${url.host}`;
+    if (origin !== expectedOrigin) return json({ error: "Invalid origin" }, 403);
+  }
   const token = readCookie(request, SESSION_COOKIE);
   if (token) {
     const tokenHash = await hashSessionToken(token, env);
@@ -587,6 +611,8 @@ async function handleCreateEntry(request, env) {
 
   const label = String(payload.label || "").trim();
   const issuer = payload.issuer ? String(payload.issuer).trim() : "";
+  if (label.length > ENTRY_LABEL_MAX_LENGTH) return json({ error: `label must be at most ${ENTRY_LABEL_MAX_LENGTH} characters` }, 400);
+  if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) return json({ error: `issuer must be at most ${ENTRY_ISSUER_MAX_LENGTH} characters` }, 400);
   const secret = String(payload.secret || "").trim();
   const digits = Number(payload.digits || 6);
   const period = Number(payload.period || 30);
@@ -647,6 +673,8 @@ async function handleUpdateEntry(request, env) {
   const body = await parseJson(request);
   const label = body.label !== undefined ? String(body.label).trim() : existing.label;
   const issuer = body.issuer !== undefined ? String(body.issuer).trim() : existing.issuer;
+  if (label.length > ENTRY_LABEL_MAX_LENGTH) return json({ error: `label must be at most ${ENTRY_LABEL_MAX_LENGTH} characters` }, 400);
+  if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) return json({ error: `issuer must be at most ${ENTRY_ISSUER_MAX_LENGTH} characters` }, 400);
   const digits = body.digits !== undefined ? Number(body.digits) : existing.digits;
   const period = body.period !== undefined ? Number(body.period) : existing.period;
   const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-1");
@@ -762,19 +790,20 @@ async function handleConsumeHotp(request, env) {
   const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
 
-  // F-06 fix: atomically increment counter FIRST, then generate code.
-  // This prevents concurrent requests from generating the same code.
-  const nextCounter = counter + 1;
+  // F-06 fix: single atomic UPDATE ... RETURNING to prevent TOCTOU race.
+  // D1 serialises writes per DO, so RETURNING + increment is naturally atomic.
   const result = await env.DB.prepare(
-    "UPDATE totp_entries SET hotp_counter = ? WHERE id = ? AND hotp_counter = ?"
-  ).bind(nextCounter, id, counter).run();
+    "UPDATE totp_entries SET hotp_counter = hotp_counter + 1 WHERE id = ? AND otp_type = 'hotp' RETURNING hotp_counter - 1 AS old_counter, hotp_counter AS new_counter"
+  ).bind(id).first();
 
-  if (result.meta?.changes === 0) {
-    return json({ error: "HOTP code already consumed or counter mismatch, please retry" }, 409);
+  if (!result || result.old_counter === undefined) {
+    return json({ error: "HOTP code already consumed, please retry" }, 409);
   }
 
-  const code = await generateHotp(secret, digits, algorithm, counter);
-  return json({ code, counter, nextCounter, otpType: "hotp" });
+  const usedCounter = Number(result.old_counter);
+  const nextCounter = Number(result.new_counter);
+  const code = await generateHotp(secret, digits, algorithm, usedCounter);
+  return json({ code, counter: usedCounter, nextCounter, otpType: "hotp" });
 }
 
 async function handleListGroups(request, env) {
@@ -801,9 +830,10 @@ async function handleCreateGroup(request, env) {
   const body = await parseJson(request);
   const name = String(body.name || "").trim();
   const color = validHexColor(body.color) ? body.color : "#0f766e";
+  if (!name) return json({ error: "name is required" }, 400);
+  if (name.length > GROUP_NAME_MAX_LENGTH) return json({ error: `name must be at most ${GROUP_NAME_MAX_LENGTH} characters` }, 400);
   const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
-  if (!name) return json({ error: "name is required" }, 400);
   if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
@@ -832,6 +862,7 @@ async function handleDeleteGroup(request, env) {
   if (!row) return json({ error: "Group not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
 
+  await env.DB.prepare("UPDATE totp_entries SET group_id = NULL WHERE group_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM groups WHERE id = ?").bind(id).run();
   return json({ ok: true });
 }
@@ -885,6 +916,9 @@ async function handleImportOtpAuth(request, env) {
   const text = String(body.text || "");
   if (!text.trim()) return json({ error: "text is required" }, 400);
 
+  // N-07 fix: reject oversized payloads to prevent CPU/memory spikes
+  if (text.length > 200_000) return json({ error: "otpauth text too large (max 200KB)" }, 413);
+
   // Non-admin users can ONLY import to their own account (security fix)
   const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   if (auth.user.role !== "admin" && requestedUserId !== auth.user.id) {
@@ -919,6 +953,9 @@ async function handleImportOtpAuth(request, env) {
       errors.push("Missing secret/label");
       continue;
     }
+    if (label.length > ENTRY_LABEL_MAX_LENGTH) { errors.push("Label too long"); continue; }
+    const issuer = String(data.issuer || "").trim();
+    if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) { errors.push("Issuer too long"); continue; }
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) throw new Error("invalid");
@@ -935,7 +972,7 @@ async function handleImportOtpAuth(request, env) {
       await env.DB.prepare(
         "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
       )
-        .bind(userId, label, String(data.issuer || ""), secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
+        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
         .run();
       imported += 1;
     } catch (e) {
@@ -1039,6 +1076,7 @@ async function importPayload(body, auth, env) {
   for (const g of groups) {
     const name = String(g.name || "").trim();
     if (!name) continue;
+    if (name.length > GROUP_NAME_MAX_LENGTH) continue;
     const color = validHexColor(g.color) ? g.color : "#0f766e";
     try {
       const res = await env.DB.prepare(
@@ -1058,7 +1096,10 @@ async function importPayload(body, auth, env) {
   for (const e of entries) {
     const secret = String(e.secret || "").trim();
     const label = String(e.label || "").trim();
+    const issuer = String(e.issuer || "").trim();
     if (!secret || !label) continue;
+    if (label.length > ENTRY_LABEL_MAX_LENGTH) continue;
+    if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) continue;
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) continue;
@@ -1077,7 +1118,7 @@ async function importPayload(body, auth, env) {
     await env.DB.prepare(
       "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind(userId, label, String(e.issuer || ""), secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
+      .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
       .run();
     imported.entries += 1;
   }
@@ -1379,8 +1420,8 @@ async function applyLoginRiskControl(request, env, username) {
   }
 
   let windowStart = nowSec;
-  let requestCount = 1;
   let lockUntil = 0;
+  let requestCount = 1;
   if (row && nowSec - Number(row.window_start) < 60) {
     windowStart = Number(row.window_start);
     requestCount = Number(row.request_count) + 1;
@@ -1431,6 +1472,11 @@ async function deleteUserSessions(env, userId) {
 
 async function applyApiRateLimit(request, env, route) {
   if (!shouldRateLimitRoute(request, route)) return null;
+
+  try {
+    if (await isAdminRequest(request, env)) return null;
+  } catch { /* fall through to rate limit */ }
+
   const nowSec = Math.floor(Date.now() / 1000);
   const maxRequests = normalizeRateLimit(env.API_RATE_MAX_REQUESTS_PER_MINUTE, DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE);
   const subject = await apiRateLimitSubject(request, env);
@@ -1446,18 +1492,31 @@ async function applyApiRateLimit(request, env, route) {
     return null;
   }
 
+  if (row && Number(row.lock_until) > nowSec) {
+    return json(
+      { error: "Too many API requests. Temporarily locked.", retryAfterSeconds: Number(row.lock_until) - nowSec },
+      429,
+      { "Retry-After": String(Number(row.lock_until) - nowSec) }
+    );
+  }
+
   let windowStart = nowSec;
+  let lockUntil = 0;
   let requestCount = 1;
   if (row && nowSec - Number(row.window_start) < 60) {
     windowStart = Number(row.window_start);
     requestCount = Number(row.request_count) + 1;
   }
+  if (requestCount > maxRequests) {
+    const lockMinutes = normalizeRateLimit(env.API_RATE_LOCK_MINUTES, DEFAULT_API_RATE_LOCK_MINUTES);
+    lockUntil = nowSec + lockMinutes * 60;
+  }
 
   try {
     await env.DB.prepare(
-      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
     )
-      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, nowSec)
+      .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, lockUntil, nowSec)
       .run();
   } catch (err) {
     return null;
@@ -1465,9 +1524,9 @@ async function applyApiRateLimit(request, env, route) {
 
   if (requestCount > maxRequests) {
     return json(
-      { error: "Too many API requests", retryAfterSeconds: Math.max(1, 60 - (nowSec - windowStart)) },
+      { error: "Too many API requests. Temporarily locked.", retryAfterSeconds: lockUntil - nowSec },
       429,
-      { "Retry-After": String(Math.max(1, 60 - (nowSec - windowStart))) }
+      { "Retry-After": String(lockUntil - nowSec) }
     );
   }
   return null;
@@ -1498,6 +1557,30 @@ async function apiRateLimitSubject(request, env) {
   return `ip:${clientIp(request)}`;
 }
 
+async function isAdminRequest(request, env) {
+  const bearerToken = readBearerToken(request);
+  if (bearerToken) {
+    try {
+      const tokenHash = await hashSessionToken(bearerToken, env);
+      const row = await env.DB.prepare(
+        "SELECT u.role FROM api_sessions a JOIN users u ON u.id = a.user_id WHERE a.token_hash = ? AND a.expires_at > ?"
+      ).bind(tokenHash, nowIso()).first();
+      if (row && row.role === "admin") return true;
+    } catch { /* fall through */ }
+  }
+  const sessionToken = readCookie(request, SESSION_COOKIE);
+  if (sessionToken) {
+    try {
+      const tokenHash = await hashSessionToken(sessionToken, env);
+      const row = await env.DB.prepare(
+        "SELECT u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
+      ).bind(tokenHash, nowIso()).first();
+      if (row && row.role === "admin") return true;
+    } catch { /* fall through */ }
+  }
+  return false;
+}
+
 function normalizeRateLimit(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 10 && n <= 5000 ? Math.floor(n) : fallback;
@@ -1518,7 +1601,7 @@ function dbErrorMessage(err) {
 }
 
 function clientIp(request) {
-  return String(request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown")
+  return String(request.headers.get("cf-connecting-ip") || "unknown")
     .split(",")[0]
     .trim() || "unknown";
 }
@@ -1605,6 +1688,18 @@ async function createSession(env, userId) {
   await deleteApiSessionsForUser(env, userId);
 
   return { cookie: sessionCookie(token, SESSION_TTL_SECONDS) };
+}
+
+async function regenerateWebSession(request, env, userId) {
+  await revokePresentedWebSession(request, env);
+  return createSession(env, userId);
+}
+
+async function revokePresentedWebSession(request, env) {
+  const token = readCookie(request, SESSION_COOKIE);
+  if (!token) return;
+  const tokenHash = await hashSessionToken(token, env);
+  await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(tokenHash).run();
 }
 
 async function refreshSessionTtl(request, env) {
@@ -2093,13 +2188,20 @@ function pathResourceId(request, resource) {
   const parts = new URL(request.url).pathname.split("/").filter(Boolean);
   const idx = parts.indexOf(resource);
   if (idx < 0 || idx + 1 >= parts.length) return NaN;
-  return Number(parts[idx + 1]);
+  return parsePathId(parts[idx + 1]);
+}
+
+function parsePathId(value) {
+  const text = String(value || "");
+  if (!/^[1-9]\d{0,15}$/.test(text)) return NaN;
+  const id = Number(text);
+  return Number.isSafeInteger(id) && id > 0 ? id : NaN;
 }
 
 function parseOptionalPositiveId(value) {
   if (value === undefined || value === null || value === "") return null;
   const id = Number(value);
-  if (!Number.isInteger(id) || id <= 0) return false;
+  if (!Number.isSafeInteger(id) || id <= 0) return false;
   return id;
 }
 
@@ -2154,7 +2256,7 @@ function b64ToBytes(b64) {
 function corsPreflight(request, env) {
   const origin = allowedCorsOrigin(request, env);
   if (!origin) return new Response(null, { status: 403 });
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(origin, env);
   headers.set("Access-Control-Max-Age", "86400");
   headers.set("Vary", "Origin");
   return new Response(null, { status: 204, headers });
@@ -2164,19 +2266,22 @@ function withCors(request, response, env) {
   const origin = allowedCorsOrigin(request, env);
   if (!origin) return response;
   const next = new Response(response.body, response);
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(origin, env);
   for (const [key, value] of headers) next.headers.set(key, value);
   next.headers.set("Vary", appendVary(next.headers.get("Vary"), "Origin"));
   return next;
 }
 
-function corsHeaders(origin) {
-  return new Headers({
+function corsHeaders(origin, env) {
+  const headers = new Headers({
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": CORS_ALLOWED_METHODS,
     "Access-Control-Allow-Headers": CORS_ALLOWED_HEADERS,
-    "Access-Control-Allow-Credentials": "true",
   });
+  if (corsCredentialsEnabled(env)) {
+    headers.set("Access-Control-Allow-Credentials", "true");
+  }
+  return headers;
 }
 
 function allowedCorsOrigin(request, env) {
@@ -2192,6 +2297,10 @@ function normalizedAllowedCorsOrigins(env) {
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item && item !== "*" && item !== "null" && isSafeCorsOrigin(item));
+}
+
+function corsCredentialsEnabled(env) {
+  return ["true", "1", "yes"].includes(String(env.CORS_ALLOW_CREDENTIALS || "").trim().toLowerCase());
 }
 
 function isSafeCorsOrigin(origin) {
@@ -2233,6 +2342,17 @@ function debugErrorsEnabled(env) {
   return enabled && environment !== "production";
 }
 
+function canExposeErrorDetail(request, env) {
+  if (!debugErrorsEnabled(env)) return false;
+  const origin = String(request.headers.get("origin") || "").trim();
+  if (!origin) return true;
+  try {
+    return origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
+}
+
 function json(data, status = 200, headers = {}) {
   const securityHeaders = commonSecurityHeaders();
   return new Response(JSON.stringify(data), {
@@ -2248,7 +2368,8 @@ function json(data, status = 200, headers = {}) {
 
 function html(markup, nonce) {
   // F-08 fix: jsQR has SRI integrity; cdn.jsdelivr.net still needed for fetch. Inlining jsQR would eliminate this risk.
-  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net"];
+  // N-06 / F-08: narrow CSP to the exact jsQR path with SRI; drop the broad jsdelivr domain.
+  const scriptSrc = ["'self'", `'nonce-${nonce}'`, "https://challenges.cloudflare.com", "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"];
   const styleSrc = ["'self'", `'nonce-${nonce}'`];
   return new Response(markup, {
     headers: {
@@ -2807,14 +2928,17 @@ function appHtml(env, nonce) {
       if (!currentUser) return;
       try {
         const blob = new Blob(['{}'], { type: "application/json" });
-        navigator.sendBeacon("/api/session/close-soon", blob);
-        fetch("/api/session/close-soon", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
-          body: "{}",
-          keepalive: true,
-          credentials: "same-origin"
-        }).catch(function() {});
+        // N-06 fix: use sendBeacon as primary; only fall back to fetch on failure
+        const ok = navigator.sendBeacon("/api/session/close-soon", blob);
+        if (!ok) {
+          fetch("/api/session/close-soon", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
+            body: "{}",
+            keepalive: true,
+            credentials: "same-origin"
+          }).catch(function() {});
+        }
       } catch {}
     }
 
@@ -3195,12 +3319,21 @@ function appHtml(env, nonce) {
     async function refreshUsers() {
       const d = await api("/api/users");
       const table = document.getElementById("usersTable");
-      table.innerHTML = "<tr><th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th></tr>";
+      // F-03 fix: rebuild table with a single DOM write (no innerHTML += accumulation)
+      const tbody = document.createElement("tbody");
+      const headerRow = document.createElement("tr");
+      headerRow.innerHTML = "<th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th>";
+      tbody.appendChild(headerRow);
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
-        table.innerHTML += "<tr><td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td><button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> <button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> <button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td></tr>";
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
+          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
+          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
+          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
+        tbody.appendChild(tr);
       });
+      table.replaceChildren(tbody);
     }
 
     async function switchRole(id, role) {
