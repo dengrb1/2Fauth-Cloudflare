@@ -12,11 +12,15 @@ const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
+const ENTRY_LABEL_MAX_LENGTH = 200;
+const ENTRY_ISSUER_MAX_LENGTH = 100;
+const GROUP_NAME_MAX_LENGTH = 60;
 const DEFAULT_API_RATE_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
+const DB_ID_PATH_PATTERN = "[1-9]\\d{0,15}";
 
 // N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
 const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
@@ -61,9 +65,9 @@ const API_ROUTES = [
   ["POST", "/api/import/encrypted", handleImportDataEncrypted],
   ["GET", "/api/users", handleListUsers],
   ["POST", "/api/users", handleCreateUser],
-  ["PATCH", /^\/api\/users\/\d+\/role$/, handleUpdateUserRole],
-  ["PATCH", /^\/api\/users\/\d+\/password$/, handleResetUserPassword],
-  ["DELETE", /^\/api\/users\/\d+$/, handleDeleteUser],
+  ["PATCH", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}/role`), handleUpdateUserRole],
+  ["PATCH", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}/password`), handleResetUserPassword],
+  ["DELETE", routePattern("/api", `/users/${DB_ID_PATH_PATTERN}`), handleDeleteUser],
   ["GET", "/api/security/login-policy", handleGetLoginPolicy],
   ["PATCH", "/api/security/login-policy", handleUpdateLoginPolicy],
 ];
@@ -72,11 +76,11 @@ function entryRoutes(prefix) {
   return [
     ["GET", `${prefix}/entries`, handleListEntries],
     ["POST", `${prefix}/entries`, handleCreateEntry],
-    ["PATCH", routePattern(prefix, "/entries/\\d+"), handleUpdateEntry],
-    ["GET", routePattern(prefix, "/entries/\\d+/code"), handleEntryCode],
-    ["POST", routePattern(prefix, "/entries/\\d+/verify"), handleVerifyTotp],
-    ["POST", routePattern(prefix, "/entries/\\d+/hotp"), handleConsumeHotp],
-    ["DELETE", routePattern(prefix, "/entries/\\d+"), handleDeleteEntry],
+    ["PATCH", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleUpdateEntry],
+    ["GET", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/code`), handleEntryCode],
+    ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/verify`), handleVerifyTotp],
+    ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/hotp`), handleConsumeHotp],
+    ["DELETE", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleDeleteEntry],
   ];
 }
 
@@ -84,7 +88,7 @@ function groupRoutes(prefix) {
   return [
     ["GET", `${prefix}/groups`, handleListGroups],
     ["POST", `${prefix}/groups`, handleCreateGroup],
-    ["DELETE", routePattern(prefix, "/groups/\\d+"), handleDeleteGroup],
+    ["DELETE", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleDeleteGroup],
   ];
 }
 
@@ -141,7 +145,7 @@ export default {
         return withCors(request, json({ error: err.message }, err.status), env);
       }
       const payload = { error: "Internal Server Error" };
-      if (debugErrorsEnabled(env)) {
+      if (canExposeErrorDetail(request, env)) {
         payload.detail = err instanceof Error ? err.message : "Internal error";
       }
       return withCors(request, json(payload, 500), env);
@@ -195,7 +199,7 @@ async function handleBootstrap(request, env) {
     userId = normalizeDbId(row?.id);
   }
   if (!userId) return json({ error: "Failed to create user id" }, 500);
-  const { cookie } = await createSession(env, userId);
+  const { cookie } = await regenerateWebSession(request, env, userId);
   return json(
     { ok: true, user: { id: userId, username, role: "admin" } },
     201,
@@ -244,6 +248,7 @@ async function handleLogin(request, env) {
     await upgradePasswordHash(env, row.id, password).catch(() => {});
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
+  await revokePresentedWebSession(request, env);
 
   const clientType = String(body.clientType || "").trim().toLowerCase();
   if (clientType === ANDROID_CLIENT_TYPE) {
@@ -305,6 +310,7 @@ async function handleApiCapabilities(request, env) {
     cors: {
       exactOriginAllowlist: true,
       configured: corsOrigins.length > 0,
+      credentials: corsCredentialsEnabled(env),
     },
     endpoints: {
       login: "/api/v1/auth/login",
@@ -391,6 +397,7 @@ async function handleExtensionLogin(request, env) {
     await upgradePasswordHash(env, row.id, password).catch(() => {});
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
+  await revokePresentedWebSession(request, env);
 
   const deviceName = normalizeClientMetadata(body.deviceName, 120, "edge");
   const clientVersion = normalizeClientMetadata(body.clientVersion, 64, "unknown");
@@ -604,6 +611,8 @@ async function handleCreateEntry(request, env) {
 
   const label = String(payload.label || "").trim();
   const issuer = payload.issuer ? String(payload.issuer).trim() : "";
+  if (label.length > ENTRY_LABEL_MAX_LENGTH) return json({ error: `label must be at most ${ENTRY_LABEL_MAX_LENGTH} characters` }, 400);
+  if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) return json({ error: `issuer must be at most ${ENTRY_ISSUER_MAX_LENGTH} characters` }, 400);
   const secret = String(payload.secret || "").trim();
   const digits = Number(payload.digits || 6);
   const period = Number(payload.period || 30);
@@ -664,6 +673,8 @@ async function handleUpdateEntry(request, env) {
   const body = await parseJson(request);
   const label = body.label !== undefined ? String(body.label).trim() : existing.label;
   const issuer = body.issuer !== undefined ? String(body.issuer).trim() : existing.issuer;
+  if (label.length > ENTRY_LABEL_MAX_LENGTH) return json({ error: `label must be at most ${ENTRY_LABEL_MAX_LENGTH} characters` }, 400);
+  if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) return json({ error: `issuer must be at most ${ENTRY_ISSUER_MAX_LENGTH} characters` }, 400);
   const digits = body.digits !== undefined ? Number(body.digits) : existing.digits;
   const period = body.period !== undefined ? Number(body.period) : existing.period;
   const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-1");
@@ -819,9 +830,10 @@ async function handleCreateGroup(request, env) {
   const body = await parseJson(request);
   const name = String(body.name || "").trim();
   const color = validHexColor(body.color) ? body.color : "#0f766e";
+  if (!name) return json({ error: "name is required" }, 400);
+  if (name.length > GROUP_NAME_MAX_LENGTH) return json({ error: `name must be at most ${GROUP_NAME_MAX_LENGTH} characters` }, 400);
   const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
-  if (!name) return json({ error: "name is required" }, 400);
   if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
@@ -941,6 +953,9 @@ async function handleImportOtpAuth(request, env) {
       errors.push("Missing secret/label");
       continue;
     }
+    if (label.length > ENTRY_LABEL_MAX_LENGTH) { errors.push("Label too long"); continue; }
+    const issuer = String(data.issuer || "").trim();
+    if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) { errors.push("Issuer too long"); continue; }
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) throw new Error("invalid");
@@ -957,7 +972,7 @@ async function handleImportOtpAuth(request, env) {
       await env.DB.prepare(
         "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
       )
-        .bind(userId, label, String(data.issuer || ""), secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
+        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
         .run();
       imported += 1;
     } catch (e) {
@@ -1061,6 +1076,7 @@ async function importPayload(body, auth, env) {
   for (const g of groups) {
     const name = String(g.name || "").trim();
     if (!name) continue;
+    if (name.length > GROUP_NAME_MAX_LENGTH) continue;
     const color = validHexColor(g.color) ? g.color : "#0f766e";
     try {
       const res = await env.DB.prepare(
@@ -1080,7 +1096,10 @@ async function importPayload(body, auth, env) {
   for (const e of entries) {
     const secret = String(e.secret || "").trim();
     const label = String(e.label || "").trim();
+    const issuer = String(e.issuer || "").trim();
     if (!secret || !label) continue;
+    if (label.length > ENTRY_LABEL_MAX_LENGTH) continue;
+    if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) continue;
     try {
       const secretBytes = base32Decode(secret);
       if (!secretBytes.length) continue;
@@ -1099,7 +1118,7 @@ async function importPayload(body, auth, env) {
     await env.DB.prepare(
       "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind(userId, label, String(e.issuer || ""), secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
+      .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
       .run();
     imported.entries += 1;
   }
@@ -1671,6 +1690,18 @@ async function createSession(env, userId) {
   return { cookie: sessionCookie(token, SESSION_TTL_SECONDS) };
 }
 
+async function regenerateWebSession(request, env, userId) {
+  await revokePresentedWebSession(request, env);
+  return createSession(env, userId);
+}
+
+async function revokePresentedWebSession(request, env) {
+  const token = readCookie(request, SESSION_COOKIE);
+  if (!token) return;
+  const tokenHash = await hashSessionToken(token, env);
+  await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(tokenHash).run();
+}
+
 async function refreshSessionTtl(request, env) {
   const token = readCookie(request, SESSION_COOKIE);
   if (!token) return;
@@ -2157,13 +2188,20 @@ function pathResourceId(request, resource) {
   const parts = new URL(request.url).pathname.split("/").filter(Boolean);
   const idx = parts.indexOf(resource);
   if (idx < 0 || idx + 1 >= parts.length) return NaN;
-  return Number(parts[idx + 1]);
+  return parsePathId(parts[idx + 1]);
+}
+
+function parsePathId(value) {
+  const text = String(value || "");
+  if (!/^[1-9]\d{0,15}$/.test(text)) return NaN;
+  const id = Number(text);
+  return Number.isSafeInteger(id) && id > 0 ? id : NaN;
 }
 
 function parseOptionalPositiveId(value) {
   if (value === undefined || value === null || value === "") return null;
   const id = Number(value);
-  if (!Number.isInteger(id) || id <= 0) return false;
+  if (!Number.isSafeInteger(id) || id <= 0) return false;
   return id;
 }
 
@@ -2218,7 +2256,7 @@ function b64ToBytes(b64) {
 function corsPreflight(request, env) {
   const origin = allowedCorsOrigin(request, env);
   if (!origin) return new Response(null, { status: 403 });
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(origin, env);
   headers.set("Access-Control-Max-Age", "86400");
   headers.set("Vary", "Origin");
   return new Response(null, { status: 204, headers });
@@ -2228,19 +2266,22 @@ function withCors(request, response, env) {
   const origin = allowedCorsOrigin(request, env);
   if (!origin) return response;
   const next = new Response(response.body, response);
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(origin, env);
   for (const [key, value] of headers) next.headers.set(key, value);
   next.headers.set("Vary", appendVary(next.headers.get("Vary"), "Origin"));
   return next;
 }
 
-function corsHeaders(origin) {
-  return new Headers({
+function corsHeaders(origin, env) {
+  const headers = new Headers({
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": CORS_ALLOWED_METHODS,
     "Access-Control-Allow-Headers": CORS_ALLOWED_HEADERS,
-    "Access-Control-Allow-Credentials": "true",
   });
+  if (corsCredentialsEnabled(env)) {
+    headers.set("Access-Control-Allow-Credentials", "true");
+  }
+  return headers;
 }
 
 function allowedCorsOrigin(request, env) {
@@ -2256,6 +2297,10 @@ function normalizedAllowedCorsOrigins(env) {
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item && item !== "*" && item !== "null" && isSafeCorsOrigin(item));
+}
+
+function corsCredentialsEnabled(env) {
+  return ["true", "1", "yes"].includes(String(env.CORS_ALLOW_CREDENTIALS || "").trim().toLowerCase());
 }
 
 function isSafeCorsOrigin(origin) {
@@ -2295,6 +2340,17 @@ function debugErrorsEnabled(env) {
   const enabled = String(env.DEBUG_ERRORS || "").toLowerCase() === "true";
   const environment = String(env.ENVIRONMENT || env.NODE_ENV || "").toLowerCase();
   return enabled && environment !== "production";
+}
+
+function canExposeErrorDetail(request, env) {
+  if (!debugErrorsEnabled(env)) return false;
+  const origin = String(request.headers.get("origin") || "").trim();
+  if (!origin) return true;
+  try {
+    return origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
 }
 
 function json(data, status = 200, headers = {}) {

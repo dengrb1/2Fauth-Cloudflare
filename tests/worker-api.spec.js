@@ -422,7 +422,7 @@ test("generic API rate limit rejects excessive authenticated requests", async ()
   const body = await response.json();
 
   assert.equal(response.status, 429);
-  assert.equal(body.error, "Too many API requests");
+  assert.equal(body.error, "Too many API requests. Temporarily locked.");
   assert.equal(response.headers.get("Retry-After") !== null, true);
 });
 
