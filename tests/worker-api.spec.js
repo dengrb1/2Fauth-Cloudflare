@@ -166,6 +166,37 @@ function refreshDb(clientType, changes = 1) {
   };
 }
 
+function loginRateLimitPassThroughDb(user, state = {}) {
+  return {
+    prepare(sql) {
+      const statement = {
+        bind(...args) {
+          state.binds = state.binds || [];
+          state.binds.push({ sql, args });
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM login_risk_control")) return null;
+          if (sql.includes("FROM users WHERE username = ?")) return user;
+          if (sql.includes("SELECT id FROM api_sessions WHERE token_hash = ?")) return { id: 42 };
+          if (sql.includes("SELECT id FROM sessions WHERE token_hash = ?")) return { id: 10 };
+          return null;
+        },
+        async run() {
+          state.runs = state.runs || [];
+          state.runs.push(sql);
+          return { meta: { changes: 1, last_row_id: sql.includes("INSERT INTO sessions") ? 10 : undefined } };
+        },
+        async all() {
+          if (sql.includes("FROM app_settings")) return { results: [] };
+          return { results: [] };
+        },
+      };
+      return statement;
+    },
+  };
+}
+
 function adminSessionDb(handler) {
   const state = { inserts: 0, updates: 0, deletes: 0 };
   const db = {
@@ -309,6 +340,23 @@ test("invalid JSON body returns 400 instead of falling through", async () => {
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "chrome-extension://abc123");
 });
 
+test("oversized JSON body returns 413 before route handling", async () => {
+  const request = new Request("https://example.com/api/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": "1048577",
+    },
+    body: "{}",
+  });
+
+  const response = await worker.fetch(request, envWithDb(emptyDb()), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 413);
+  assert.match(body.error, /JSON body too large/);
+});
+
 test("TURNSTILE_KEY also enforces login verification", async () => {
   const request = new Request("https://example.com/api/v1/auth/login", {
     method: "POST",
@@ -347,6 +395,34 @@ test("web login remains compatible with pre-api-session D1 schema", async () => 
   assert.equal(body.user.username, "admin");
   assert.match(response.headers.get("set-cookie"), /__Host-session=/);
   assert.ok(state.runs.some((sql) => sql === "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"));
+  assert.ok(state.runs.some((sql) => sql === "UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?"));
+});
+
+test("web login ignores android clientType and only returns a web session", async () => {
+  const saltB64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
+  const user = {
+    id: 1,
+    username: "admin",
+    role: "admin",
+    password_salt: saltB64,
+    password_hash: passwordHash("correct horse battery", saltB64),
+  };
+  const request = new Request("https://example.com/api/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username: "admin", password: "correct horse battery", clientType: "android" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(loginRateLimitPassThroughDb(user)), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.accessToken, undefined);
+  assert.equal(body.refreshToken, undefined);
+  assert.match(response.headers.get("set-cookie"), /__Host-session=/);
 });
 
 test("malformed stored password hashes fail login without a 500", async () => {
@@ -424,6 +500,34 @@ test("generic API rate limit rejects excessive authenticated requests", async ()
   assert.equal(response.status, 429);
   assert.equal(body.error, "Too many API requests. Temporarily locked.");
   assert.equal(response.headers.get("Retry-After") !== null, true);
+});
+
+test("generic API rate limit fails closed on DB errors", async () => {
+  const db = {
+    prepare(sql) {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM login_risk_control")) throw new Error("database is locked");
+          return null;
+        },
+      };
+      return statement;
+    },
+  };
+  const request = new Request("https://example.com/api/v1/me", {
+    headers: {
+      Authorization: "Bearer access-token",
+    },
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.error, "API rate limiter unavailable");
 });
 
 test("v1 logout deletes the authenticated API session", async () => {
@@ -527,6 +631,34 @@ test("plaintext export is disabled unless explicitly enabled", async () => {
   assert.equal(body.error, "Plaintext export is disabled. Use /api/export/encrypted.");
 });
 
+test("encrypted import rejects downgraded PBKDF2 iterations", async () => {
+  const db = adminSessionDb({});
+  const request = new Request("https://example.com/api/import/encrypted", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      passphrase: "correct horse",
+      encrypted: {
+        format: "worker-2fauth-encrypted-v1",
+        kdf: "PBKDF2-SHA-256",
+        iterations: 1,
+        salt: "AQIDBAUGBwgJCgsMDQ4PEA==",
+        iv: "AQIDBAUGBwgJCgsM",
+        ciphertext: "AQID",
+      },
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
+});
+
 test("creating entries rejects SHA-1 OTP algorithms", async () => {
   const db = adminSessionDb({});
   const request = new Request("https://example.com/api/v1/entries", {
@@ -548,6 +680,44 @@ test("creating entries rejects SHA-1 OTP algorithms", async () => {
   assert.equal(response.status, 400);
   assert.equal(body.error, "algorithm must be SHA-256 or SHA-512");
   assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+});
+
+test("updating entries rejects SHA-1 OTP algorithms", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT * FROM totp_entries WHERE id = ?")) {
+        return {
+          id: 5,
+          user_id: 1,
+          label: "Email",
+          issuer: "",
+          secret_enc: "iv:cipher",
+          digits: 6,
+          period: 30,
+          algorithm: "SHA-256",
+          otp_type: "totp",
+          hotp_counter: 0,
+          group_id: null,
+        };
+      }
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/entries/5", {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ algorithm: "SHA-1" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "algorithm must be SHA-256 or SHA-512");
+  assert.equal(db.state.runs.some((sql) => sql.includes("UPDATE totp_entries")), false);
 });
 
 test("bootstrap rejects weak passwords before hashing", async () => {
@@ -580,7 +750,7 @@ test("bootstrap rejects weak passwords before hashing", async () => {
   const body = await response.json();
 
   assert.equal(response.status, 400);
-  assert.match(body.error, /uppercase, lowercase, number, and symbol/);
+  assert.equal(body.error, "Invalid username or password");
 });
 
 test("cannot demote the last admin", async () => {
@@ -679,7 +849,7 @@ test("change own password rejects weak new password", async () => {
   const body = await response.json();
 
   assert.equal(response.status, 400);
-  assert.match(body.error, /uppercase, lowercase, number, and symbol/);
+  assert.equal(body.error, "Invalid new password");
 });
 
 test("admin can reset any user password", async () => {

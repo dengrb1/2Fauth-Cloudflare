@@ -1,4 +1,4 @@
-const SESSION_COOKIE = "__Host-session";
+﻿const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
@@ -7,11 +7,22 @@ const CLOSE_SOON_HEADER = "x-session-close";
 const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
 // Keep hashing strong while avoiding CPU limit spikes on Cloudflare Workers.
 const PBKDF2_ITERATIONS = 100_000;
+const MIN_PASSWORD_PBKDF2_ITERATIONS = 10_000;
+const MAX_PASSWORD_PBKDF2_ITERATIONS = 1_000_000;
 const PBKDF2_HASH = "SHA-256";
 const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase, number, and symbol";
+const PASSPHRASE_PBKDF2_ITERATIONS = 180_000;
+const MAX_PASSPHRASE_PBKDF2_ITERATIONS = 1_000_000;
+const ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH = 12;
+const DEFAULT_JSON_BODY_MAX_BYTES = 1_048_576;
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
+const DEFAULT_TOTP_VERIFY_MAX_REQUESTS_PER_MINUTE = 10;
+const DEFAULT_TOTP_VERIFY_LOCK_MINUTES = 5;
+const DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE = 5;
+const DEFAULT_HOTP_CONSUME_LOCK_MINUTES = 5;
+const ENCRYPTION_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
 const ENTRY_LABEL_MAX_LENGTH = 200;
 const ENTRY_ISSUER_MAX_LENGTH = 100;
 const GROUP_NAME_MAX_LENGTH = 60;
@@ -21,6 +32,7 @@ const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
 const DB_ID_PATH_PATTERN = "[1-9]\\d{0,15}";
+const EXTENSION_CORS_PROTOCOLS = new Set(["chrome-extension:", "moz-extension:", "safari-web-extension:"]);
 
 // N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
 const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
@@ -179,7 +191,7 @@ async function handleBootstrap(request, env) {
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
     if (!username || !validPassword(password)) {
-      // F-04: vague error — do not disclose password policy details.
+      // F-04: vague error 鈥?do not disclose password policy details.
       return json({ error: "Invalid username or password" }, 400);
   }
 
@@ -191,7 +203,7 @@ async function handleBootstrap(request, env) {
   const result = await env.DB.prepare(
     "INSERT INTO users (username, password_hash, password_salt, role, created_at) VALUES (?, ?, ?, 'admin', ?)"
   )
-    .bind(username, hashB64, saltB64, now)
+    .bind(username, encodePasswordHash(hashB64), saltB64, now)
     .run();
 
   let userId = normalizeDbId(result.meta?.last_row_id);
@@ -225,8 +237,7 @@ async function handleLogin(request, env) {
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
   if (hasTurnstileSecret(env)) {
-    const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
-    const ts = await verifyTurnstileToken(turnstileToken, ip, env);
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
       return json({ error: "Turnstile verification failed" }, 400);
     }
@@ -250,21 +261,7 @@ async function handleLogin(request, env) {
   }
   await clearLoginRiskControl(request, env, username).catch(() => {});
   await revokePresentedWebSession(request, env);
-  // F-05: session fixation prevention — old session revoked, new random token generated below.
-
-  const clientType = String(body.clientType || "").trim().toLowerCase();
-  if (clientType === ANDROID_CLIENT_TYPE) {
-    const apiSession = await createApiSession(env, row.id, ANDROID_CLIENT_TYPE);
-    return json({
-      ok: true,
-      user: { id: row.id, username: row.username, role: row.role },
-      accessToken: apiSession.accessToken,
-      refreshToken: apiSession.refreshToken,
-      expiresIn: apiSession.expiresIn,
-      refreshExpiresIn: API_REFRESH_TTL_SECONDS,
-      sessionId: apiSession.sessionId,
-    });
-  }
+  // F-05: session fixation prevention 鈥?old session revoked, new random token generated below.
 
   const { cookie } = await createSession(env, row.id);
   return json(
@@ -275,9 +272,7 @@ async function handleLogin(request, env) {
 }
 
 async function handleMobileLogin(request, env) {
-  const body = await parseJson(request);
-  body.clientType = ANDROID_CLIENT_TYPE;
-  return handleLogin(withJsonBody(request, body), env);
+  return loginForApiClient(request, env, ANDROID_CLIENT_TYPE);
 }
 
 async function handleMobileRefresh(request, env) {
@@ -336,8 +331,60 @@ async function handleApiClientLogin(request, env) {
     return handleExtensionLogin(withJsonBody(request, body), env);
   }
 
-  body.clientType = ANDROID_CLIENT_TYPE;
-  return handleLogin(withJsonBody(request, body), env);
+  return loginForApiClient(withJsonBody(request, body), env, ANDROID_CLIENT_TYPE);
+}
+
+async function loginForApiClient(request, env, clientType) {
+  const body = await parseJson(request);
+  const username = normalizeUsername(body.username);
+  const password = String(body.password || "");
+  const turnstileToken = String(body.turnstileToken || "");
+  const risk = await applyLoginRiskControl(request, env, username);
+  if (risk.blocked) {
+    return json(
+      {
+        error: "Too many login attempts. Temporarily locked.",
+        retryAfterSeconds: risk.retryAfterSeconds,
+      },
+      429
+    );
+  }
+  if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (hasTurnstileSecret(env)) {
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
+    if (!ts.ok) {
+      return json({ error: "Turnstile verification failed" }, 400);
+    }
+  }
+
+  const row = await env.DB.prepare(
+    "SELECT id, username, role, password_hash, password_salt FROM users WHERE username = ?"
+  )
+    .bind(username)
+    .first();
+  if (!row) {
+    await verifyPasswordDetailed(password, FAKE_PASSWORD_SALT, FAKE_PASSWORD_HASH);
+    return json({ error: "Invalid credentials" }, 401);
+  }
+
+  const passwordCheck = await verifyPasswordDetailed(password, row.password_salt, row.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid credentials" }, 401);
+  if (passwordCheck.needsRehash) {
+    await upgradePasswordHash(env, row.id, password).catch(() => {});
+  }
+  await clearLoginRiskControl(request, env, username).catch(() => {});
+  await revokePresentedWebSession(request, env);
+
+  const apiSession = await createApiSession(env, row.id, clientType);
+  return json({
+    ok: true,
+    user: { id: row.id, username: row.username, role: row.role },
+    accessToken: apiSession.accessToken,
+    refreshToken: apiSession.refreshToken,
+    expiresIn: apiSession.expiresIn,
+    refreshExpiresIn: API_REFRESH_TTL_SECONDS,
+    sessionId: apiSession.sessionId,
+  });
 }
 
 async function handleApiClientRefresh(request, env) {
@@ -375,8 +422,7 @@ async function handleExtensionLogin(request, env) {
   // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
   const turnstileToken = String(body.turnstileToken || "");
   if (hasTurnstileSecret(env)) {
-    const ip = String(request.headers.get("cf-connecting-ip") || "").split(",")[0].trim();
-    const ts = await verifyTurnstileToken(turnstileToken, ip, env);
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
       return json({ error: "Turnstile verification failed" }, 400);
     }
@@ -476,7 +522,7 @@ async function handleCodesBatchForAuth(request, env, auth) {
     return json({ error: `entryIds cannot exceed ${EXTENSION_BATCH_MAX_IDS}` }, 400);
   }
 
-  // F-01: safe IN-clause query builder — no string interpolation of SQL.
+  // F-01: safe IN-clause query builder 鈥?no string interpolation of SQL.
   // Every element was already validated as a positive integer above.
   const { placeholders, params: inParams } = buildInClause(normalizedIds);
   let query = `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE id IN (${placeholders})`;
@@ -689,7 +735,8 @@ async function handleUpdateEntry(request, env) {
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-1, SHA-256, or SHA-512" }, 400);
+  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (body.algorithm !== undefined && algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
 
   let secretEnc = existing.secret_enc;
@@ -754,6 +801,8 @@ async function handleVerifyTotp(request, env) {
   const body = await parseJson(request);
   const submittedCode = String(body.code || "").replace(/\s+/g, "");
   if (!/^\d{6,8}$/.test(submittedCode)) return json({ error: "code must be 6 to 8 digits" }, 400);
+  const verifyLimit = await applyTotpVerifyRateLimit(request, env, id);
+  if (verifyLimit) return verifyLimit;
 
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
   if (!row) return json({ error: "Entry not found" }, 404);
@@ -786,6 +835,9 @@ async function handleConsumeHotp(request, env) {
   if (!row) return json({ error: "Entry not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
   if ((row.otp_type || "totp") !== "hotp") return json({ error: "This entry is not HOTP" }, 400);
+
+  const hotpLimit = await applyHotpConsumeRateLimit(request, env, id);
+  if (hotpLimit) return hotpLimit;
 
   const secret = await decryptText(row.secret_enc, env);
   const counter = Number(row.hotp_counter || 0);
@@ -1134,8 +1186,8 @@ async function handleExportDataEncrypted(request, env) {
   if (!auth.ok) return auth.response;
   const body = await parseJson(request);
   const passphrase = String(body.passphrase || "");
-  if (passphrase.length < 10) {
-    return json({ error: "passphrase must be at least 10 chars" }, 400);
+  if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) {
+    return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
   }
 
   const plainData = await getExportPayload(auth, env);
@@ -1150,7 +1202,7 @@ async function handleImportDataEncrypted(request, env) {
   const body = await parseJson(request);
   const passphrase = String(body.passphrase || "");
   const encrypted = body.encrypted;
-  if (passphrase.length < 10) return json({ error: "passphrase must be at least 10 chars" }, 400);
+  if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
   if (!encrypted || typeof encrypted !== "object") return json({ error: "encrypted payload is required" }, 400);
 
   let data;
@@ -1205,7 +1257,7 @@ async function handleCreateUser(request, env) {
     const result = await env.DB.prepare(
       "INSERT INTO users (username, password_hash, password_salt, role, created_at) VALUES (?, ?, ?, ?, ?)"
     )
-      .bind(username, hashB64, saltB64, role, now)
+      .bind(username, encodePasswordHash(hashB64), saltB64, role, now)
       .run();
     return json({ ok: true, id: normalizeDbId(result.meta?.last_row_id) }, 201);
   } catch {
@@ -1401,18 +1453,36 @@ async function applyLoginRiskControl(request, env, username) {
   const nowSec = Math.floor(Date.now() / 1000);
   const policy = await getLoginPolicy(env);
   const ip = clientIp(request);
-  const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
-  let row;
+  const usernameKey = await sha256Base64(`login|user-ip|${username || "__empty__"}|${ip}`);
+  const ipKey = await sha256Base64(`login|ip|${ip}`);
+  const ipPolicy = { ...policy, maxRequestsPerMinute: policy.maxRequestsPerMinute * 2 };
+  let userRisk;
+  let ipRisk;
   try {
-    row = await env.DB.prepare(
-      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
-    )
-      .bind(riskKey)
-      .first();
+    [userRisk, ipRisk] = await Promise.all([
+      updateLoginRiskBucket(env, usernameKey, username || "__empty__", ip, nowSec, policy),
+      updateLoginRiskBucket(env, ipKey, "__any__", ip, nowSec, ipPolicy),
+    ]);
   } catch (err) {
-    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
+    if (isMissingTableError(err, "login_risk_control")) throw new ApiError(503, "Service temporarily unavailable");
     throw err;
   }
+
+  if (userRisk.blocked && ipRisk.blocked) {
+    return userRisk.retryAfterSeconds >= ipRisk.retryAfterSeconds ? userRisk : ipRisk;
+  }
+  if (userRisk.blocked) return userRisk;
+  if (ipRisk.blocked) return ipRisk;
+  return { blocked: false };
+}
+
+async function updateLoginRiskBucket(env, riskKey, username, ip, nowSec, policy) {
+  let row;
+  row = await env.DB.prepare(
+    "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+  )
+    .bind(riskKey)
+    .first();
 
   if (row && Number(row.lock_until) > nowSec) {
     return {
@@ -1433,16 +1503,11 @@ async function applyLoginRiskControl(request, env, username) {
     lockUntil = nowSec + policy.lockMinutes * 60;
   }
 
-  try {
-    await env.DB.prepare(
-      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
-    )
-      .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
-      .run();
-  } catch (err) {
-    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
-    throw err;
-  }
+  await env.DB.prepare(
+    "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+  )
+    .bind(riskKey, username || "__empty__", ip, windowStart, requestCount, lockUntil, nowSec)
+    .run();
 
   if (lockUntil > nowSec) {
     return { blocked: true, retryAfterSeconds: lockUntil - nowSec, lockUntil };
@@ -1452,8 +1517,11 @@ async function applyLoginRiskControl(request, env, username) {
 
 async function clearLoginRiskControl(request, env, username) {
   const ip = clientIp(request);
-  const riskKey = await sha256Base64(`${username || "__empty__"}|${ip}`);
-  await env.DB.prepare("DELETE FROM login_risk_control WHERE key = ?").bind(riskKey).run();
+  const usernameKey = await sha256Base64(`login|user-ip|${username || "__empty__"}|${ip}`);
+  const ipKey = await sha256Base64(`login|ip|${ip}`);
+  await env.DB.prepare("DELETE FROM login_risk_control WHERE key IN (?, ?)")
+    .bind(usernameKey, ipKey)
+    .run();
 }
 
 async function clearLoginRiskForUsername(env, username) {
@@ -1476,10 +1544,6 @@ async function deleteUserSessions(env, userId) {
 async function applyApiRateLimit(request, env, route) {
   if (!shouldRateLimitRoute(request, route)) return null;
 
-  try {
-    if (await isAdminRequest(request, env)) return null;
-  } catch { /* fall through to rate limit */ }
-
   const nowSec = Math.floor(Date.now() / 1000);
   const maxRequests = normalizeRateLimit(env.API_RATE_MAX_REQUESTS_PER_MINUTE, DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE);
   const subject = await apiRateLimitSubject(request, env);
@@ -1492,7 +1556,7 @@ async function applyApiRateLimit(request, env, route) {
       .bind(rateKey)
       .first();
   } catch (err) {
-    return null;
+    return json({ error: "API rate limiter unavailable" }, 503);
   }
 
   if (row && Number(row.lock_until) > nowSec) {
@@ -1522,7 +1586,7 @@ async function applyApiRateLimit(request, env, route) {
       .bind(rateKey, "__api__", clientIp(request), windowStart, requestCount, lockUntil, nowSec)
       .run();
   } catch (err) {
-    return null;
+    return json({ error: "API rate limiter unavailable" }, 503);
   }
 
   if (requestCount > maxRequests) {
@@ -1530,6 +1594,61 @@ async function applyApiRateLimit(request, env, route) {
       { error: "Too many API requests. Temporarily locked.", retryAfterSeconds: lockUntil - nowSec },
       429,
       { "Retry-After": String(lockUntil - nowSec) }
+    );
+  }
+  return null;
+}
+
+async function applyTotpVerifyRateLimit(request, env, entryId) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const subject = await apiRateLimitSubject(request, env);
+  const rateKey = await sha256Base64(`totp-verify|${entryId}|${subject}`);
+  const policy = {
+    maxRequestsPerMinute: normalizeRateLimit(
+      env.TOTP_VERIFY_MAX_REQUESTS_PER_MINUTE,
+      DEFAULT_TOTP_VERIFY_MAX_REQUESTS_PER_MINUTE
+    ),
+    lockMinutes: normalizeRateLimit(env.TOTP_VERIFY_LOCK_MINUTES, DEFAULT_TOTP_VERIFY_LOCK_MINUTES),
+  };
+
+  let result;
+  try {
+    result = await updateLoginRiskBucket(env, rateKey, "__totp_verify__", clientIp(request), nowSec, policy);
+  } catch (err) {
+    return json({ error: "TOTP verification rate limiter unavailable" }, 503);
+  }
+
+  if (result.blocked) {
+    return json(
+      { error: "Too many TOTP verification attempts. Temporarily locked.", retryAfterSeconds: result.retryAfterSeconds },
+      429,
+      { "Retry-After": String(result.retryAfterSeconds) }
+    );
+  }
+  return null;
+}
+
+async function applyHotpConsumeRateLimit(request, env, entryId) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const subject = await apiRateLimitSubject(request, env);
+  const rateKey = await sha256Base64(`hotp-consume|${entryId}|${subject}`);
+  const policy = {
+    maxRequestsPerMinute: Number(env.HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE) || DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE,
+    lockMinutes: Number(env.HOTP_CONSUME_LOCK_MINUTES) || DEFAULT_HOTP_CONSUME_LOCK_MINUTES,
+  };
+
+  let result;
+  try {
+    result = await updateLoginRiskBucket(env, rateKey, "__hotp_consume__", clientIp(request), nowSec, policy);
+  } catch (err) {
+    return json({ error: "HOTP rate limiter unavailable" }, 503);
+  }
+
+  if (result.blocked) {
+    return json(
+      { error: "Too many HOTP requests. Temporarily locked.", retryAfterSeconds: result.retryAfterSeconds },
+      429,
+      { "Retry-After": String(result.retryAfterSeconds) }
     );
   }
   return null;
@@ -1545,6 +1664,7 @@ function shouldRateLimitRoute(request, route) {
       "/api/mobile/login",
       "/api/extension/login",
       "/api/v1/auth/login",
+      "/api/bootstrap",
     ].includes(path)
   ) {
     return false;
@@ -1604,9 +1724,12 @@ function dbErrorMessage(err) {
 }
 
 function clientIp(request) {
-  return String(request.headers.get("cf-connecting-ip") || "unknown")
+  // Only trust cf-connecting-ip (set by Cloudflare edge, not spoofable by client).
+  // x-forwarded-for / x-real-ip are client-controlled and must not be used.
+  const value = String(request.headers.get("cf-connecting-ip") || "")
     .split(",")[0]
-    .trim() || "unknown";
+    .trim();
+  return value || "unknown";
 }
 
 async function verifyTurnstileToken(token, remoteip, env) {
@@ -1856,7 +1979,7 @@ function isExtensionClientType(clientType) {
 function normalizeApiClientType(value) {
   const v = String(value || "").trim().toLowerCase();
   if (v === ANDROID_CLIENT_TYPE) return ANDROID_CLIENT_TYPE;
-  if (["browser_extension", "extension", "edge_extension", "chrome_extension"].includes(v)) {
+  if (["browser_extension", "extension", "edge_extension", "chrome_extension", "safari-web-extension"].includes(v)) {
     return "browser_extension";
   }
   return "";
@@ -1893,16 +2016,36 @@ async function hashPassword(password, saltB64, iterations = PBKDF2_ITERATIONS) {
   return { hashB64: bytesToB64(new Uint8Array(bits)), saltB64: bytesToB64(salt) };
 }
 
+function encodePasswordHash(hashB64, iterations = PBKDF2_ITERATIONS) {
+  return `pbkdf2-${PBKDF2_HASH.toLowerCase()}:i=${iterations}:${hashB64}`;
+}
+
+function parsePasswordHash(storedHashB64) {
+  const text = String(storedHashB64 || "");
+  const match = text.match(/^pbkdf2-sha-256:i=([1-9]\d{0,9}):([A-Za-z0-9+/]+={0,2})$/);
+  if (!match) return { hashB64: text, iterations: PBKDF2_ITERATIONS, legacy: true };
+  const iterations = Number(match[1]);
+  if (
+    !Number.isSafeInteger(iterations) ||
+    iterations < MIN_PASSWORD_PBKDF2_ITERATIONS ||
+    iterations > MAX_PASSWORD_PBKDF2_ITERATIONS
+  ) {
+    throw new Error("invalid password hash iterations");
+  }
+  return { hashB64: match[2], iterations, legacy: false };
+}
+
 async function verifyPassword(password, saltB64, expectedHashB64) {
   return (await verifyPasswordDetailed(password, saltB64, expectedHashB64)).ok;
 }
 
 async function verifyPasswordDetailed(password, saltB64, expectedHashB64) {
   try {
-    const expected = b64ToBytes(expectedHashB64);
-    const current = await hashPassword(password, saltB64, PBKDF2_ITERATIONS);
+    const parsed = parsePasswordHash(expectedHashB64);
+    const expected = b64ToBytes(parsed.hashB64);
+    const current = await hashPassword(password, saltB64, parsed.iterations);
     if (constantTimeEqual(b64ToBytes(current.hashB64), expected)) {
-      return { ok: true, needsRehash: false };
+      return { ok: true, needsRehash: parsed.legacy || parsed.iterations < PBKDF2_ITERATIONS };
     }
   } catch {
     return { ok: false, needsRehash: false };
@@ -1913,7 +2056,7 @@ async function verifyPasswordDetailed(password, saltB64, expectedHashB64) {
 async function upgradePasswordHash(env, userId, password) {
   const { hashB64, saltB64 } = await hashPassword(password);
   await env.DB.prepare("UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?")
-    .bind(hashB64, saltB64, userId)
+    .bind(encodePasswordHash(hashB64), saltB64, userId)
     .run();
 }
 
@@ -1923,14 +2066,24 @@ async function getEncryptionKey(env) {
   // F-02 fix: hash secrets instead of storing plaintext secrets in Map key
   const raw = `${env.ENVIRONMENT || env.NODE_ENV || "default"}|${env.ENCRYPTION_KEY}|${env.SESSION_PEPPER}`;
   const cacheKey = await sha256Base64(raw);
-  if (!encryptionKeyCache.has(cacheKey)) {
-    if (encryptionKeyCache.size >= 8) encryptionKeyCache.clear();
-    encryptionKeyCache.set(cacheKey, crypto.subtle.importKey("raw", b64ToBytes(env.ENCRYPTION_KEY), "AES-GCM", false, [
-      "encrypt",
-      "decrypt",
-    ]));
+  const now = Date.now();
+  for (const [key, entry] of encryptionKeyCache) {
+    if (entry.expiresAt <= now) encryptionKeyCache.delete(key);
   }
-  return encryptionKeyCache.get(cacheKey);
+  const cached = encryptionKeyCache.get(cacheKey);
+  if (!cached) {
+    if (encryptionKeyCache.size >= 8) encryptionKeyCache.clear();
+    const keyPromise = crypto.subtle.importKey(
+      "raw",
+      b64ToBytes(env.ENCRYPTION_KEY),
+      "AES-GCM",
+      false,
+      ["encrypt", "decrypt"]
+    );
+    encryptionKeyCache.set(cacheKey, { keyPromise, expiresAt: now + ENCRYPTION_KEY_CACHE_TTL_MS });
+    return keyPromise;
+  }
+  return cached.keyPromise;
 }
 
 async function encryptText(plain, env) {
@@ -1961,7 +2114,7 @@ async function encryptWithPassphrase(data, passphrase) {
   return {
     format: "worker-2fauth-encrypted-v1",
     kdf: "PBKDF2-SHA-256",
-    iterations: 180000,
+    iterations: PASSPHRASE_PBKDF2_ITERATIONS,
     salt: bytesToB64(salt),
     iv: bytesToB64(iv),
     ciphertext: bytesToB64(new Uint8Array(cipher)),
@@ -1970,7 +2123,7 @@ async function encryptWithPassphrase(data, passphrase) {
 
 async function decryptWithPassphrase(payload, passphrase) {
   if (payload.format !== "worker-2fauth-encrypted-v1") throw new Error("unsupported format");
-  const iterations = Number(payload.iterations || 180000);
+  const iterations = normalizePassphraseIterations(payload.iterations);
   const salt = b64ToBytes(String(payload.salt || ""));
   const iv = b64ToBytes(String(payload.iv || ""));
   const ciphertext = b64ToBytes(String(payload.ciphertext || ""));
@@ -1979,7 +2132,7 @@ async function decryptWithPassphrase(payload, passphrase) {
   return JSON.parse(dec(new Uint8Array(plain)));
 }
 
-async function derivePassphraseKey(passphrase, salt, iterations = 180000) {
+async function derivePassphraseKey(passphrase, salt, iterations = PASSPHRASE_PBKDF2_ITERATIONS) {
   const baseKey = await crypto.subtle.importKey("raw", enc(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", hash: "SHA-256", salt, iterations },
@@ -1988,6 +2141,18 @@ async function derivePassphraseKey(passphrase, salt, iterations = 180000) {
     false,
     ["encrypt", "decrypt"]
   );
+}
+
+function normalizePassphraseIterations(value) {
+  const iterations = value === undefined || value === null ? PASSPHRASE_PBKDF2_ITERATIONS : Number(value);
+  if (
+    !Number.isSafeInteger(iterations) ||
+    iterations < PASSPHRASE_PBKDF2_ITERATIONS ||
+    iterations > MAX_PASSPHRASE_PBKDF2_ITERATIONS
+  ) {
+    throw new Error("invalid PBKDF2 iterations");
+  }
+  return iterations;
 }
 
 function parseOtpAuthUri(uri) {
@@ -2194,7 +2359,7 @@ function normalizeDbId(value) {
   return null;
 }
 
-// F-01: safe IN-clause builder. Returns only "?" placeholders — never interpolates user values into SQL.
+// F-01: safe IN-clause builder. Returns only "?" placeholders 鈥?never interpolates user values into SQL.
 function buildInClause(values) {
   // values must be pre-validated (e.g. positive integers) by the caller.
   const placeholders = Array(values.length).fill("?").join(", ");
@@ -2228,12 +2393,41 @@ function randomHex(byteLen) {
 }
 
 async function parseJson(request) {
-  const text = await request.text();
+  const text = await readRequestTextLimited(request, DEFAULT_JSON_BODY_MAX_BYTES);
   if (!text.trim()) return {};
   try {
     return JSON.parse(text);
   } catch {
     throw new ApiError(400, "Invalid JSON body");
+  }
+}
+
+async function readRequestTextLimited(request, maxBytes) {
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new ApiError(413, `JSON body too large (max ${maxBytes} bytes)`);
+  }
+  if (!request.body) return "";
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new ApiError(413, `JSON body too large (max ${maxBytes} bytes)`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -2243,9 +2437,9 @@ async function sha256Base64(input) {
 }
 
 function constantTimeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let out = 0;
-  for (let i = 0; i < a.length; i++) out |= a[i] ^ b[i];
+  const maxLen = Math.max(a.length, b.length);
+  let out = a.length ^ b.length;
+  for (let i = 0; i < maxLen; i++) out |= (a[i] || 0) ^ (b[i] || 0);
   return out === 0;
 }
 
@@ -2322,10 +2516,14 @@ function corsCredentialsEnabled(env) {
 function isSafeCorsOrigin(origin) {
   // F-11 fix: no longer automatically trust all browser extensions.
   // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
-  // F-03: reject extension protocols and only allow http/https via URL parser.
   try {
     const url = new URL(origin);
-    return origin === url.origin && ["https:", "http:"].includes(url.protocol);
+    if (["https:", "http:"].includes(url.protocol)) return origin === url.origin;
+    if (EXTENSION_CORS_PROTOCOLS.has(url.protocol)) {
+      const normalized = `${url.protocol}//${url.host}`;
+      return origin === normalized && !!url.host;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -2415,7 +2613,7 @@ function appHtml(env, nonce) {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>2FAuth 验证器</title>
+  <title>2FAuth 楠岃瘉鍣?/title>
   <style nonce="${nonce}">
     :root {
       --bg: #f3f7f6;
@@ -2561,41 +2759,41 @@ function appHtml(env, nonce) {
   <div class="page">
     <div class="top">
       <div>
-        <h1 id="appTitle">2FAuth 验证器</h1>
-        <div id="state" class="sub">加载中...</div>
+        <h1 id="appTitle">2FAuth 楠岃瘉鍣?/h1>
+        <div id="state" class="sub">鍔犺浇涓?..</div>
       </div>
       <div class="row">
         <select id="langSelect">
-          <option value="zh-CN">简体中文</option>
+          <option value="zh-CN">绠€浣撲腑鏂?/option>
           <option value="en-US">English</option>
         </select>
         <select id="autoLogoutSelect">
-          <option value="15">15分钟自动退出</option>
-          <option value="30">30分钟自动退出</option>
-          <option value="60">60分钟自动退出</option>
-          <option value="120">120分钟自动退出</option>
-          <option value="0">不自动退出</option>
+          <option value="15">15鍒嗛挓鑷姩閫€鍑?/option>
+          <option value="30">30鍒嗛挓鑷姩閫€鍑?/option>
+          <option value="60">60鍒嗛挓鑷姩閫€鍑?/option>
+          <option value="120">120鍒嗛挓鑷姩閫€鍑?/option>
+          <option value="0">涓嶈嚜鍔ㄩ€€鍑?/option>
         </select>
         <div id="whoami" class="sub"></div>
       </div>
     </div>
 
     <section id="bootstrap" class="panel stack">
-      <h3 class="flush">初始化管理员</h3>
+      <h3 class="flush">鍒濆鍖栫鐞嗗憳</h3>
       <div class="row">
-        <input id="bsUser" placeholder="管理员用户名" />
-        <input id="bsPass" type="password" placeholder="密码（至少12位，含大小写/数字/符号）" />
-        <button type="button" data-action="bootstrap">初始化</button>
+        <input id="bsUser" placeholder="绠＄悊鍛樼敤鎴峰悕" />
+        <input id="bsPass" type="password" placeholder="瀵嗙爜锛堣嚦灏?2浣嶏紝鍚ぇ灏忓啓/鏁板瓧/绗﹀彿锛? />
+        <button type="button" data-action="bootstrap">鍒濆鍖?/button>
       </div>
       <div id="bsMsg" class="muted"></div>
     </section>
 
     <section id="login" class="panel stack">
-      <h3 class="flush">登录</h3>
+      <h3 class="flush">鐧诲綍</h3>
       <div class="row">
-        <input id="loginUser" placeholder="用户名" />
-        <input id="loginPass" type="password" placeholder="密码" />
-        <button type="button" data-action="login">登录</button>
+        <input id="loginUser" placeholder="鐢ㄦ埛鍚? />
+        <input id="loginPass" type="password" placeholder="瀵嗙爜" />
+        <button type="button" data-action="login">鐧诲綍</button>
       </div>
       <div id="turnstileBox" class="row hidden"></div>
       <div id="loginMsg" class="muted"></div>
@@ -2604,29 +2802,29 @@ function appHtml(env, nonce) {
     <section id="app">
       <div class="panel row top-actions">
         <div class="row">
-          <input id="search" placeholder="搜索标签/发行方..." />
-          <select id="groupFilter"><option value="">全部分组</option></select>
-          <button class="ghost" data-action="refresh-all">刷新</button>
+          <input id="search" placeholder="鎼滅储鏍囩/鍙戣鏂?.." />
+          <select id="groupFilter"><option value="">鍏ㄩ儴鍒嗙粍</option></select>
+          <button class="ghost" data-action="refresh-all">鍒锋柊</button>
         </div>
         <div class="row">
-          <button class="ghost" data-action="export-data">导出</button>
-          <button class="ghost" data-action="export-otpauth">导出 otpauth 文本</button>
-          <button class="ghost" data-action="export-encrypted">加密导出</button>
-          <button class="ghost" data-action="toggle-import">导入</button>
-          <button class="ghost" data-action="change-my-password">修改密码</button>
-          <button type="button" class="warn" data-action="logout">退出登录</button>
+          <button class="ghost" data-action="export-data">瀵煎嚭</button>
+          <button class="ghost" data-action="export-otpauth">瀵煎嚭 otpauth 鏂囨湰</button>
+          <button class="ghost" data-action="export-encrypted">鍔犲瘑瀵煎嚭</button>
+          <button class="ghost" data-action="toggle-import">瀵煎叆</button>
+          <button class="ghost" data-action="change-my-password">淇敼瀵嗙爜</button>
+          <button type="button" class="warn" data-action="logout">閫€鍑虹櫥褰?/button>
         </div>
       </div>
 
       <div id="importPanel" class="panel stack hidden">
-        <h3 class="flush">导入备份 JSON</h3>
-        <textarea id="importText" placeholder='粘贴 /api/export 的 JSON'></textarea>
+        <h3 class="flush">瀵煎叆澶囦唤 JSON</h3>
+        <textarea id="importText" placeholder='绮樿创 /api/export 鐨?JSON'></textarea>
         <div class="row">
           <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" />
-          <input id="importPassphrase" type="password" placeholder="口令（用于加密备份）" />
-          <button data-action="import-data">执行导入</button>
-          <button class="ghost" data-action="import-otpauth">导入 otpauth 文本</button>
-          <button class="ghost" data-action="import-encrypted">执行加密导入</button>
+          <input id="importPassphrase" type="password" placeholder="鍙ｄ护锛堢敤浜庡姞瀵嗗浠斤級" />
+          <button data-action="import-data">鎵ц瀵煎叆</button>
+          <button class="ghost" data-action="import-otpauth">瀵煎叆 otpauth 鏂囨湰</button>
+          <button class="ghost" data-action="import-encrypted">鎵ц鍔犲瘑瀵煎叆</button>
         </div>
         <div id="importMsg" class="muted"></div>
       </div>
@@ -2634,56 +2832,56 @@ function appHtml(env, nonce) {
       <div class="grid">
         <div class="stack">
           <div class="panel stack">
-            <h3 class="flush">新建条目</h3>
-            <input id="eLabel" placeholder="标签（如 GitHub）" />
-            <input id="eIssuer" placeholder="发行方（可选）" />
-            <input id="eSecret" placeholder="Base32 密钥" />
-            <input id="eUri" placeholder="或 otpauth://totp/... / otpauth://hotp/..." />
+            <h3 class="flush">鏂板缓鏉＄洰</h3>
+            <input id="eLabel" placeholder="鏍囩锛堝 GitHub锛? />
+            <input id="eIssuer" placeholder="鍙戣鏂癸紙鍙€夛級" />
+            <input id="eSecret" placeholder="Base32 瀵嗛挜" />
+            <input id="eUri" placeholder="鎴?otpauth://totp/... / otpauth://hotp/..." />
             <div class="row">
-              <button class="ghost" data-action="start-scan">摄像头扫码</button>
-              <button class="ghost" data-action="stop-scan">停止扫码</button>
+              <button class="ghost" data-action="start-scan">鎽勫儚澶存壂鐮?/button>
+              <button class="ghost" data-action="stop-scan">鍋滄鎵爜</button>
               <input id="qrImageFile" type="file" accept="image/*" />
             </div>
             <video id="scanVideo" autoplay playsinline class="hidden"></video>
             <div id="scanMsg" class="muted"></div>
             <div class="row">
               <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
-              <select id="eAlgo"><option>SHA-1</option><option>SHA-256</option><option>SHA-512</option></select>
+              <select id="eAlgo"><option>SHA-256</option><option>SHA-512</option></select>
               <input id="eDigits" value="6" class="narrow-74" />
               <input id="ePeriod" value="30" class="narrow-74" />
               <input id="eCounter" value="0" class="narrow-86" />
             </div>
-            <select id="eGroup"><option value="">不分组</option></select>
-            <button data-action="create-entry">保存条目</button>
+            <select id="eGroup"><option value="">涓嶅垎缁?/option></select>
+            <button data-action="create-entry">淇濆瓨鏉＄洰</button>
             <div id="entryMsg" class="muted"></div>
           </div>
 
           <div class="panel stack">
-            <h3 class="flush">分组</h3>
+            <h3 class="flush">鍒嗙粍</h3>
             <div class="row">
-              <input id="gName" placeholder="分组名称" />
+              <input id="gName" placeholder="鍒嗙粍鍚嶇О" />
               <input id="gColor" value="#0f766e" class="narrow-110" />
-              <button data-action="create-group">新增</button>
+              <button data-action="create-group">鏂板</button>
             </div>
             <div id="groupsList" class="stack"></div>
           </div>
 
           <div id="adminPanel" class="panel stack hidden">
-            <h3 class="flush">用户管理（管理员）</h3>
+            <h3 class="flush">鐢ㄦ埛绠＄悊锛堢鐞嗗憳锛?/h3>
             <div class="row">
-              <input id="uName" placeholder="用户名" />
-              <input id="uPass" type="password" placeholder="密码 >=12 位，含大小写/数字/符号" />
+              <input id="uName" placeholder="鐢ㄦ埛鍚? />
+              <input id="uPass" type="password" placeholder="瀵嗙爜 >=12 浣嶏紝鍚ぇ灏忓啓/鏁板瓧/绗﹀彿" />
               <select id="uRole"><option value="user">user</option><option value="admin">admin</option></select>
-              <button data-action="create-user">创建</button>
+              <button data-action="create-user">鍒涘缓</button>
             </div>
             <div id="userMsg" class="muted"></div>
             <table id="usersTable"></table>
             <div class="panel stack mt-8">
-              <h4 class="flush">登录风控设置</h4>
+              <h4 class="flush">鐧诲綍椋庢帶璁剧疆</h4>
               <div class="row">
-                <input id="riskMaxReq" type="number" min="3" max="100" placeholder="每分钟请求阈值（默认10）" />
-                <input id="riskLockMin" type="number" min="1" max="1440" placeholder="锁定分钟数（默认15）" />
-                <button data-action="save-login-policy">保存风控设置</button>
+                <input id="riskMaxReq" type="number" min="3" max="100" placeholder="姣忓垎閽熻姹傞槇鍊硷紙榛樿10锛? />
+                <input id="riskLockMin" type="number" min="1" max="1440" placeholder="閿佸畾鍒嗛挓鏁帮紙榛樿15锛? />
+                <button data-action="save-login-policy">淇濆瓨椋庢帶璁剧疆</button>
               </div>
               <div id="riskMsg" class="muted"></div>
             </div>
@@ -2691,7 +2889,7 @@ function appHtml(env, nonce) {
         </div>
 
         <div class="panel stack">
-          <h3 class="flush">我的验证码</h3>
+          <h3 class="flush">鎴戠殑楠岃瘉鐮?/h3>
           <div id="entries" class="entry-grid"></div>
         </div>
       </div>
@@ -2714,74 +2912,74 @@ function appHtml(env, nonce) {
     let turnstileToken = "";
     const I18N = {
       "zh-CN": {
-        loading: "加载中...",
-        systemNotInitialized: "系统尚未初始化，请先创建管理员。",
-        pleaseLogin: "请先登录。",
-        ready: "已就绪",
-        logoutTimeout: "会话因长时间无操作已自动退出。",
-        noGroup: "不分组",
-        allGroups: "全部分组",
-        noGroupsYet: "暂无分组。",
-        noEntriesMatched: "当前筛选下没有条目。",
-        noIssuer: "无发行方",
-        clickGenerate: "点击生成",
-        secLeft: "秒后过期",
-        copyCode: "复制验证码",
-        codeCopied: "验证码已复制",
-        copyFailed: "复制失败，请手动复制",
-        setGroup: "设为分组",
-        removeGroup: "移出分组",
-        groupUpdated: "分组已更新",
-        generateHotp: "生成 HOTP",
-        edit: "编辑",
-        delete: "删除",
-        deleteEntryConfirm: "确认删除该条目？",
-        deleteGroupConfirm: "确认删除分组？分组下条目将变为不分组。",
-        deleteUserConfirm: "确认删除用户？",
-        backupCopied: "备份 JSON 已复制到剪贴板。",
-        encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
-        plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
-        plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
-        setBackupPassphrase: "设置备份口令（至少10位）",
-        copyExportJson: "复制导出 JSON",
-        copyEncryptedExportJson: "复制加密导出 JSON",
-        importedDone: "导入完成",
-        encryptedImportedDone: "加密导入完成",
-        cameraNotSupported: "当前浏览器不支持 BarcodeDetector。",
-        cameraFallback: "已启用兼容扫码模式（jsQR）。",
-        cameraStarted: "摄像头扫码已启动...",
-        qrDetected: "已识别二维码，URI 已填入表单。",
-        qrReadyToSave: "二维码已识别，点击“保存条目”即可添加。",
-        cameraDenied: "无法访问摄像头：",
-        noQrFound: "图片中未识别到二维码。",
-        qrFromImage: "图片二维码识别成功。",
-        scanImageFailed: "图片扫码失败：",
-        saved: "已保存",
-        userCreated: "用户已创建",
-        changePassword: "修改密码",
-        resetPassword: "重置密码",
-        currentPassword: "当前密码",
-        newPassword: "新密码",
-        passwordChanged: "密码已修改，请重新登录。",
-        passwordReset: "密码已重置",
-        passwordResetConfirm: "确认重置该用户的密码？",
-        labelPrompt: "标签",
-        issuerPrompt: "发行方",
-        groupIdPrompt: "分组 ID（留空代表不分组）",
+        loading: "鍔犺浇涓?..",
+        systemNotInitialized: "绯荤粺灏氭湭鍒濆鍖栵紝璇峰厛鍒涘缓绠＄悊鍛樸€?,
+        pleaseLogin: "璇峰厛鐧诲綍銆?,
+        ready: "宸插氨缁?,
+        logoutTimeout: "浼氳瘽鍥犻暱鏃堕棿鏃犳搷浣滃凡鑷姩閫€鍑恒€?,
+        noGroup: "涓嶅垎缁?,
+        allGroups: "鍏ㄩ儴鍒嗙粍",
+        noGroupsYet: "鏆傛棤鍒嗙粍銆?,
+        noEntriesMatched: "褰撳墠绛涢€変笅娌℃湁鏉＄洰銆?,
+        noIssuer: "鏃犲彂琛屾柟",
+        clickGenerate: "鐐瑰嚮鐢熸垚",
+        secLeft: "绉掑悗杩囨湡",
+        copyCode: "澶嶅埗楠岃瘉鐮?,
+        codeCopied: "楠岃瘉鐮佸凡澶嶅埗",
+        copyFailed: "澶嶅埗澶辫触锛岃鎵嬪姩澶嶅埗",
+        setGroup: "璁句负鍒嗙粍",
+        removeGroup: "绉诲嚭鍒嗙粍",
+        groupUpdated: "鍒嗙粍宸叉洿鏂?,
+        generateHotp: "鐢熸垚 HOTP",
+        edit: "缂栬緫",
+        delete: "鍒犻櫎",
+        deleteEntryConfirm: "纭鍒犻櫎璇ユ潯鐩紵",
+        deleteGroupConfirm: "纭鍒犻櫎鍒嗙粍锛熷垎缁勪笅鏉＄洰灏嗗彉涓轰笉鍒嗙粍銆?,
+        deleteUserConfirm: "纭鍒犻櫎鐢ㄦ埛锛?,
+        backupCopied: "澶囦唤 JSON 宸插鍒跺埌鍓创鏉裤€?,
+        encryptedBackupCopied: "鍔犲瘑澶囦唤 JSON 宸插鍒跺埌鍓创鏉裤€?,
+        plaintextExportConfirm: "鏄庢枃瀵煎嚭浼氬寘鍚墍鏈?OTP 瀵嗛挜銆傜‘璁ょ户缁紵",
+        plaintextExportDisabled: "褰撳墠閮ㄧ讲鏈紑鍚槑鏂囧鍑猴紝璇蜂娇鐢ㄢ€滃姞瀵嗗鍑衡€濄€?,
+        setBackupPassphrase: "璁剧疆澶囦唤鍙ｄ护锛堣嚦灏?0浣嶏級",
+        copyExportJson: "澶嶅埗瀵煎嚭 JSON",
+        copyEncryptedExportJson: "澶嶅埗鍔犲瘑瀵煎嚭 JSON",
+        importedDone: "瀵煎叆瀹屾垚",
+        encryptedImportedDone: "鍔犲瘑瀵煎叆瀹屾垚",
+        cameraNotSupported: "褰撳墠娴忚鍣ㄤ笉鏀寔 BarcodeDetector銆?,
+        cameraFallback: "宸插惎鐢ㄥ吋瀹规壂鐮佹ā寮忥紙jsQR锛夈€?,
+        cameraStarted: "鎽勫儚澶存壂鐮佸凡鍚姩...",
+        qrDetected: "宸茶瘑鍒簩缁寸爜锛孶RI 宸插～鍏ヨ〃鍗曘€?,
+        qrReadyToSave: "浜岀淮鐮佸凡璇嗗埆锛岀偣鍑烩€滀繚瀛樻潯鐩€濆嵆鍙坊鍔犮€?,
+        cameraDenied: "鏃犳硶璁块棶鎽勫儚澶达細",
+        noQrFound: "鍥剧墖涓湭璇嗗埆鍒颁簩缁寸爜銆?,
+        qrFromImage: "鍥剧墖浜岀淮鐮佽瘑鍒垚鍔熴€?,
+        scanImageFailed: "鍥剧墖鎵爜澶辫触锛?,
+        saved: "宸蹭繚瀛?,
+        userCreated: "鐢ㄦ埛宸插垱寤?,
+        changePassword: "淇敼瀵嗙爜",
+        resetPassword: "閲嶇疆瀵嗙爜",
+        currentPassword: "褰撳墠瀵嗙爜",
+        newPassword: "鏂板瘑鐮?,
+        passwordChanged: "瀵嗙爜宸蹭慨鏀癸紝璇烽噸鏂扮櫥褰曘€?,
+        passwordReset: "瀵嗙爜宸查噸缃?,
+        passwordResetConfirm: "纭閲嶇疆璇ョ敤鎴风殑瀵嗙爜锛?,
+        labelPrompt: "鏍囩",
+        issuerPrompt: "鍙戣鏂?,
+        groupIdPrompt: "鍒嗙粍 ID锛堢暀绌轰唬琛ㄤ笉鍒嗙粍锛?,
         usersThId: "ID",
-        usersThName: "用户名",
-        usersThRole: "角色",
-        usersThAction: "操作",
-        setRole: "设置为",
-        riskPolicySaved: "风控设置已保存",
-        riskPolicyLoaded: "当前风控：每分钟",
-        times: "次",
-        lockFor: "，锁定",
-        minutes: "分钟",
-        otpauthExportDone: "otpauth 文本已下载。",
-        otpauthImportDone: "otpauth 导入完成",
-        importFileLoaded: "文件内容已加载到导入框。",
-        turnstileRequired: "请先完成 Cloudflare Turnstile 验证。",
+        usersThName: "鐢ㄦ埛鍚?,
+        usersThRole: "瑙掕壊",
+        usersThAction: "鎿嶄綔",
+        setRole: "璁剧疆涓?,
+        riskPolicySaved: "椋庢帶璁剧疆宸蹭繚瀛?,
+        riskPolicyLoaded: "褰撳墠椋庢帶锛氭瘡鍒嗛挓",
+        times: "娆?,
+        lockFor: "锛岄攣瀹?,
+        minutes: "鍒嗛挓",
+        otpauthExportDone: "otpauth 鏂囨湰宸蹭笅杞姐€?,
+        otpauthImportDone: "otpauth 瀵煎叆瀹屾垚",
+        importFileLoaded: "鏂囦欢鍐呭宸插姞杞藉埌瀵煎叆妗嗐€?,
+        turnstileRequired: "璇峰厛瀹屾垚 Cloudflare Turnstile 楠岃瘉銆?,
       },
       "en-US": {
         loading: "Loading...",
@@ -2812,7 +3010,7 @@ function appHtml(env, nonce) {
         encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
         plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
         plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
-        setBackupPassphrase: "Set backup passphrase (>=10 chars):",
+        setBackupPassphrase: "Set backup passphrase (>=12 chars):",
         copyExportJson: "Copy export JSON:",
         copyEncryptedExportJson: "Copy encrypted export JSON:",
         importedDone: "Import completed",
@@ -3083,9 +3281,10 @@ function appHtml(env, nonce) {
       const box = document.getElementById("groupsList");
       if (!groups.length) { box.innerHTML = '<div class="muted">' + esc(t("noGroupsYet")) + '</div>'; return; }
       box.innerHTML = groups.map(function(g) {
+        const id = esc(g.id);
         return '<div class="row group-row">'
           + '<span class="chip"><i class="swatch" data-color="' + esc(g.color || "#0f766e") + '"></i>' + esc(g.name) + '</span>'
-          + '<button class="warn" data-action="delete-group" data-id="' + g.id + '">' + esc(t("delete")) + '</button>'
+          + '<button class="warn" data-action="delete-group" data-id="' + id + '">' + esc(t("delete")) + '</button>'
           + '</div>';
       }).join("");
       applyDynamicStyles();
@@ -3114,6 +3313,7 @@ function appHtml(env, nonce) {
       const out = document.getElementById("entries");
       if (!list.length) { out.innerHTML = '<div class="muted">' + esc(t("noEntriesMatched")) + '</div>'; return; }
       out.innerHTML = list.map(function(e) {
+        const id = esc(e.id);
         const state = codeState[e.id] || {};
         const code = state.code || "------";
         const ex = state.expiresIn || "";
@@ -3125,18 +3325,18 @@ function appHtml(env, nonce) {
           + '<div class="title">' + esc(e.label) + '</div>'
           + '<div class="meta">' + esc(e.issuer || t("noIssuer")) + '</div>'
           + '<div class="row">' + otpTag + group + counter + '</div>'
-          + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
-          + '<div class="muted" id="x-' + e.id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
-          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + progress + '"></i></div>'
+          + '<div class="code" id="c-' + id + '">' + esc(code) + '</div>'
+          + '<div class="muted" id="x-' + id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
+          + '<div class="bar"><i id="p-' + id + '" data-progress="' + esc(progress) + '"></i></div>'
           + '<div class="row mt-8">'
           + (e.otp_type === "hotp"
-            ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
-          + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
-          + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
-          + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
-          + '<button class="ghost" data-action="edit-entry" data-id="' + e.id + '">' + esc(t("edit")) + '</button>'
-          + '<button class="warn" data-action="delete-entry" data-id="' + e.id + '">' + esc(t("delete")) + '</button>'
+            ? '<button data-action="gen-hotp" data-id="' + id + '">' + esc(t("generateHotp")) + '</button>'
+            : '<button class="ghost" data-action="copy-code" data-id="' + id + '">' + esc(t("copyCode")) + '</button>')
+          + '<select id="entry-group-' + id + '">' + groupOptionsHtml(e.group_id) + '</select>'
+          + '<button class="ghost" data-action="set-entry-group" data-id="' + id + '">' + esc(t("setGroup")) + '</button>'
+          + '<button class="ghost" data-action="remove-entry-group" data-id="' + id + '">' + esc(t("removeGroup")) + '</button>'
+          + '<button class="ghost" data-action="edit-entry" data-id="' + id + '">' + esc(t("edit")) + '</button>'
+          + '<button class="warn" data-action="delete-entry" data-id="' + id + '">' + esc(t("delete")) + '</button>'
           + '</div></article>';
       }).join("");
       applyDynamicStyles();
@@ -3323,18 +3523,44 @@ function appHtml(env, nonce) {
       // F-03 fix: rebuild table with a single DOM write (no innerHTML += accumulation)
       const tbody = document.createElement("tbody");
       const headerRow = document.createElement("tr");
-      headerRow.innerHTML = "<th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th>";
+      [t("usersThId"), t("usersThName"), t("usersThRole"), t("usersThAction")].forEach(function(label) {
+        const th = document.createElement("th");
+        th.textContent = label;
+        headerRow.appendChild(th);
+      });
       tbody.appendChild(headerRow);
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
         const tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
-          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
-          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
-          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
+        const idCell = document.createElement("td");
+        idCell.textContent = String(u.id || "");
+        const usernameCell = document.createElement("td");
+        usernameCell.textContent = String(u.username || "");
+        const roleCell = document.createElement("td");
+        roleCell.textContent = String(u.role || "");
+        const actionCell = document.createElement("td");
+        actionCell.appendChild(userActionButton("ghost", "switch-role", u.id, t("setRole") + " " + next, next));
+        actionCell.appendChild(document.createTextNode(" "));
+        actionCell.appendChild(userActionButton("ghost", "reset-password", u.id, t("resetPassword")));
+        actionCell.appendChild(document.createTextNode(" "));
+        actionCell.appendChild(userActionButton("warn", "delete-user", u.id, t("delete")));
+        tr.appendChild(idCell);
+        tr.appendChild(usernameCell);
+        tr.appendChild(roleCell);
+        tr.appendChild(actionCell);
         tbody.appendChild(tr);
       });
       table.replaceChildren(tbody);
+    }
+
+    function userActionButton(className, action, id, label, role) {
+      const button = document.createElement("button");
+      button.className = className;
+      button.dataset.action = action;
+      button.dataset.id = String(id || "");
+      if (role) button.dataset.role = role;
+      button.textContent = label;
+      return button;
     }
 
     async function switchRole(id, role) {
@@ -3553,7 +3779,7 @@ function appHtml(env, nonce) {
         const file = ev && ev.target && ev.target.files && ev.target.files[0];
         if (!file) return;
         let raw = "";
-        // F-02: use local-only QR detection — no third-party API.
+        // F-02: use local-only QR detection 鈥?no third-party API.
           if ("BarcodeDetector" in window) {
             const bmp = await createImageBitmap(file);
             const detector = new BarcodeDetector({ formats: ["qr_code"] });

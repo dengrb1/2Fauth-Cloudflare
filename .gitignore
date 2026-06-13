@@ -1,4 +1,19 @@
-```
-# Security audit reports
-SECURITY_AUDIT_REPORT.md
-```
+# Secrets (never commit)
+.dev.vars
+
+# Wrangler local state
+.wrangler/
+
+# Dependencies
+node_modules/
+
+# Dev server logs
+dev-stdout.txt
+
+# Generated security audit reports
+SECURITY-AUDIT*.md
+
+# Test output
+coverage/
+.nyc_output/
+*.log
