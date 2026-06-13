@@ -1,8 +1,19 @@
-node_modules/
+# Secrets (never commit)
+.dev.vars
+
+# Wrangler local state
 .wrangler/
-.codex-remote-attachments/
-tmp_*
-SECURITY-AUDIT-REPORT.md
-audit/static-analysis.cjs
-audit/static-analysis.js
-SECURITY-AUDIT-REPORT-2.md
+
+# Dependencies
+node_modules/
+
+# Dev server logs
+dev-stdout.txt
+
+# Generated security audit reports
+SECURITY-AUDIT*.md
+
+# Test output
+coverage/
+.nyc_output/
+*.log
