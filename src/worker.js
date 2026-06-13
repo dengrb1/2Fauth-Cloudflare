@@ -1,4 +1,4 @@
-﻿const SESSION_COOKIE = "__Host-session";
+const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
@@ -67,9 +67,7 @@ const API_ROUTES = [
   ["PATCH", "/api/me/password", handleChangeMyPassword],
   ...entryRoutes("/api"),
   ...groupRoutes("/api"),
-  ["GET", "/api/export", handleExportData],
   ["POST", "/api/export", handleExportData],
-  ["GET", "/api/export/otpauth", handleExportOtpAuth],
   ["POST", "/api/export/otpauth", handleExportOtpAuth],
   ["POST", "/api/export/encrypted", handleExportDataEncrypted],
   ["POST", "/api/import", handleImportData],
@@ -323,7 +321,7 @@ async function handleApiCapabilities(request, env) {
 
 async function handleApiClientLogin(request, env) {
   const body = await parseJson(request);
-  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  const clientType = normalizeApiClientType(body.clientType || ANDROID_CLIENT_TYPE);
   if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
 
   if (clientType === "browser_extension") {
@@ -389,7 +387,7 @@ async function loginForApiClient(request, env, clientType) {
 
 async function handleApiClientRefresh(request, env) {
   const body = await parseJson(request);
-  const clientType = normalizeApiClientType(body.clientType || request.headers.get("x-client-type") || ANDROID_CLIENT_TYPE);
+  const clientType = normalizeApiClientType(body.clientType || ANDROID_CLIENT_TYPE);
   if (!clientType) return json({ error: "clientType must be android or browser_extension" }, 400);
   const expected = clientType === "browser_extension" ? EXTENSION_CLIENT_TYPE : ANDROID_CLIENT_TYPE;
   return rotateApiSessionTokens(withJsonBody(request, body), env, expected, { includeRefreshExpiresIn: true });
@@ -1454,7 +1452,8 @@ async function applyLoginRiskControl(request, env, username) {
   const policy = await getLoginPolicy(env);
   const ip = clientIp(request);
   const usernameKey = await sha256Base64(`login|user-ip|${username || "__empty__"}|${ip}`);
-  const ipKey = await sha256Base64(`login|ip|${ip}`);
+  // P1 fix: use global bucket for unknown IP to prevent cross-user lockout
+  const ipKey = ip === "unknown" ? await sha256Base64("login|ip|unknown-global") : await sha256Base64(`login|ip|${ip}`);
   const ipPolicy = { ...policy, maxRequestsPerMinute: policy.maxRequestsPerMinute * 2 };
   let userRisk;
   let ipRisk;
@@ -1677,31 +1676,9 @@ async function apiRateLimitSubject(request, env) {
   if (bearerToken) return `bearer:${await hashSessionToken(bearerToken, env)}`;
   const sessionToken = readCookie(request, SESSION_COOKIE);
   if (sessionToken) return `cookie:${await hashSessionToken(sessionToken, env)}`;
-  return `ip:${clientIp(request)}`;
-}
-
-async function isAdminRequest(request, env) {
-  const bearerToken = readBearerToken(request);
-  if (bearerToken) {
-    try {
-      const tokenHash = await hashSessionToken(bearerToken, env);
-      const row = await env.DB.prepare(
-        "SELECT u.role FROM api_sessions a JOIN users u ON u.id = a.user_id WHERE a.token_hash = ? AND a.expires_at > ?"
-      ).bind(tokenHash, nowIso()).first();
-      if (row && row.role === "admin") return true;
-    } catch { /* fall through */ }
-  }
-  const sessionToken = readCookie(request, SESSION_COOKIE);
-  if (sessionToken) {
-    try {
-      const tokenHash = await hashSessionToken(sessionToken, env);
-      const row = await env.DB.prepare(
-        "SELECT u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
-      ).bind(tokenHash, nowIso()).first();
-      if (row && row.role === "admin") return true;
-    } catch { /* fall through */ }
-  }
-  return false;
+  const ip = clientIp(request);
+  // P1 fix: avoid shared rate-limit bucket when IP is unknown (non-CF environments)
+  return ip === "unknown" ? `ip:${crypto.randomUUID()}` : `ip:${ip}`;
 }
 
 function normalizeRateLimit(value, fallback) {
@@ -1764,9 +1741,9 @@ async function getCurrentUser(request, env) {
     let row = null;
     try {
       row = await env.DB.prepare(
-        "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.refresh_expires_at > ?"
+        "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
       )
-        .bind(tokenHash, now, now)
+        .bind(tokenHash, now)
         .first();
     } catch (err) {
       if (!isMissingTableError(err, "api_sessions")) throw err;
