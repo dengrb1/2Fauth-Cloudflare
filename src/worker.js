@@ -1,4 +1,4 @@
-const SESSION_COOKIE = "__Host-session";
+﻿const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
@@ -132,7 +132,7 @@ export default {
 
       if (method === "GET" && path === "/") {
         const nonce = randomHex(16);
-        return html(appShellHtml(env, nonce), nonce);
+        return html(appHtml(env, nonce), nonce);
       }
 
       const route = findApiRoute(method, path);
@@ -146,7 +146,7 @@ export default {
       }
       if (method === "GET" && !path.startsWith("/api/")) {
         const nonce = randomHex(16);
-        return html(appShellHtml(env, nonce), nonce);
+        return html(appHtml(env, nonce), nonce);
       }
 
       return withCors(request, json({ error: "Not found" }, 404), env);
@@ -2583,441 +2583,6 @@ function html(markup, nonce) {
   });
 }
 
-function appShellHtml(env, nonce) {
-  const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
-  const turnstileScript = turnstileSiteKey
-    ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
-    : "";
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>2FAuth 验证器</title>
-  ${turnstileScript}
-  <style nonce="${nonce}">
-    :root {
-      --bg: #f4f7f8;
-      --ink: #122426;
-      --muted: #607174;
-      --card: #ffffff;
-      --line: #d8e2e4;
-      --primary: #0f766e;
-      --danger: #b42318;
-      --soft: #edf5f4;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      color: var(--ink);
-      font-family: "Segoe UI", Arial, sans-serif;
-      background: linear-gradient(155deg, #f8fbfb, var(--bg));
-    }
-    .page { max-width: 1120px; margin: 0 auto; padding: 24px 16px 40px; }
-    .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
-    h1 { margin: 0; font-size: 26px; }
-    h2, h3 { margin: 0; }
-    .sub, .muted { color: var(--muted); font-size: 13px; }
-    .panel {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px;
-      margin-bottom: 12px;
-      box-shadow: 0 12px 28px rgba(18, 36, 38, 0.07);
-    }
-    .grid { display: grid; grid-template-columns: 330px 1fr; gap: 12px; align-items: start; }
-    .stack { display: grid; gap: 10px; }
-    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .hidden { display: none; }
-    input, select, button, textarea {
-      min-height: 38px;
-      border-radius: 8px;
-      border: 1px solid var(--line);
-      padding: 8px 10px;
-      font-size: 14px;
-    }
-    input, select, textarea { background: #fff; color: var(--ink); }
-    textarea { width: 100%; min-height: 74px; resize: vertical; }
-    button { border: 0; cursor: pointer; background: var(--primary); color: #fff; }
-    button.secondary { background: var(--soft); color: var(--ink); border: 1px solid var(--line); }
-    button.danger { background: var(--danger); }
-    button:disabled { cursor: not-allowed; opacity: 0.6; }
-    .entries { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
-    .entry { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
-    .entry-title { font-weight: 700; margin-bottom: 3px; }
-    .code { font-size: 28px; font-weight: 800; letter-spacing: 2px; margin: 8px 0 4px; }
-    .bar { height: 6px; background: #edf2f2; border-radius: 99px; overflow: hidden; }
-    .bar i { display: block; height: 100%; width: 0; background: var(--primary); transition: width 0.2s; }
-    .error { color: var(--danger); font-size: 13px; }
-    .pill { display: inline-flex; padding: 2px 8px; border-radius: 99px; background: var(--soft); font-size: 12px; }
-    @media (max-width: 820px) {
-      .top { align-items: flex-start; flex-direction: column; }
-      .grid { grid-template-columns: 1fr; }
-      .row > input, .row > select, .row > button { width: 100%; }
-      .page { padding: 14px 10px 28px; }
-    }
-  </style>
-</head>
-<body>
-  <main class="page">
-    <header class="top">
-      <div>
-        <h1>2FAuth 验证器</h1>
-        <div id="state" class="sub">加载中...</div>
-      </div>
-      <div class="row">
-        <span id="whoami" class="sub"></span>
-        <button id="refreshBtn" type="button" class="secondary hidden">刷新</button>
-        <button id="logoutBtn" type="button" class="danger hidden">退出登录</button>
-      </div>
-    </header>
-
-    <section id="bootstrap" class="panel stack hidden">
-      <h2>初始化管理员</h2>
-      <div class="row">
-        <input id="bsUser" autocomplete="username" placeholder="用户名" />
-        <input id="bsPass" type="password" autocomplete="new-password" placeholder="强密码" />
-        <button id="bootstrapBtn" type="button">创建管理员</button>
-      </div>
-      <div id="bsMsg" class="muted"></div>
-    </section>
-
-    <section id="login" class="panel stack hidden">
-      <h2>登录</h2>
-      <div class="row">
-        <input id="loginUser" autocomplete="username" placeholder="???" />
-        <input id="loginPass" type="password" autocomplete="current-password" placeholder="密码" />
-        <button id="loginBtn" type="button">登录</button>
-      </div>
-      <div id="turnstileBox" class="hidden"></div>
-      <div id="loginMsg" class="muted"></div>
-    </section>
-
-    <section id="app" class="hidden">
-      <div class="grid">
-        <div class="stack">
-          <section class="panel stack">
-            <h3>添加令牌</h3>
-            <input id="eLabel" placeholder="名称，例如 GitHub" />
-            <input id="eIssuer" placeholder="发行方" />
-            <input id="eSecret" placeholder="Base32 密钥" />
-            <textarea id="eUri" placeholder="或粘贴 otpauth:// 链接"></textarea>
-            <div class="row">
-              <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
-              <select id="eAlgo"><option>SHA-256</option><option>SHA-512</option></select>
-              <input id="eDigits" value="6" inputmode="numeric" placeholder="位数" />
-              <input id="ePeriod" value="30" inputmode="numeric" placeholder="周期" />
-              <input id="eCounter" value="0" inputmode="numeric" placeholder="计数器" />
-            </div>
-            <select id="eGroup"><option value="">无分组</option></select>
-            <button id="createEntryBtn" type="button">保存令牌</button>
-            <div id="entryMsg" class="muted"></div>
-          </section>
-
-          <section class="panel stack">
-            <h3>分组</h3>
-            <div class="row">
-              <input id="gName" placeholder="分组名称" />
-              <input id="gColor" value="#0f766e" placeholder="#0f766e" />
-              <button id="createGroupBtn" type="button">添加分组</button>
-            </div>
-            <div id="groupsList" class="stack"></div>
-          </section>
-        </div>
-
-        <section class="panel stack">
-          <div class="row">
-            <h3>验证码</h3>
-            <input id="search" placeholder="搜索令牌" />
-            <select id="groupFilter"><option value="">全部分组</option></select>
-          </div>
-          <div id="entries" class="entries"></div>
-        </section>
-      </div>
-    </section>
-  </main>
-
-  <script nonce="${nonce}">
-    const TURNSTILE_SITE_KEY = ${JSON.stringify(turnstileSiteKey)};
-    let currentUser = null;
-    let entries = [];
-    let groups = [];
-    let codeState = {};
-    let turnstileWidgetId = null;
-    let turnstileToken = "";
-
-    function byId(id) {
-      return document.getElementById(id);
-    }
-
-    function value(id) {
-      return byId(id).value.trim();
-    }
-
-    function show(id, visible) {
-      byId(id).classList.toggle("hidden", !visible);
-    }
-
-    function text(id, content, error) {
-      const el = byId(id);
-      el.textContent = content || "";
-      el.className = error ? "error" : "muted";
-    }
-
-    function esc(input) {
-      return String(input || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    async function api(path, opts) {
-      const init = opts || {};
-      const res = await fetch(path, {
-        ...init,
-        credentials: "include",
-        headers: { "content-type": "application/json", ...(init.headers || {}) }
-      });
-      const data = await res.json().catch(function() { return {}; });
-      if (!res.ok) throw new Error(data.detail ? data.error + ": " + data.detail : (data.error || "HTTP " + res.status));
-      return data;
-    }
-
-    function renderTurnstile() {
-      if (!TURNSTILE_SITE_KEY) return;
-      const box = byId("turnstileBox");
-      box.classList.remove("hidden");
-      let tries = 0;
-      const tick = function() {
-        if (turnstileWidgetId !== null) return;
-        if (window.turnstile && typeof window.turnstile.render === "function") {
-          turnstileWidgetId = window.turnstile.render("#turnstileBox", {
-            sitekey: TURNSTILE_SITE_KEY,
-            callback: function(token) { turnstileToken = token || ""; },
-            "expired-callback": function() { turnstileToken = ""; },
-            "error-callback": function() { turnstileToken = ""; }
-          });
-          return;
-        }
-        tries += 1;
-        if (tries < 40) setTimeout(tick, 100);
-      };
-      tick();
-    }
-
-    async function init() {
-      try {
-        byId("state").textContent = "加载中...";
-        const status = await api("/api/status");
-        if (!status.initialized) {
-          byId("state").textContent = "系统尚未初始化。";
-          show("bootstrap", true);
-          return;
-        }
-        const me = await api("/api/me").catch(function() { return null; });
-        if (!me) {
-          byId("state").textContent = "请先登录。";
-          show("login", true);
-          renderTurnstile();
-          return;
-        }
-        currentUser = me.user;
-        byId("state").textContent = "已就绪";
-        byId("whoami").textContent = currentUser.username + " (" + currentUser.role + ")";
-        show("logoutBtn", true);
-        show("refreshBtn", true);
-        show("app", true);
-        await refreshAll();
-      } catch (err) {
-        byId("state").textContent = err.message || String(err);
-      }
-    }
-
-    async function bootstrap() {
-      try {
-        await api("/api/bootstrap", {
-          method: "POST",
-          body: JSON.stringify({ username: value("bsUser"), password: value("bsPass") })
-        });
-        location.reload();
-      } catch (err) {
-        text("bsMsg", err.message, true);
-      }
-    }
-
-    async function login() {
-      try {
-        if (TURNSTILE_SITE_KEY && !turnstileToken) {
-          text("loginMsg", "请先完成 Turnstile 验证。", true);
-          return;
-        }
-        await api("/api/login", {
-          method: "POST",
-          body: JSON.stringify({ username: value("loginUser"), password: value("loginPass"), turnstileToken: turnstileToken })
-        });
-        location.reload();
-      } catch (err) {
-        text("loginMsg", err.message, true);
-        if (window.turnstile && turnstileWidgetId !== null) {
-          try { window.turnstile.reset(turnstileWidgetId); } catch (_) {}
-          turnstileToken = "";
-        }
-      }
-    }
-
-    async function logout() {
-      await api("/api/logout", { method: "POST", body: "{}" });
-      location.reload();
-    }
-
-    async function refreshAll() {
-      const data = await Promise.all([api("/api/entries"), api("/api/groups")]);
-      entries = data[0].entries || [];
-      groups = data[1].groups || [];
-      hydrateGroups();
-      renderGroups();
-      renderEntries();
-      await refreshVisibleCodes();
-    }
-
-    function hydrateGroups() {
-      const entryOptions = ['<option value="">无分组</option>'];
-      const filterOptions = ['<option value="">全部分组</option>'];
-      groups.forEach(function(group) {
-        const option = '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>';
-        entryOptions.push(option);
-        filterOptions.push(option);
-      });
-      byId("eGroup").innerHTML = entryOptions.join("");
-      byId("groupFilter").innerHTML = filterOptions.join("");
-    }
-
-    function renderGroups() {
-      const box = byId("groupsList");
-      if (!groups.length) {
-        box.innerHTML = '<div class="muted">暂无分组。</div>';
-        return;
-      }
-      box.innerHTML = groups.map(function(group) {
-        return '<div class="row"><span class="pill">&nbsp;</span><span>' +
-          esc(group.name) + '</span></div>';
-      }).join("");
-    }
-
-    function filteredEntries() {
-      const q = value("search").toLowerCase();
-      const groupId = value("groupFilter");
-      return entries.filter(function(entry) {
-        const haystack = String((entry.label || "") + " " + (entry.issuer || "") + " " + (entry.username || "")).toLowerCase();
-        return (!q || haystack.indexOf(q) !== -1) && (!groupId || String(entry.group_id || "") === groupId);
-      });
-    }
-
-    function renderEntries() {
-      const box = byId("entries");
-      const list = filteredEntries();
-      if (!list.length) {
-        box.innerHTML = '<div class="muted">当前筛选条件下无匹配令牌。</div>';
-        return;
-      }
-      box.innerHTML = list.map(function(entry) {
-        const state = codeState[entry.id] || {};
-        const isHotp = (entry.otp_type || "totp") === "hotp";
-        const code = state.code || (isHotp ? "点击生成" : "------");
-        const progress = state.expiresIn && entry.period ? Math.max(0, Math.min(100, state.expiresIn / entry.period * 100)) : 0;
-        return '<article class="entry" data-entry-id="' + esc(entry.id) + '">' +
-          '<div class="entry-title">' + esc(entry.label) + '</div>' +
-          '<div class="muted">' + esc(entry.issuer || "无发行方") + (entry.group_name ? " - " + esc(entry.group_name) : "") + '</div>' +
-          '<div class="code">' + esc(code) + '</div>' +
-          (isHotp ? '<button type="button" data-action="hotp" data-id="' + esc(entry.id) + '">生成 HOTP</button>' : '<div class="bar"><i data-progress="' + esc(progress) + '"></i></div><div class="muted">' + esc(state.expiresIn || "") + '秒后过期</div>') +
-          '</article>';
-      }).join("");
-      document.querySelectorAll(".bar i[data-progress]").forEach(function(bar) {
-        const progress = Math.max(0, Math.min(100, Number(bar.getAttribute("data-progress") || 0)));
-        bar.style.width = progress + "%";
-      });
-    }
-
-    async function refreshVisibleCodes() {
-      await Promise.all(filteredEntries().map(async function(entry) {
-        if ((entry.otp_type || "totp") === "hotp") return;
-        try {
-          codeState[entry.id] = await api("/api/entries/" + entry.id + "/code");
-        } catch (err) {
-          codeState[entry.id] = { code: "错误", expiresIn: 0 };
-        }
-      }));
-      renderEntries();
-    }
-
-    async function createEntry() {
-      try {
-        const otpauthUri = value("eUri");
-        const payload = otpauthUri ? { otpauthUri: otpauthUri } : {
-          label: value("eLabel"),
-          issuer: value("eIssuer"),
-          secret: value("eSecret"),
-          otpType: value("eOtpType"),
-          algorithm: value("eAlgo"),
-          digits: Number(value("eDigits") || 6),
-          period: Number(value("ePeriod") || 30),
-          hotpCounter: Number(value("eCounter") || 0),
-          groupId: value("eGroup") || null
-        };
-        await api("/api/entries", { method: "POST", body: JSON.stringify(payload) });
-        ["eLabel", "eIssuer", "eSecret", "eUri"].forEach(function(id) { byId(id).value = ""; });
-        text("entryMsg", "已保存");
-        await refreshAll();
-      } catch (err) {
-        text("entryMsg", err.message, true);
-      }
-    }
-
-    async function createGroup() {
-      try {
-        await api("/api/groups", {
-          method: "POST",
-          body: JSON.stringify({ name: value("gName"), color: value("gColor") || "#0f766e" })
-        });
-        byId("gName").value = "";
-        await refreshAll();
-      } catch (err) {
-        alert(err.message || String(err));
-      }
-    }
-
-    async function generateHotp(id) {
-      const data = await api("/api/entries/" + id + "/hotp", { method: "POST", body: "{}" });
-      codeState[id] = data;
-      renderEntries();
-    }
-
-    function bindEvents() {
-      byId("bootstrapBtn").addEventListener("click", bootstrap);
-      byId("loginBtn").addEventListener("click", login);
-      byId("logoutBtn").addEventListener("click", logout);
-      byId("refreshBtn").addEventListener("click", refreshAll);
-      byId("createEntryBtn").addEventListener("click", createEntry);
-      byId("createGroupBtn").addEventListener("click", createGroup);
-      byId("search").addEventListener("input", renderEntries);
-      byId("groupFilter").addEventListener("change", renderEntries);
-      document.addEventListener("click", function(event) {
-        const button = event.target.closest("[data-action='hotp']");
-        if (button) generateHotp(button.dataset.id).catch(function(err) { alert(err.message || String(err)); });
-      });
-    }
-
-    bindEvents();
-    init();
-    setInterval(refreshVisibleCodes, 5000);
-  </script>
-</body>
-</html>`;
-}
 
 function appHtml(env, nonce) {
   const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
@@ -3026,7 +2591,7 @@ function appHtml(env, nonce) {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>2FAuth 楠岃瘉鍣?/title>
+  <title>2FAuth 验证器</title>
   <style nonce="${nonce}">
     :root {
       --bg: #f3f7f6;
@@ -3172,41 +2737,41 @@ function appHtml(env, nonce) {
   <div class="page">
     <div class="top">
       <div>
-        <h1 id="appTitle">2FAuth 楠岃瘉鍣?/h1>
-        <div id="state" class="sub">鍔犺浇涓?..</div>
+        <h1 id="appTitle">2FAuth 验证器</h1>
+        <div id="state" class="sub">加载中...</div>
       </div>
       <div class="row">
         <select id="langSelect">
-          <option value="zh-CN">绠€浣撲腑鏂?/option>
+          <option value="zh-CN">简体中文</option>
           <option value="en-US">English</option>
         </select>
         <select id="autoLogoutSelect">
-          <option value="15">15鍒嗛挓鑷姩閫€鍑?/option>
-          <option value="30">30鍒嗛挓鑷姩閫€鍑?/option>
-          <option value="60">60鍒嗛挓鑷姩閫€鍑?/option>
-          <option value="120">120鍒嗛挓鑷姩閫€鍑?/option>
-          <option value="0">涓嶈嚜鍔ㄩ€€鍑?/option>
+          <option value="15">15分钟自动退出</option>
+          <option value="30">30分钟自动退出</option>
+          <option value="60">60分钟自动退出</option>
+          <option value="120">120分钟自动退出</option>
+          <option value="0">不自动退出</option>
         </select>
         <div id="whoami" class="sub"></div>
       </div>
     </div>
 
     <section id="bootstrap" class="panel stack">
-      <h3 class="flush">鍒濆鍖栫鐞嗗憳</h3>
+      <h3 class="flush">初始化管理员</h3>
       <div class="row">
-        <input id="bsUser" placeholder="绠＄悊鍛樼敤鎴峰悕" />
-        <input id="bsPass" type="password" placeholder="瀵嗙爜锛堣嚦灏?2浣嶏紝鍚ぇ灏忓啓/鏁板瓧/绗﹀彿锛? />
-        <button type="button" data-action="bootstrap">鍒濆鍖?/button>
+        <input id="bsUser" placeholder="管理员用户名" />
+        <input id="bsPass" type="password" placeholder="密码（至少12位，含大小写/数字/符号）" />
+        <button type="button" data-action="bootstrap">初始化</button>
       </div>
       <div id="bsMsg" class="muted"></div>
     </section>
 
     <section id="login" class="panel stack">
-      <h3 class="flush">鐧诲綍</h3>
+      <h3 class="flush">登录</h3>
       <div class="row">
-        <input id="loginUser" placeholder="鐢ㄦ埛鍚? />
-        <input id="loginPass" type="password" placeholder="瀵嗙爜" />
-        <button type="button" data-action="login">鐧诲綍</button>
+        <input id="loginUser" placeholder="用户名" />
+        <input id="loginPass" type="password" placeholder="密码" />
+        <button type="button" data-action="login">登录</button>
       </div>
       <div id="turnstileBox" class="row hidden"></div>
       <div id="loginMsg" class="muted"></div>
@@ -3215,29 +2780,29 @@ function appHtml(env, nonce) {
     <section id="app">
       <div class="panel row top-actions">
         <div class="row">
-          <input id="search" placeholder="鎼滅储鏍囩/鍙戣鏂?.." />
-          <select id="groupFilter"><option value="">鍏ㄩ儴鍒嗙粍</option></select>
-          <button class="ghost" data-action="refresh-all">鍒锋柊</button>
+          <input id="search" placeholder="搜索标签/发行方..." />
+          <select id="groupFilter"><option value="">全部分组</option></select>
+          <button class="ghost" data-action="refresh-all">刷新</button>
         </div>
         <div class="row">
-          <button class="ghost" data-action="export-data">瀵煎嚭</button>
-          <button class="ghost" data-action="export-otpauth">瀵煎嚭 otpauth 鏂囨湰</button>
-          <button class="ghost" data-action="export-encrypted">鍔犲瘑瀵煎嚭</button>
-          <button class="ghost" data-action="toggle-import">瀵煎叆</button>
-          <button class="ghost" data-action="change-my-password">淇敼瀵嗙爜</button>
-          <button type="button" class="warn" data-action="logout">閫€鍑虹櫥褰?/button>
+          <button class="ghost" data-action="export-data">导出</button>
+          <button class="ghost" data-action="export-otpauth">导出 otpauth 文本</button>
+          <button class="ghost" data-action="export-encrypted">加密导出</button>
+          <button class="ghost" data-action="toggle-import">导入</button>
+          <button class="ghost" data-action="change-my-password">修改密码</button>
+          <button type="button" class="warn" data-action="logout">退出登录</button>
         </div>
       </div>
 
       <div id="importPanel" class="panel stack hidden">
-        <h3 class="flush">瀵煎叆澶囦唤 JSON</h3>
-        <textarea id="importText" placeholder='绮樿创 /api/export 鐨?JSON'></textarea>
+        <h3 class="flush">导入备份 JSON</h3>
+        <textarea id="importText" placeholder='粘贴 /api/export 的 JSON'></textarea>
         <div class="row">
           <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" />
-          <input id="importPassphrase" type="password" placeholder="鍙ｄ护锛堢敤浜庡姞瀵嗗浠斤級" />
-          <button data-action="import-data">鎵ц瀵煎叆</button>
-          <button class="ghost" data-action="import-otpauth">瀵煎叆 otpauth 鏂囨湰</button>
-          <button class="ghost" data-action="import-encrypted">鎵ц鍔犲瘑瀵煎叆</button>
+          <input id="importPassphrase" type="password" placeholder="口令（用于加密备份）" />
+          <button data-action="import-data">执行导入</button>
+          <button class="ghost" data-action="import-otpauth">导入 otpauth 文本</button>
+          <button class="ghost" data-action="import-encrypted">执行加密导入</button>
         </div>
         <div id="importMsg" class="muted"></div>
       </div>
@@ -3245,56 +2810,56 @@ function appHtml(env, nonce) {
       <div class="grid">
         <div class="stack">
           <div class="panel stack">
-            <h3 class="flush">鏂板缓鏉＄洰</h3>
-            <input id="eLabel" placeholder="鏍囩锛堝 GitHub锛? />
-            <input id="eIssuer" placeholder="鍙戣鏂癸紙鍙€夛級" />
-            <input id="eSecret" placeholder="Base32 瀵嗛挜" />
-            <input id="eUri" placeholder="鎴?otpauth://totp/... / otpauth://hotp/..." />
+            <h3 class="flush">新建条目</h3>
+            <input id="eLabel" placeholder="标签（如 GitHub）" />
+            <input id="eIssuer" placeholder="发行方（可选）" />
+            <input id="eSecret" placeholder="Base32 密钥" />
+            <input id="eUri" placeholder="或 otpauth://totp/... / otpauth://hotp/..." />
             <div class="row">
-              <button class="ghost" data-action="start-scan">鎽勫儚澶存壂鐮?/button>
-              <button class="ghost" data-action="stop-scan">鍋滄鎵爜</button>
+              <button class="ghost" data-action="start-scan">摄像头扫码</button>
+              <button class="ghost" data-action="stop-scan">停止扫码</button>
               <input id="qrImageFile" type="file" accept="image/*" />
             </div>
             <video id="scanVideo" autoplay playsinline class="hidden"></video>
             <div id="scanMsg" class="muted"></div>
             <div class="row">
               <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
-              <select id="eAlgo"><option>SHA-256</option><option>SHA-512</option></select>
+              <select id="eAlgo"><option>SHA-1</option><option>SHA-256</option><option>SHA-512</option></select>
               <input id="eDigits" value="6" class="narrow-74" />
               <input id="ePeriod" value="30" class="narrow-74" />
               <input id="eCounter" value="0" class="narrow-86" />
             </div>
-            <select id="eGroup"><option value="">涓嶅垎缁?/option></select>
-            <button data-action="create-entry">淇濆瓨鏉＄洰</button>
+            <select id="eGroup"><option value="">不分组</option></select>
+            <button data-action="create-entry">保存条目</button>
             <div id="entryMsg" class="muted"></div>
           </div>
 
           <div class="panel stack">
-            <h3 class="flush">鍒嗙粍</h3>
+            <h3 class="flush">分组</h3>
             <div class="row">
-              <input id="gName" placeholder="鍒嗙粍鍚嶇О" />
+              <input id="gName" placeholder="分组名称" />
               <input id="gColor" value="#0f766e" class="narrow-110" />
-              <button data-action="create-group">鏂板</button>
+              <button data-action="create-group">新增</button>
             </div>
             <div id="groupsList" class="stack"></div>
           </div>
 
           <div id="adminPanel" class="panel stack hidden">
-            <h3 class="flush">鐢ㄦ埛绠＄悊锛堢鐞嗗憳锛?/h3>
+            <h3 class="flush">用户管理（管理员）</h3>
             <div class="row">
-              <input id="uName" placeholder="鐢ㄦ埛鍚? />
-              <input id="uPass" type="password" placeholder="瀵嗙爜 >=12 浣嶏紝鍚ぇ灏忓啓/鏁板瓧/绗﹀彿" />
+              <input id="uName" placeholder="用户名" />
+              <input id="uPass" type="password" placeholder="密码 >=12 位，含大小写/数字/符号" />
               <select id="uRole"><option value="user">user</option><option value="admin">admin</option></select>
-              <button data-action="create-user">鍒涘缓</button>
+              <button data-action="create-user">创建</button>
             </div>
             <div id="userMsg" class="muted"></div>
             <table id="usersTable"></table>
             <div class="panel stack mt-8">
-              <h4 class="flush">鐧诲綍椋庢帶璁剧疆</h4>
+              <h4 class="flush">登录风控设置</h4>
               <div class="row">
-                <input id="riskMaxReq" type="number" min="3" max="100" placeholder="姣忓垎閽熻姹傞槇鍊硷紙榛樿10锛? />
-                <input id="riskLockMin" type="number" min="1" max="1440" placeholder="閿佸畾鍒嗛挓鏁帮紙榛樿15锛? />
-                <button data-action="save-login-policy">淇濆瓨椋庢帶璁剧疆</button>
+                <input id="riskMaxReq" type="number" min="3" max="100" placeholder="每分钟请求阈值（默认10）" />
+                <input id="riskLockMin" type="number" min="1" max="1440" placeholder="锁定分钟数（默认15）" />
+                <button data-action="save-login-policy">保存风控设置</button>
               </div>
               <div id="riskMsg" class="muted"></div>
             </div>
@@ -3302,7 +2867,7 @@ function appHtml(env, nonce) {
         </div>
 
         <div class="panel stack">
-          <h3 class="flush">鎴戠殑楠岃瘉鐮?/h3>
+          <h3 class="flush">我的验证码</h3>
           <div id="entries" class="entry-grid"></div>
         </div>
       </div>
@@ -3325,74 +2890,74 @@ function appHtml(env, nonce) {
     let turnstileToken = "";
     const I18N = {
       "zh-CN": {
-        loading: "鍔犺浇涓?..",
-        systemNotInitialized: "绯荤粺灏氭湭鍒濆鍖栵紝璇峰厛鍒涘缓绠＄悊鍛樸€?,
-        pleaseLogin: "璇峰厛鐧诲綍銆?,
-        ready: "宸插氨缁?,
-        logoutTimeout: "浼氳瘽鍥犻暱鏃堕棿鏃犳搷浣滃凡鑷姩閫€鍑恒€?,
-        noGroup: "涓嶅垎缁?,
-        allGroups: "鍏ㄩ儴鍒嗙粍",
-        noGroupsYet: "鏆傛棤鍒嗙粍銆?,
-        noEntriesMatched: "褰撳墠绛涢€変笅娌℃湁鏉＄洰銆?,
-        noIssuer: "鏃犲彂琛屾柟",
-        clickGenerate: "鐐瑰嚮鐢熸垚",
-        secLeft: "绉掑悗杩囨湡",
-        copyCode: "澶嶅埗楠岃瘉鐮?,
-        codeCopied: "楠岃瘉鐮佸凡澶嶅埗",
-        copyFailed: "澶嶅埗澶辫触锛岃鎵嬪姩澶嶅埗",
-        setGroup: "璁句负鍒嗙粍",
-        removeGroup: "绉诲嚭鍒嗙粍",
-        groupUpdated: "鍒嗙粍宸叉洿鏂?,
-        generateHotp: "鐢熸垚 HOTP",
-        edit: "缂栬緫",
-        delete: "鍒犻櫎",
-        deleteEntryConfirm: "纭鍒犻櫎璇ユ潯鐩紵",
-        deleteGroupConfirm: "纭鍒犻櫎鍒嗙粍锛熷垎缁勪笅鏉＄洰灏嗗彉涓轰笉鍒嗙粍銆?,
-        deleteUserConfirm: "纭鍒犻櫎鐢ㄦ埛锛?,
-        backupCopied: "澶囦唤 JSON 宸插鍒跺埌鍓创鏉裤€?,
-        encryptedBackupCopied: "鍔犲瘑澶囦唤 JSON 宸插鍒跺埌鍓创鏉裤€?,
-        plaintextExportConfirm: "鏄庢枃瀵煎嚭浼氬寘鍚墍鏈?OTP 瀵嗛挜銆傜‘璁ょ户缁紵",
-        plaintextExportDisabled: "褰撳墠閮ㄧ讲鏈紑鍚槑鏂囧鍑猴紝璇蜂娇鐢ㄢ€滃姞瀵嗗鍑衡€濄€?,
-        setBackupPassphrase: "璁剧疆澶囦唤鍙ｄ护锛堣嚦灏?0浣嶏級",
-        copyExportJson: "澶嶅埗瀵煎嚭 JSON",
-        copyEncryptedExportJson: "澶嶅埗鍔犲瘑瀵煎嚭 JSON",
-        importedDone: "瀵煎叆瀹屾垚",
-        encryptedImportedDone: "鍔犲瘑瀵煎叆瀹屾垚",
-        cameraNotSupported: "褰撳墠娴忚鍣ㄤ笉鏀寔 BarcodeDetector銆?,
-        cameraFallback: "宸插惎鐢ㄥ吋瀹规壂鐮佹ā寮忥紙jsQR锛夈€?,
-        cameraStarted: "鎽勫儚澶存壂鐮佸凡鍚姩...",
-        qrDetected: "宸茶瘑鍒簩缁寸爜锛孶RI 宸插～鍏ヨ〃鍗曘€?,
-        qrReadyToSave: "浜岀淮鐮佸凡璇嗗埆锛岀偣鍑烩€滀繚瀛樻潯鐩€濆嵆鍙坊鍔犮€?,
-        cameraDenied: "鏃犳硶璁块棶鎽勫儚澶达細",
-        noQrFound: "鍥剧墖涓湭璇嗗埆鍒颁簩缁寸爜銆?,
-        qrFromImage: "鍥剧墖浜岀淮鐮佽瘑鍒垚鍔熴€?,
-        scanImageFailed: "鍥剧墖鎵爜澶辫触锛?,
-        saved: "宸蹭繚瀛?,
-        userCreated: "鐢ㄦ埛宸插垱寤?,
-        changePassword: "淇敼瀵嗙爜",
-        resetPassword: "閲嶇疆瀵嗙爜",
-        currentPassword: "褰撳墠瀵嗙爜",
-        newPassword: "鏂板瘑鐮?,
-        passwordChanged: "瀵嗙爜宸蹭慨鏀癸紝璇烽噸鏂扮櫥褰曘€?,
-        passwordReset: "瀵嗙爜宸查噸缃?,
-        passwordResetConfirm: "纭閲嶇疆璇ョ敤鎴风殑瀵嗙爜锛?,
-        labelPrompt: "鏍囩",
-        issuerPrompt: "鍙戣鏂?,
-        groupIdPrompt: "鍒嗙粍 ID锛堢暀绌轰唬琛ㄤ笉鍒嗙粍锛?,
+        loading: "加载中...",
+        systemNotInitialized: "系统尚未初始化，请先创建管理员。",
+        pleaseLogin: "请先登录。",
+        ready: "已就绪",
+        logoutTimeout: "会话因长时间无操作已自动退出。",
+        noGroup: "不分组",
+        allGroups: "全部分组",
+        noGroupsYet: "暂无分组。",
+        noEntriesMatched: "当前筛选下没有条目。",
+        noIssuer: "无发行方",
+        clickGenerate: "点击生成",
+        secLeft: "秒后过期",
+        copyCode: "复制验证码",
+        codeCopied: "验证码已复制",
+        copyFailed: "复制失败，请手动复制",
+        setGroup: "设为分组",
+        removeGroup: "移出分组",
+        groupUpdated: "分组已更新",
+        generateHotp: "生成 HOTP",
+        edit: "编辑",
+        delete: "删除",
+        deleteEntryConfirm: "确认删除该条目？",
+        deleteGroupConfirm: "确认删除分组？分组下条目将变为不分组。",
+        deleteUserConfirm: "确认删除用户？",
+        backupCopied: "备份 JSON 已复制到剪贴板。",
+        encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
+        plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
+        plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
+        setBackupPassphrase: "设置备份口令（至少10位）",
+        copyExportJson: "复制导出 JSON",
+        copyEncryptedExportJson: "复制加密导出 JSON",
+        importedDone: "导入完成",
+        encryptedImportedDone: "加密导入完成",
+        cameraNotSupported: "当前浏览器不支持 BarcodeDetector。",
+        cameraFallback: "已启用兼容扫码模式（jsQR）。",
+        cameraStarted: "摄像头扫码已启动...",
+        qrDetected: "已识别二维码，URI 已填入表单。",
+        qrReadyToSave: "二维码已识别，点击“保存条目”即可添加。",
+        cameraDenied: "无法访问摄像头：",
+        noQrFound: "图片中未识别到二维码。",
+        qrFromImage: "图片二维码识别成功。",
+        scanImageFailed: "图片扫码失败：",
+        saved: "已保存",
+        userCreated: "用户已创建",
+        changePassword: "修改密码",
+        resetPassword: "重置密码",
+        currentPassword: "当前密码",
+        newPassword: "新密码",
+        passwordChanged: "密码已修改，请重新登录。",
+        passwordReset: "密码已重置",
+        passwordResetConfirm: "确认重置该用户的密码？",
+        labelPrompt: "标签",
+        issuerPrompt: "发行方",
+        groupIdPrompt: "分组 ID（留空代表不分组）",
         usersThId: "ID",
-        usersThName: "鐢ㄦ埛鍚?,
-        usersThRole: "瑙掕壊",
-        usersThAction: "鎿嶄綔",
-        setRole: "璁剧疆涓?,
-        riskPolicySaved: "椋庢帶璁剧疆宸蹭繚瀛?,
-        riskPolicyLoaded: "褰撳墠椋庢帶锛氭瘡鍒嗛挓",
-        times: "娆?,
-        lockFor: "锛岄攣瀹?,
-        minutes: "鍒嗛挓",
-        otpauthExportDone: "otpauth 鏂囨湰宸蹭笅杞姐€?,
-        otpauthImportDone: "otpauth 瀵煎叆瀹屾垚",
-        importFileLoaded: "鏂囦欢鍐呭宸插姞杞藉埌瀵煎叆妗嗐€?,
-        turnstileRequired: "璇峰厛瀹屾垚 Cloudflare Turnstile 楠岃瘉銆?,
+        usersThName: "用户名",
+        usersThRole: "角色",
+        usersThAction: "操作",
+        setRole: "设置为",
+        riskPolicySaved: "风控设置已保存",
+        riskPolicyLoaded: "当前风控：每分钟",
+        times: "次",
+        lockFor: "，锁定",
+        minutes: "分钟",
+        otpauthExportDone: "otpauth 文本已下载。",
+        otpauthImportDone: "otpauth 导入完成",
+        importFileLoaded: "文件内容已加载到导入框。",
+        turnstileRequired: "请先完成 Cloudflare Turnstile 验证。",
       },
       "en-US": {
         loading: "Loading...",
@@ -3423,7 +2988,7 @@ function appHtml(env, nonce) {
         encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
         plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
         plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
-        setBackupPassphrase: "Set backup passphrase (>=12 chars):",
+        setBackupPassphrase: "Set backup passphrase (>=10 chars):",
         copyExportJson: "Copy export JSON:",
         copyEncryptedExportJson: "Copy encrypted export JSON:",
         importedDone: "Import completed",
@@ -3694,10 +3259,9 @@ function appHtml(env, nonce) {
       const box = document.getElementById("groupsList");
       if (!groups.length) { box.innerHTML = '<div class="muted">' + esc(t("noGroupsYet")) + '</div>'; return; }
       box.innerHTML = groups.map(function(g) {
-        const id = esc(g.id);
         return '<div class="row group-row">'
           + '<span class="chip"><i class="swatch" data-color="' + esc(g.color || "#0f766e") + '"></i>' + esc(g.name) + '</span>'
-          + '<button class="warn" data-action="delete-group" data-id="' + id + '">' + esc(t("delete")) + '</button>'
+          + '<button class="warn" data-action="delete-group" data-id="' + g.id + '">' + esc(t("delete")) + '</button>'
           + '</div>';
       }).join("");
       applyDynamicStyles();
@@ -3726,7 +3290,6 @@ function appHtml(env, nonce) {
       const out = document.getElementById("entries");
       if (!list.length) { out.innerHTML = '<div class="muted">' + esc(t("noEntriesMatched")) + '</div>'; return; }
       out.innerHTML = list.map(function(e) {
-        const id = esc(e.id);
         const state = codeState[e.id] || {};
         const code = state.code || "------";
         const ex = state.expiresIn || "";
@@ -3738,18 +3301,18 @@ function appHtml(env, nonce) {
           + '<div class="title">' + esc(e.label) + '</div>'
           + '<div class="meta">' + esc(e.issuer || t("noIssuer")) + '</div>'
           + '<div class="row">' + otpTag + group + counter + '</div>'
-          + '<div class="code" id="c-' + id + '">' + esc(code) + '</div>'
-          + '<div class="muted" id="x-' + id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
-          + '<div class="bar"><i id="p-' + id + '" data-progress="' + esc(progress) + '"></i></div>'
+          + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
+          + '<div class="muted" id="x-' + e.id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
+          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + progress + '"></i></div>'
           + '<div class="row mt-8">'
           + (e.otp_type === "hotp"
-            ? '<button data-action="gen-hotp" data-id="' + id + '">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" data-action="copy-code" data-id="' + id + '">' + esc(t("copyCode")) + '</button>')
-          + '<select id="entry-group-' + id + '">' + groupOptionsHtml(e.group_id) + '</select>'
-          + '<button class="ghost" data-action="set-entry-group" data-id="' + id + '">' + esc(t("setGroup")) + '</button>'
-          + '<button class="ghost" data-action="remove-entry-group" data-id="' + id + '">' + esc(t("removeGroup")) + '</button>'
-          + '<button class="ghost" data-action="edit-entry" data-id="' + id + '">' + esc(t("edit")) + '</button>'
-          + '<button class="warn" data-action="delete-entry" data-id="' + id + '">' + esc(t("delete")) + '</button>'
+            ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
+            : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
+          + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
+          + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
+          + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
+          + '<button class="ghost" data-action="edit-entry" data-id="' + e.id + '">' + esc(t("edit")) + '</button>'
+          + '<button class="warn" data-action="delete-entry" data-id="' + e.id + '">' + esc(t("delete")) + '</button>'
           + '</div></article>';
       }).join("");
       applyDynamicStyles();
@@ -3936,44 +3499,18 @@ function appHtml(env, nonce) {
       // F-03 fix: rebuild table with a single DOM write (no innerHTML += accumulation)
       const tbody = document.createElement("tbody");
       const headerRow = document.createElement("tr");
-      [t("usersThId"), t("usersThName"), t("usersThRole"), t("usersThAction")].forEach(function(label) {
-        const th = document.createElement("th");
-        th.textContent = label;
-        headerRow.appendChild(th);
-      });
+      headerRow.innerHTML = "<th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th>";
       tbody.appendChild(headerRow);
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
         const tr = document.createElement("tr");
-        const idCell = document.createElement("td");
-        idCell.textContent = String(u.id || "");
-        const usernameCell = document.createElement("td");
-        usernameCell.textContent = String(u.username || "");
-        const roleCell = document.createElement("td");
-        roleCell.textContent = String(u.role || "");
-        const actionCell = document.createElement("td");
-        actionCell.appendChild(userActionButton("ghost", "switch-role", u.id, t("setRole") + " " + next, next));
-        actionCell.appendChild(document.createTextNode(" "));
-        actionCell.appendChild(userActionButton("ghost", "reset-password", u.id, t("resetPassword")));
-        actionCell.appendChild(document.createTextNode(" "));
-        actionCell.appendChild(userActionButton("warn", "delete-user", u.id, t("delete")));
-        tr.appendChild(idCell);
-        tr.appendChild(usernameCell);
-        tr.appendChild(roleCell);
-        tr.appendChild(actionCell);
+        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
+          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
+          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
+          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
         tbody.appendChild(tr);
       });
       table.replaceChildren(tbody);
-    }
-
-    function userActionButton(className, action, id, label, role) {
-      const button = document.createElement("button");
-      button.className = className;
-      button.dataset.action = action;
-      button.dataset.id = String(id || "");
-      if (role) button.dataset.role = role;
-      button.textContent = label;
-      return button;
     }
 
     async function switchRole(id, role) {
@@ -4192,7 +3729,7 @@ function appHtml(env, nonce) {
         const file = ev && ev.target && ev.target.files && ev.target.files[0];
         if (!file) return;
         let raw = "";
-        // F-02: use local-only QR detection 鈥?no third-party API.
+        // F-02: use local-only QR detection — no third-party API.
           if ("BarcodeDetector" in window) {
             const bmp = await createImageBitmap(file);
             const detector = new BarcodeDetector({ formats: ["qr_code"] });
@@ -4387,4 +3924,3 @@ function appHtml(env, nonce) {
 </body>
 </html>`;
 }
-
