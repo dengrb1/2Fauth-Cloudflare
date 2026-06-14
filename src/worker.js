@@ -132,7 +132,7 @@ export default {
 
       if (method === "GET" && path === "/") {
         const nonce = randomHex(16);
-        return html(appHtml(env, nonce), nonce);
+        return html(appShellHtml(env, nonce), nonce);
       }
 
       const route = findApiRoute(method, path);
@@ -146,7 +146,7 @@ export default {
       }
       if (method === "GET" && !path.startsWith("/api/")) {
         const nonce = randomHex(16);
-        return html(appHtml(env, nonce), nonce);
+        return html(appShellHtml(env, nonce), nonce);
       }
 
       return withCors(request, json({ error: "Not found" }, 404), env);
@@ -2581,6 +2581,442 @@ function html(markup, nonce) {
       ...commonSecurityHeaders(),
     },
   });
+}
+
+function appShellHtml(env, nonce) {
+  const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
+  const turnstileScript = turnstileSiteKey
+    ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+    : "";
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>2FAuth 验证器</title>
+  ${turnstileScript}
+  <style nonce="${nonce}">
+    :root {
+      --bg: #f4f7f8;
+      --ink: #122426;
+      --muted: #607174;
+      --card: #ffffff;
+      --line: #d8e2e4;
+      --primary: #0f766e;
+      --danger: #b42318;
+      --soft: #edf5f4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(155deg, #f8fbfb, var(--bg));
+    }
+    .page { max-width: 1120px; margin: 0 auto; padding: 24px 16px 40px; }
+    .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: 26px; }
+    h2, h3 { margin: 0; }
+    .sub, .muted { color: var(--muted); font-size: 13px; }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 12px;
+      box-shadow: 0 12px 28px rgba(18, 36, 38, 0.07);
+    }
+    .grid { display: grid; grid-template-columns: 330px 1fr; gap: 12px; align-items: start; }
+    .stack { display: grid; gap: 10px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .hidden { display: none; }
+    input, select, button, textarea {
+      min-height: 38px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      font-size: 14px;
+    }
+    input, select, textarea { background: #fff; color: var(--ink); }
+    textarea { width: 100%; min-height: 74px; resize: vertical; }
+    button { border: 0; cursor: pointer; background: var(--primary); color: #fff; }
+    button.secondary { background: var(--soft); color: var(--ink); border: 1px solid var(--line); }
+    button.danger { background: var(--danger); }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    .entries { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+    .entry { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
+    .entry-title { font-weight: 700; margin-bottom: 3px; }
+    .code { font-size: 28px; font-weight: 800; letter-spacing: 2px; margin: 8px 0 4px; }
+    .bar { height: 6px; background: #edf2f2; border-radius: 99px; overflow: hidden; }
+    .bar i { display: block; height: 100%; width: 0; background: var(--primary); transition: width 0.2s; }
+    .error { color: var(--danger); font-size: 13px; }
+    .pill { display: inline-flex; padding: 2px 8px; border-radius: 99px; background: var(--soft); font-size: 12px; }
+    @media (max-width: 820px) {
+      .top { align-items: flex-start; flex-direction: column; }
+      .grid { grid-template-columns: 1fr; }
+      .row > input, .row > select, .row > button { width: 100%; }
+      .page { padding: 14px 10px 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="top">
+      <div>
+        <h1>2FAuth 验证器</h1>
+        <div id="state" class="sub">加载中...</div>
+      </div>
+      <div class="row">
+        <span id="whoami" class="sub"></span>
+        <button id="refreshBtn" type="button" class="secondary hidden">刷新</button>
+        <button id="logoutBtn" type="button" class="danger hidden">退出登录</button>
+      </div>
+    </header>
+
+    <section id="bootstrap" class="panel stack hidden">
+      <h2>初始化管理员</h2>
+      <div class="row">
+        <input id="bsUser" autocomplete="username" placeholder="用户名" />
+        <input id="bsPass" type="password" autocomplete="new-password" placeholder="强密码" />
+        <button id="bootstrapBtn" type="button">创建管理员</button>
+      </div>
+      <div id="bsMsg" class="muted"></div>
+    </section>
+
+    <section id="login" class="panel stack hidden">
+      <h2>登录</h2>
+      <div class="row">
+        <input id="loginUser" autocomplete="username" placeholder="???" />
+        <input id="loginPass" type="password" autocomplete="current-password" placeholder="密码" />
+        <button id="loginBtn" type="button">登录</button>
+      </div>
+      <div id="turnstileBox" class="hidden"></div>
+      <div id="loginMsg" class="muted"></div>
+    </section>
+
+    <section id="app" class="hidden">
+      <div class="grid">
+        <div class="stack">
+          <section class="panel stack">
+            <h3>添加令牌</h3>
+            <input id="eLabel" placeholder="名称，例如 GitHub" />
+            <input id="eIssuer" placeholder="发行方" />
+            <input id="eSecret" placeholder="Base32 密钥" />
+            <textarea id="eUri" placeholder="或粘贴 otpauth:// 链接"></textarea>
+            <div class="row">
+              <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
+              <select id="eAlgo"><option>SHA-256</option><option>SHA-512</option></select>
+              <input id="eDigits" value="6" inputmode="numeric" placeholder="位数" />
+              <input id="ePeriod" value="30" inputmode="numeric" placeholder="周期" />
+              <input id="eCounter" value="0" inputmode="numeric" placeholder="计数器" />
+            </div>
+            <select id="eGroup"><option value="">无分组</option></select>
+            <button id="createEntryBtn" type="button">保存令牌</button>
+            <div id="entryMsg" class="muted"></div>
+          </section>
+
+          <section class="panel stack">
+            <h3>分组</h3>
+            <div class="row">
+              <input id="gName" placeholder="分组名称" />
+              <input id="gColor" value="#0f766e" placeholder="#0f766e" />
+              <button id="createGroupBtn" type="button">添加分组</button>
+            </div>
+            <div id="groupsList" class="stack"></div>
+          </section>
+        </div>
+
+        <section class="panel stack">
+          <div class="row">
+            <h3>验证码</h3>
+            <input id="search" placeholder="搜索令牌" />
+            <select id="groupFilter"><option value="">全部分组</option></select>
+          </div>
+          <div id="entries" class="entries"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script nonce="${nonce}">
+    const TURNSTILE_SITE_KEY = ${JSON.stringify(turnstileSiteKey)};
+    let currentUser = null;
+    let entries = [];
+    let groups = [];
+    let codeState = {};
+    let turnstileWidgetId = null;
+    let turnstileToken = "";
+
+    function byId(id) {
+      return document.getElementById(id);
+    }
+
+    function value(id) {
+      return byId(id).value.trim();
+    }
+
+    function show(id, visible) {
+      byId(id).classList.toggle("hidden", !visible);
+    }
+
+    function text(id, content, error) {
+      const el = byId(id);
+      el.textContent = content || "";
+      el.className = error ? "error" : "muted";
+    }
+
+    function esc(input) {
+      return String(input || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    async function api(path, opts) {
+      const init = opts || {};
+      const res = await fetch(path, {
+        ...init,
+        credentials: "include",
+        headers: { "content-type": "application/json", ...(init.headers || {}) }
+      });
+      const data = await res.json().catch(function() { return {}; });
+      if (!res.ok) throw new Error(data.detail ? data.error + ": " + data.detail : (data.error || "HTTP " + res.status));
+      return data;
+    }
+
+    function renderTurnstile() {
+      if (!TURNSTILE_SITE_KEY) return;
+      const box = byId("turnstileBox");
+      box.classList.remove("hidden");
+      let tries = 0;
+      const tick = function() {
+        if (turnstileWidgetId !== null) return;
+        if (window.turnstile && typeof window.turnstile.render === "function") {
+          turnstileWidgetId = window.turnstile.render("#turnstileBox", {
+            sitekey: TURNSTILE_SITE_KEY,
+            callback: function(token) { turnstileToken = token || ""; },
+            "expired-callback": function() { turnstileToken = ""; },
+            "error-callback": function() { turnstileToken = ""; }
+          });
+          return;
+        }
+        tries += 1;
+        if (tries < 40) setTimeout(tick, 100);
+      };
+      tick();
+    }
+
+    async function init() {
+      try {
+        byId("state").textContent = "加载中...";
+        const status = await api("/api/status");
+        if (!status.initialized) {
+          byId("state").textContent = "系统尚未初始化。";
+          show("bootstrap", true);
+          return;
+        }
+        const me = await api("/api/me").catch(function() { return null; });
+        if (!me) {
+          byId("state").textContent = "请先登录。";
+          show("login", true);
+          renderTurnstile();
+          return;
+        }
+        currentUser = me.user;
+        byId("state").textContent = "已就绪";
+        byId("whoami").textContent = currentUser.username + " (" + currentUser.role + ")";
+        show("logoutBtn", true);
+        show("refreshBtn", true);
+        show("app", true);
+        await refreshAll();
+      } catch (err) {
+        byId("state").textContent = err.message || String(err);
+      }
+    }
+
+    async function bootstrap() {
+      try {
+        await api("/api/bootstrap", {
+          method: "POST",
+          body: JSON.stringify({ username: value("bsUser"), password: value("bsPass") })
+        });
+        location.reload();
+      } catch (err) {
+        text("bsMsg", err.message, true);
+      }
+    }
+
+    async function login() {
+      try {
+        if (TURNSTILE_SITE_KEY && !turnstileToken) {
+          text("loginMsg", "请先完成 Turnstile 验证。", true);
+          return;
+        }
+        await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ username: value("loginUser"), password: value("loginPass"), turnstileToken: turnstileToken })
+        });
+        location.reload();
+      } catch (err) {
+        text("loginMsg", err.message, true);
+        if (window.turnstile && turnstileWidgetId !== null) {
+          try { window.turnstile.reset(turnstileWidgetId); } catch (_) {}
+          turnstileToken = "";
+        }
+      }
+    }
+
+    async function logout() {
+      await api("/api/logout", { method: "POST", body: "{}" });
+      location.reload();
+    }
+
+    async function refreshAll() {
+      const data = await Promise.all([api("/api/entries"), api("/api/groups")]);
+      entries = data[0].entries || [];
+      groups = data[1].groups || [];
+      hydrateGroups();
+      renderGroups();
+      renderEntries();
+      await refreshVisibleCodes();
+    }
+
+    function hydrateGroups() {
+      const entryOptions = ['<option value="">无分组</option>'];
+      const filterOptions = ['<option value="">全部分组</option>'];
+      groups.forEach(function(group) {
+        const option = '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>';
+        entryOptions.push(option);
+        filterOptions.push(option);
+      });
+      byId("eGroup").innerHTML = entryOptions.join("");
+      byId("groupFilter").innerHTML = filterOptions.join("");
+    }
+
+    function renderGroups() {
+      const box = byId("groupsList");
+      if (!groups.length) {
+        box.innerHTML = '<div class="muted">暂无分组。</div>';
+        return;
+      }
+      box.innerHTML = groups.map(function(group) {
+        return '<div class="row"><span class="pill">&nbsp;</span><span>' +
+          esc(group.name) + '</span></div>';
+      }).join("");
+    }
+
+    function filteredEntries() {
+      const q = value("search").toLowerCase();
+      const groupId = value("groupFilter");
+      return entries.filter(function(entry) {
+        const haystack = String((entry.label || "") + " " + (entry.issuer || "") + " " + (entry.username || "")).toLowerCase();
+        return (!q || haystack.indexOf(q) !== -1) && (!groupId || String(entry.group_id || "") === groupId);
+      });
+    }
+
+    function renderEntries() {
+      const box = byId("entries");
+      const list = filteredEntries();
+      if (!list.length) {
+        box.innerHTML = '<div class="muted">当前筛选条件下无匹配令牌。</div>';
+        return;
+      }
+      box.innerHTML = list.map(function(entry) {
+        const state = codeState[entry.id] || {};
+        const isHotp = (entry.otp_type || "totp") === "hotp";
+        const code = state.code || (isHotp ? "点击生成" : "------");
+        const progress = state.expiresIn && entry.period ? Math.max(0, Math.min(100, state.expiresIn / entry.period * 100)) : 0;
+        return '<article class="entry" data-entry-id="' + esc(entry.id) + '">' +
+          '<div class="entry-title">' + esc(entry.label) + '</div>' +
+          '<div class="muted">' + esc(entry.issuer || "无发行方") + (entry.group_name ? " - " + esc(entry.group_name) : "") + '</div>' +
+          '<div class="code">' + esc(code) + '</div>' +
+          (isHotp ? '<button type="button" data-action="hotp" data-id="' + esc(entry.id) + '">生成 HOTP</button>' : '<div class="bar"><i data-progress="' + esc(progress) + '"></i></div><div class="muted">' + esc(state.expiresIn || "") + '秒后过期</div>') +
+          '</article>';
+      }).join("");
+      document.querySelectorAll(".bar i[data-progress]").forEach(function(bar) {
+        const progress = Math.max(0, Math.min(100, Number(bar.getAttribute("data-progress") || 0)));
+        bar.style.width = progress + "%";
+      });
+    }
+
+    async function refreshVisibleCodes() {
+      await Promise.all(filteredEntries().map(async function(entry) {
+        if ((entry.otp_type || "totp") === "hotp") return;
+        try {
+          codeState[entry.id] = await api("/api/entries/" + entry.id + "/code");
+        } catch (err) {
+          codeState[entry.id] = { code: "错误", expiresIn: 0 };
+        }
+      }));
+      renderEntries();
+    }
+
+    async function createEntry() {
+      try {
+        const otpauthUri = value("eUri");
+        const payload = otpauthUri ? { otpauthUri: otpauthUri } : {
+          label: value("eLabel"),
+          issuer: value("eIssuer"),
+          secret: value("eSecret"),
+          otpType: value("eOtpType"),
+          algorithm: value("eAlgo"),
+          digits: Number(value("eDigits") || 6),
+          period: Number(value("ePeriod") || 30),
+          hotpCounter: Number(value("eCounter") || 0),
+          groupId: value("eGroup") || null
+        };
+        await api("/api/entries", { method: "POST", body: JSON.stringify(payload) });
+        ["eLabel", "eIssuer", "eSecret", "eUri"].forEach(function(id) { byId(id).value = ""; });
+        text("entryMsg", "已保存");
+        await refreshAll();
+      } catch (err) {
+        text("entryMsg", err.message, true);
+      }
+    }
+
+    async function createGroup() {
+      try {
+        await api("/api/groups", {
+          method: "POST",
+          body: JSON.stringify({ name: value("gName"), color: value("gColor") || "#0f766e" })
+        });
+        byId("gName").value = "";
+        await refreshAll();
+      } catch (err) {
+        alert(err.message || String(err));
+      }
+    }
+
+    async function generateHotp(id) {
+      const data = await api("/api/entries/" + id + "/hotp", { method: "POST", body: "{}" });
+      codeState[id] = data;
+      renderEntries();
+    }
+
+    function bindEvents() {
+      byId("bootstrapBtn").addEventListener("click", bootstrap);
+      byId("loginBtn").addEventListener("click", login);
+      byId("logoutBtn").addEventListener("click", logout);
+      byId("refreshBtn").addEventListener("click", refreshAll);
+      byId("createEntryBtn").addEventListener("click", createEntry);
+      byId("createGroupBtn").addEventListener("click", createGroup);
+      byId("search").addEventListener("input", renderEntries);
+      byId("groupFilter").addEventListener("change", renderEntries);
+      document.addEventListener("click", function(event) {
+        const button = event.target.closest("[data-action='hotp']");
+        if (button) generateHotp(button.dataset.id).catch(function(err) { alert(err.message || String(err)); });
+      });
+    }
+
+    bindEvents();
+    init();
+    setInterval(refreshVisibleCodes, 5000);
+  </script>
+</body>
+</html>`;
 }
 
 function appHtml(env, nonce) {

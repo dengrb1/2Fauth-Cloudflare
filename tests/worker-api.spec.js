@@ -290,6 +290,10 @@ test("web UI responses include HTML security headers", async () => {
   assert.match(response.headers.get("Content-Security-Policy"), /'nonce-[0-9a-f]{32}'/);
   assert.equal(response.headers.get("X-Frame-Options"), "DENY");
   assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  const html = await response.text();
+  assert.match(html, /<title>2FAuth 验证器<\/title>/);
+  assert.match(html, /<h1>2FAuth 验证器<\/h1>/);
+  assert.doesNotMatch(html, /\?\/(?:title|h1)>/);
 });
 
 test("wildcard CORS allowlist is ignored when credentials are enabled", async () => {
