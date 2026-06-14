@@ -1,4 +1,4 @@
-﻿const SESSION_COOKIE = "__Host-session";
+const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
@@ -3248,8 +3248,8 @@ function appHtml(env, nonce) {
       const opts = ['<option value="">' + esc(t("noGroup")) + '</option>'];
       const filter = ['<option value="">' + esc(t("allGroups")) + '</option>'];
       groups.forEach(function(g) {
-        opts.push('<option value="' + g.id + '">' + esc(g.name) + '</option>');
-        filter.push('<option value="' + g.id + '">' + esc(g.name) + '</option>');
+        opts.push('<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>');
+        filter.push('<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>');
       });
       document.getElementById("eGroup").innerHTML = opts.join("");
       document.getElementById("groupFilter").innerHTML = filter.join("");
@@ -3261,7 +3261,7 @@ function appHtml(env, nonce) {
       box.innerHTML = groups.map(function(g) {
         return '<div class="row group-row">'
           + '<span class="chip"><i class="swatch" data-color="' + esc(g.color || "#0f766e") + '"></i>' + esc(g.name) + '</span>'
-          + '<button class="warn" data-action="delete-group" data-id="' + g.id + '">' + esc(t("delete")) + '</button>'
+          + '<button class="warn" data-action="delete-group" data-id="' + esc(g.id) + '">' + esc(t("delete")) + '</button>'
           + '</div>';
       }).join("");
       applyDynamicStyles();
@@ -3301,18 +3301,18 @@ function appHtml(env, nonce) {
           + '<div class="title">' + esc(e.label) + '</div>'
           + '<div class="meta">' + esc(e.issuer || t("noIssuer")) + '</div>'
           + '<div class="row">' + otpTag + group + counter + '</div>'
-          + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
-          + '<div class="muted" id="x-' + e.id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
-          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + progress + '"></i></div>'
+          + '<div class="code" id="c-' + esc(e.id) + '">' + esc(code) + '</div>'
+          + '<div class="muted" id="x-' + esc(e.id) + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
+          + '<div class="bar"><i id="p-' + esc(e.id) + '" data-progress="' + progress + '"></i></div>'
           + '<div class="row mt-8">'
           + (e.otp_type === "hotp"
-            ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
-          + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
-          + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
-          + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
-          + '<button class="ghost" data-action="edit-entry" data-id="' + e.id + '">' + esc(t("edit")) + '</button>'
-          + '<button class="warn" data-action="delete-entry" data-id="' + e.id + '">' + esc(t("delete")) + '</button>'
+            ? '<button data-action="gen-hotp" data-id="' + esc(e.id) + '">' + esc(t("generateHotp")) + '</button>'
+            : '<button class="ghost" data-action="copy-code" data-id="' + esc(e.id) + '">' + esc(t("copyCode")) + '</button>')
+          + '<select id="entry-group-' + esc(e.id) + '">' + groupOptionsHtml(e.group_id) + '</select>'
+          + '<button class="ghost" data-action="set-entry-group" data-id="' + esc(e.id) + '">' + esc(t("setGroup")) + '</button>'
+          + '<button class="ghost" data-action="remove-entry-group" data-id="' + esc(e.id) + '">' + esc(t("removeGroup")) + '</button>'
+          + '<button class="ghost" data-action="edit-entry" data-id="' + esc(e.id) + '">' + esc(t("edit")) + '</button>'
+          + '<button class="warn" data-action="delete-entry" data-id="' + esc(e.id) + '">' + esc(t("delete")) + '</button>'
           + '</div></article>';
       }).join("");
       applyDynamicStyles();
@@ -3504,10 +3504,10 @@ function appHtml(env, nonce) {
       (d.users || []).forEach(function(u) {
         const next = u.role === "admin" ? "user" : "admin";
         const tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
-          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
-          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
-          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
+        tr.innerHTML = "<td>" + esc(u.id) + "</td><td>" + esc(u.username) + "</td><td>" + esc(u.role) + "</td><td>" +
+          "<button class='ghost' data-action='switch-role' data-id='" + esc(u.id) + "' data-role='" + esc(next) + "'>" + esc(t("setRole")) + " " + esc(next) + "</button> " +
+          "<button class='ghost' data-action='reset-password' data-id='" + esc(u.id) + "'>" + esc(t("resetPassword")) + "</button> " +
+          "<button class='warn' data-action='delete-user' data-id='" + esc(u.id) + "'>" + esc(t("delete")) + "</button></td>";
         tbody.appendChild(tr);
       });
       table.replaceChildren(tbody);
