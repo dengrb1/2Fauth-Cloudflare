@@ -40,6 +40,7 @@ function apiSessionDb(state = {}) {
             return {
               session_id: 7,
               client_type: "android",
+              last_used_at: state.lastUsedAt,
               id: 3,
               username: "alice",
               role: "user",
@@ -53,6 +54,73 @@ function apiSessionDb(state = {}) {
           return { meta: { changes: 1 } };
         },
         async all() {
+          return { results: [] };
+        },
+      };
+      return statement;
+    },
+  };
+}
+
+function webAppDataDb(state = {}) {
+  return {
+    prepare(sql) {
+      const statement = {
+        bind(...args) {
+          state.binds = state.binds || [];
+          state.binds.push({ sql, args });
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM login_risk_control")) return null;
+          if (sql.includes("FROM sessions")) {
+            return { id: 1, username: "admin", role: "admin" };
+          }
+          return null;
+        },
+        async run() {
+          state.runs = state.runs || [];
+          state.runs.push(sql);
+          return { meta: { changes: 1 } };
+        },
+        async all() {
+          if (sql.includes("FROM totp_entries")) {
+            return {
+              results: [
+                {
+                  id: 11,
+                  user_id: 1,
+                  username: "admin",
+                  label: "Email",
+                  issuer: "Example",
+                  digits: 6,
+                  period: 30,
+                  algorithm: "SHA-256",
+                  otp_type: "totp",
+                  hotp_counter: 0,
+                  enabled: 1,
+                  group_id: null,
+                  group_name: null,
+                  group_color: null,
+                  created_at: "2026-01-01T00:00:00.000Z",
+                },
+              ],
+            };
+          }
+          if (sql.includes("FROM groups")) {
+            return {
+              results: [
+                {
+                  id: 5,
+                  user_id: 1,
+                  username: "admin",
+                  name: "Work",
+                  color: "#0f766e",
+                  created_at: "2026-01-01T00:00:00.000Z",
+                },
+              ],
+            };
+          }
           return { results: [] };
         },
       };
@@ -448,7 +516,7 @@ test("malformed stored password hashes fail login without a 500", async () => {
 
   assert.equal(response.status, 401);
   assert.equal(body.error, "Invalid credentials");
-  assert.equal(state.runs.some((sql) => sql.includes("INSERT INTO sessions")), false);
+  assert.equal((state.runs || []).some((sql) => sql.includes("INSERT INTO sessions")), false);
 });
 
 test("v1 me accepts API bearer sessions", async () => {
@@ -465,6 +533,40 @@ test("v1 me accepts API bearer sessions", async () => {
   assert.equal(response.status, 200);
   assert.deepEqual(body.user, { id: 3, username: "alice", role: "user" });
   assert.ok(state.runs.some((sql) => sql.includes("UPDATE api_sessions SET last_used_at")));
+});
+
+test("fresh API bearer sessions skip last_used_at writes", async () => {
+  const state = { lastUsedAt: new Date().toISOString() };
+  const request = new Request("https://example.com/api/v1/me", {
+    headers: {
+      Authorization: "Bearer access-token",
+    },
+  });
+
+  const response = await worker.fetch(request, envWithDb(apiSessionDb(state)), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.user, { id: 3, username: "alice", role: "user" });
+  assert.equal((state.runs || []).some((sql) => sql.includes("UPDATE api_sessions SET last_used_at")), false);
+});
+
+test("web app data returns entries and groups in one request", async () => {
+  const state = {};
+  const request = new Request("https://example.com/api/app-data", {
+    headers: {
+      Cookie: "__Host-session=web-token",
+    },
+  });
+
+  const response = await worker.fetch(request, envWithDb(webAppDataDb(state)), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.entries.length, 1);
+  assert.equal(body.entries[0].label, "Email");
+  assert.equal(body.groups.length, 1);
+  assert.equal(body.groups[0].name, "Work");
 });
 
 test("generic API rate limit rejects excessive authenticated requests", async () => {

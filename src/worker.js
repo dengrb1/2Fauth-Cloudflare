@@ -23,6 +23,8 @@ const DEFAULT_TOTP_VERIFY_LOCK_MINUTES = 5;
 const DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE = 5;
 const DEFAULT_HOTP_CONSUME_LOCK_MINUTES = 5;
 const ENCRYPTION_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
+const BACKGROUND_MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
+const API_SESSION_LAST_USED_UPDATE_INTERVAL_SECONDS = 15 * 60;
 const ENTRY_LABEL_MAX_LENGTH = 200;
 const ENTRY_ISSUER_MAX_LENGTH = 100;
 const GROUP_NAME_MAX_LENGTH = 60;
@@ -39,6 +41,8 @@ const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
 const FAKE_PASSWORD_HASH = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
 const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
+
+let nextBackgroundMaintenanceAt = 0;
 
 const API_ROUTES = [
   ["GET", "/api/status", handleStatus],
@@ -64,9 +68,12 @@ const API_ROUTES = [
   ["POST", "/api/logout", handleLogout],
   ["POST", "/api/session/close-soon", handleCloseSoon],
   ["GET", "/api/me", handleMe],
+  ["GET", "/api/app-data", handleAppData],
   ["PATCH", "/api/me/password", handleChangeMyPassword],
   ...entryRoutes("/api"),
   ...groupRoutes("/api"),
+  ["POST", "/api/codes/batch", handleWebCodesBatch],
+  ["GET", "/api/export", handleExportData],
   ["POST", "/api/export", handleExportData],
   ["POST", "/api/export/otpauth", handleExportOtpAuth],
   ["POST", "/api/export/encrypted", handleExportDataEncrypted],
@@ -120,8 +127,6 @@ export default {
         return json({ error: "ENCRYPTION_KEY and SESSION_PEPPER are required" }, 500);
       }
 
-      ctx.waitUntil(Promise.all([cleanExpiredSessions(env), cleanExpiredLoginRisk(env)]).catch(() => {}));
-
       const url = new URL(request.url);
       const method = request.method.toUpperCase();
       const path = url.pathname;
@@ -137,6 +142,7 @@ export default {
 
       const route = findApiRoute(method, path);
       if (route) {
+        scheduleBackgroundMaintenance(ctx, env, path);
         const limited = await applyApiRateLimit(request, env, route);
         if (limited) return withCors(request, limited, env);
         return withCors(request, await route.handler(request, env), env);
@@ -500,6 +506,13 @@ async function handleApiCodesBatch(request, env) {
   return handleCodesBatchForAuth(request, env, auth);
 }
 
+async function handleWebCodesBatch(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "web") return json({ error: "Web session required" }, 400);
+  return handleCodesBatchForAuth(request, env, auth);
+}
+
 async function handleCodesBatchForAuth(request, env, auth) {
   const body = await parseJson(request);
   if (!Array.isArray(body.entryIds)) return json({ error: "entryIds must be an array" }, 400);
@@ -523,7 +536,7 @@ async function handleCodesBatchForAuth(request, env, auth) {
   // F-01: safe IN-clause query builder 鈥?no string interpolation of SQL.
   // Every element was already validated as a positive integer above.
   const { placeholders, params: inParams } = buildInClause(normalizedIds);
-  let query = `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE id IN (${placeholders})`;
+  let query = `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled FROM totp_entries WHERE id IN (${placeholders})`;
   const baseParams = [...inParams];
   if (auth.user.role !== "admin") {
     query += " AND user_id = ?";
@@ -541,11 +554,17 @@ async function handleCodesBatchForAuth(request, env, auth) {
       continue;
     }
 
+    if (!entryEnabled(row.enabled)) {
+      items.push({ id, otpType: row.otp_type || "totp", enabled: false, error: "Entry is disabled" });
+      continue;
+    }
+
     const otpType = row.otp_type || "totp";
     if (otpType === "hotp") {
       items.push({
         id,
         otpType: "hotp",
+        enabled: true,
         counter: Number(row.hotp_counter || 0),
         error: "Use HOTP endpoint",
       });
@@ -567,8 +586,10 @@ async function handleCodesBatchForAuth(request, env, auth) {
       items.push({
         id,
         otpType: "totp",
+        enabled: true,
         code,
         expiresIn,
+        period,
       });
     } catch {
       items.push({ id, otpType: "totp", error: "Failed to generate code" });
@@ -625,23 +646,38 @@ async function handleMe(request, env) {
   return json({ user: auth.user });
 }
 
+async function handleAppData(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  if (auth.sessionKind !== "web") return json({ error: "Web session required" }, 400);
+
+  const [entries, groups] = await Promise.all([
+    listEntriesForAuth(env, auth),
+    listGroupsForAuth(env, auth),
+  ]);
+  return json({ entries, groups });
+}
+
 async function handleListEntries(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
+  return json({ entries: await listEntriesForAuth(env, auth) });
+}
 
+async function listEntriesForAuth(env, auth) {
   if (auth.user.role === "admin") {
     const rows = await env.DB.prepare(
-      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.id DESC"
+      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.id DESC"
     ).all();
-    return json({ entries: rows.results || [] });
+    return rows.results || [];
   }
 
   const rows = await env.DB.prepare(
-    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.id DESC"
+    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.id DESC"
   )
     .bind(auth.user.id)
     .all();
-  return json({ entries: rows.results || [] });
+  return rows.results || [];
 }
 
 async function handleCreateEntry(request, env) {
@@ -666,6 +702,7 @@ async function handleCreateEntry(request, env) {
   const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-256");
   const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
   const hotpCounter = Number(payload.hotpCounter || 0);
+  const enabled = payload.enabled === undefined ? 1 : booleanFlag(payload.enabled);
   const groupId = parseOptionalPositiveId(payload.groupId);
   const requestedUserId = Number(payload.userId !== undefined ? payload.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
@@ -678,6 +715,7 @@ async function handleCreateEntry(request, env) {
   if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (enabled === false) return json({ error: "enabled must be a boolean" }, 400);
 
   try {
     const bytes = base32Decode(secret);
@@ -699,9 +737,9 @@ async function handleCreateEntry(request, env) {
   const secretEnc = await encryptText(secret, env);
   const now = nowIso();
   const result = await env.DB.prepare(
-    "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, now)
+    .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, now)
     .run();
 
   return json({ ok: true, id: normalizeDbId(result.meta?.last_row_id) }, 201);
@@ -727,6 +765,7 @@ async function handleUpdateEntry(request, env) {
   const algorithm = body.algorithm !== undefined ? normalizeAlgorithm(body.algorithm) : normalizeAlgorithm(existing.algorithm || "SHA-1");
   const otpType = body.otpType ? (body.otpType === "hotp" ? "hotp" : "totp") : (existing.otp_type || "totp");
   const hotpCounter = body.hotpCounter !== undefined ? Number(body.hotpCounter) : (existing.hotp_counter || 0);
+  const enabled = body.enabled !== undefined ? booleanFlag(body.enabled) : (entryEnabled(existing.enabled) ? 1 : 0);
   const groupId = body.groupId !== undefined ? parseOptionalPositiveId(body.groupId) : existing.group_id;
 
   if (!label) return json({ error: "label is required" }, 400);
@@ -736,6 +775,7 @@ async function handleUpdateEntry(request, env) {
   if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (body.algorithm !== undefined && algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
+  if (enabled === false) return json({ error: "enabled must be a boolean" }, 400);
 
   let secretEnc = existing.secret_enc;
   if (body.secret !== undefined) {
@@ -757,9 +797,9 @@ async function handleUpdateEntry(request, env) {
   }
 
   await env.DB.prepare(
-    "UPDATE totp_entries SET label = ?, issuer = ?, secret_enc = ?, digits = ?, period = ?, algorithm = ?, otp_type = ?, hotp_counter = ?, group_id = ? WHERE id = ?"
+    "UPDATE totp_entries SET label = ?, issuer = ?, secret_enc = ?, digits = ?, period = ?, algorithm = ?, otp_type = ?, hotp_counter = ?, enabled = ?, group_id = ? WHERE id = ?"
   )
-    .bind(label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, id)
+    .bind(label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, id)
     .run();
   return json({ ok: true });
 }
@@ -773,6 +813,7 @@ async function handleEntryCode(request, env) {
   const row = await env.DB.prepare("SELECT * FROM totp_entries WHERE id = ?").bind(id).first();
   if (!row) return json({ error: "Entry not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
+  if (!entryEnabled(row.enabled)) return json({ error: "Entry is disabled" }, 409);
 
   const secret = await decryptText(row.secret_enc, env);
   const otpType = row.otp_type || "totp";
@@ -806,6 +847,7 @@ async function handleVerifyTotp(request, env) {
   if (!row) return json({ error: "Entry not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
   if ((row.otp_type || "totp") === "hotp") return json({ error: "Use /api/entries/:id/hotp for HOTP codes" }, 400);
+  if (!entryEnabled(row.enabled)) return json({ error: "Entry is disabled" }, 409);
 
   const algorithm = normalizeAlgorithm(row.algorithm || "SHA-1");
   if (!algorithm) return json({ error: "Unsupported OTP algorithm" }, 400);
@@ -833,6 +875,7 @@ async function handleConsumeHotp(request, env) {
   if (!row) return json({ error: "Entry not found" }, 404);
   if (auth.user.role !== "admin" && row.user_id !== auth.user.id) return json({ error: "Forbidden" }, 403);
   if ((row.otp_type || "totp") !== "hotp") return json({ error: "This entry is not HOTP" }, 400);
+  if (!entryEnabled(row.enabled)) return json({ error: "Entry is disabled" }, 409);
 
   const hotpLimit = await applyHotpConsumeRateLimit(request, env, id);
   if (hotpLimit) return hotpLimit;
@@ -862,18 +905,22 @@ async function handleConsumeHotp(request, env) {
 async function handleListGroups(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
+  return json({ groups: await listGroupsForAuth(env, auth) });
+}
+
+async function listGroupsForAuth(env, auth) {
   if (auth.user.role === "admin") {
     const rows = await env.DB.prepare(
       "SELECT g.id, g.user_id, u.username, g.name, g.color, g.created_at FROM groups g JOIN users u ON u.id = g.user_id ORDER BY g.id DESC"
     ).all();
-    return json({ groups: rows.results || [] });
+    return rows.results || [];
   }
   const rows = await env.DB.prepare(
     "SELECT id, user_id, name, color, created_at FROM groups WHERE user_id = ? ORDER BY id DESC"
   )
     .bind(auth.user.id)
     .all();
-  return json({ groups: rows.results || [] });
+  return rows.results || [];
 }
 
 async function handleCreateGroup(request, env) {
@@ -944,8 +991,8 @@ async function handleExportOtpAuth(request, env) {
 
   const entriesQuery =
     auth.user.role === "admin"
-      ? env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries ORDER BY id ASC")
-      : env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter FROM totp_entries WHERE user_id = ? ORDER BY id ASC").bind(auth.user.id);
+      ? env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled FROM totp_entries ORDER BY id ASC")
+      : env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled FROM totp_entries WHERE user_id = ? ORDER BY id ASC").bind(auth.user.id);
   const entriesRes = await entriesQuery.all();
   const lines = [];
   for (const e of entriesRes.results || []) {
@@ -1023,7 +1070,7 @@ async function handleImportOtpAuth(request, env) {
       const hotpCounter = normalizeHotpCounter(data.hotpCounter);
       const secretEnc = await encryptText(secret, env);
       await env.DB.prepare(
-        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)"
       )
         .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
         .run();
@@ -1076,8 +1123,8 @@ async function getExportPayload(auth, env) {
       : env.DB.prepare("SELECT id, user_id, name, color, created_at FROM groups WHERE user_id = ? ORDER BY id ASC").bind(auth.user.id);
   const entriesQuery =
     auth.user.role === "admin"
-      ? env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at FROM totp_entries ORDER BY id ASC")
-      : env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at FROM totp_entries WHERE user_id = ? ORDER BY id ASC").bind(auth.user.id);
+      ? env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at FROM totp_entries ORDER BY id ASC")
+      : env.DB.prepare("SELECT id, user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at FROM totp_entries WHERE user_id = ? ORDER BY id ASC").bind(auth.user.id);
 
   const [groupsRes, entriesRes] = await Promise.all([groupsQuery.all(), entriesQuery.all()]);
   const entries = [];
@@ -1166,12 +1213,14 @@ async function importPayload(body, auth, env) {
     const digits = normalizeOtpDigits(e.digits);
     const period = normalizeTotpPeriod(e.period);
     const hotpCounter = normalizeHotpCounter(e.hotp_counter);
+    const enabled = e.enabled === undefined ? 1 : booleanFlag(e.enabled);
+    if (enabled === false) continue;
     const secretEnc = await encryptText(secret, env);
 
     await env.DB.prepare(
-      "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
+      .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, nowIso())
       .run();
     imported.entries += 1;
   }
@@ -1463,7 +1512,7 @@ async function applyLoginRiskControl(request, env, username) {
       updateLoginRiskBucket(env, ipKey, "__any__", ip, nowSec, ipPolicy),
     ]);
   } catch (err) {
-    if (isMissingTableError(err, "login_risk_control")) throw new ApiError(503, "Service temporarily unavailable");
+    if (isMissingTableError(err, "login_risk_control")) return { blocked: false };
     throw err;
   }
 
@@ -1737,11 +1786,12 @@ async function getCurrentUser(request, env) {
   const bearerToken = readBearerToken(request);
   if (bearerToken) {
     const tokenHash = await hashSessionToken(bearerToken, env);
-    const now = nowIso();
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
     let row = null;
     try {
       row = await env.DB.prepare(
-        "SELECT s.id AS session_id, s.client_type, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
+        "SELECT s.id AS session_id, s.client_type, s.last_used_at, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
       )
         .bind(tokenHash, now)
         .first();
@@ -1749,7 +1799,9 @@ async function getCurrentUser(request, env) {
       if (!isMissingTableError(err, "api_sessions")) throw err;
     }
     if (row) {
-      await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
+      if (shouldUpdateApiSessionLastUsed(row.last_used_at, nowMs)) {
+        await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
+      }
       return {
         user: { id: row.id, username: row.username, role: row.role },
         sessionKind: "api",
@@ -1770,6 +1822,12 @@ async function getCurrentUser(request, env) {
     .first();
   if (!row) return null;
   return { user: row, sessionKind: "web" };
+}
+
+function shouldUpdateApiSessionLastUsed(lastUsedAt, nowMs) {
+  const lastMs = Date.parse(String(lastUsedAt || ""));
+  if (!Number.isFinite(lastMs)) return true;
+  return nowMs - lastMs >= API_SESSION_LAST_USED_UPDATE_INTERVAL_SECONDS * 1000;
 }
 
 async function createSession(env, userId) {
@@ -1822,6 +1880,23 @@ async function cleanExpiredSessions(env) {
   } catch (err) {
     if (!isMissingTableError(err, "api_sessions")) throw err;
   }
+}
+
+function scheduleBackgroundMaintenance(ctx, env, path) {
+  if (!ctx || typeof ctx.waitUntil !== "function") return;
+  if (path === "/api/status" || path === "/api/v1/capabilities") return;
+
+  const now = Date.now();
+  if (now < nextBackgroundMaintenanceAt) return;
+  nextBackgroundMaintenanceAt = now + BACKGROUND_MAINTENANCE_INTERVAL_MS;
+  ctx.waitUntil(runBackgroundMaintenance(env).catch(() => {}));
+}
+
+async function runBackgroundMaintenance(env) {
+  await Promise.all([
+    cleanExpiredSessions(env),
+    cleanExpiredLoginRisk(env),
+  ]);
 }
 
 async function insertWebSession(env, userId, tokenHash, expiresAt, createdAt) {
@@ -2262,6 +2337,21 @@ function normalizeHotpCounter(value) {
   return Number.isInteger(counter) && counter >= 0 ? counter : 0;
 }
 
+function booleanFlag(value) {
+  if (value === true || value === 1 || value === "1") return 1;
+  if (value === false || value === 0 || value === "0") return 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return 1;
+    if (normalized === "false") return 0;
+  }
+  return false;
+}
+
+function entryEnabled(value) {
+  return value === undefined || value === null || Number(value) !== 0;
+}
+
 function normalizeUsername(v) {
   const out = String(v || "").trim().toLowerCase();
   return /^[a-z0-9_.-]{3,40}$/.test(out) ? out : "";
@@ -2621,6 +2711,7 @@ function appHtml(env, nonce) {
     }
     h1 { margin: 0; font-size: 24px; }
     .sub { color: var(--muted); font-size: 13px; }
+    .disabled { opacity: .62; }
     .panel {
       background: var(--card);
       border: 1px solid var(--line);
@@ -2737,7 +2828,7 @@ function appHtml(env, nonce) {
   <div class="page">
     <div class="top">
       <div>
-        <h1 id="appTitle">2FAuth 验证器</h1>
+        <h1>2FAuth 验证器</h1>
         <div id="state" class="sub">加载中...</div>
       </div>
       <div class="row">
@@ -2881,6 +2972,8 @@ function appHtml(env, nonce) {
     let entries = [];
     let groups = [];
     let codeState = {};
+    let serverClockOffsetMs = 0;
+    let codesRefreshing = false;
     let scanStream = null;
     let scanTimer = null;
     let jsQrReady = false;
@@ -2909,6 +3002,9 @@ function appHtml(env, nonce) {
         removeGroup: "移出分组",
         groupUpdated: "分组已更新",
         generateHotp: "生成 HOTP",
+        enableEntry: "启用",
+        disableEntry: "停用",
+        disabledEntry: "已停用",
         edit: "编辑",
         delete: "删除",
         deleteEntryConfirm: "确认删除该条目？",
@@ -2979,6 +3075,9 @@ function appHtml(env, nonce) {
         removeGroup: "Remove Group",
         groupUpdated: "Group updated",
         generateHotp: "Generate HOTP",
+        enableEntry: "Enable",
+        disableEntry: "Disable",
+        disabledEntry: "Disabled",
         edit: "Edit",
         delete: "Delete",
         deleteEntryConfirm: "Delete this entry?",
@@ -3235,13 +3334,29 @@ function appHtml(env, nonce) {
     function v(id) { return document.getElementById(id).value; }
 
     async function refreshAll() {
-      const [e, g] = await Promise.all([api("/api/entries"), api("/api/groups")]);
-      entries = e.entries || [];
-      groups = g.groups || [];
+      const data = await api("/api/app-data");
+      entries = data.entries || [];
+      groups = data.groups || [];
+      pruneCodeState();
       hydrateGroupSelects();
       renderGroups();
       renderEntries();
       await refreshVisibleCodes();
+    }
+
+    function isEntryEnabled(entry) {
+      return !entry || entry.enabled === undefined || entry.enabled === null || Number(entry.enabled) !== 0;
+    }
+
+    function serverNowSec() {
+      return Math.floor((Date.now() + serverClockOffsetMs) / 1000);
+    }
+
+    function pruneCodeState() {
+      const validIds = new Set(entries.map(function(e) { return String(e.id); }));
+      Object.keys(codeState).forEach(function(id) {
+        if (!validIds.has(String(id))) delete codeState[id];
+      });
     }
 
     function hydrateGroupSelects() {
@@ -3291,23 +3406,26 @@ function appHtml(env, nonce) {
       if (!list.length) { out.innerHTML = '<div class="muted">' + esc(t("noEntriesMatched")) + '</div>'; return; }
       out.innerHTML = list.map(function(e) {
         const state = codeState[e.id] || {};
-        const code = state.code || "------";
-        const ex = state.expiresIn || "";
-        const progress = state.progress || 0;
+        const enabled = isEntryEnabled(e);
+        const code = enabled ? (state.code || "------") : "------";
+        const timing = entryTiming(e);
         const group = e.group_name ? '<span class="chip"><i class="swatch" data-color="' + esc(e.group_color || "#0f766e") + '"></i>' + esc(e.group_name) + '</span>' : '';
         const otpTag = '<span class="chip">' + esc((e.otp_type || "totp").toUpperCase()) + '</span>';
+        const statusTag = enabled ? '' : '<span class="chip">' + esc(t("disabledEntry")) + '</span>';
         const counter = (e.otp_type === "hotp") ? ('<span class="chip">counter ' + Number(e.hotp_counter || 0) + '</span>') : '';
-        return '<article class="entry">'
+        const statusText = enabled ? ((e.otp_type === "hotp") ? t("clickGenerate") : timing.expiresIn + t("secLeft")) : t("disabledEntry");
+        return '<article class="entry' + (enabled ? '' : ' disabled') + '">'
           + '<div class="title">' + esc(e.label) + '</div>'
           + '<div class="meta">' + esc(e.issuer || t("noIssuer")) + '</div>'
-          + '<div class="row">' + otpTag + group + counter + '</div>'
+          + '<div class="row">' + otpTag + statusTag + group + counter + '</div>'
           + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
-          + '<div class="muted" id="x-' + e.id + '">' + (ex ? (ex + t("secLeft")) : (e.otp_type === "hotp" ? t("clickGenerate") : "")) + '</div>'
-          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + progress + '"></i></div>'
+          + '<div class="muted" id="x-' + e.id + '">' + esc(statusText) + '</div>'
+          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + (enabled ? timing.progress : 0) + '"></i></div>'
           + '<div class="row mt-8">'
           + (e.otp_type === "hotp"
             ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
             : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
+          + '<button class="ghost" data-action="toggle-entry" data-id="' + e.id + '" data-enabled="' + (enabled ? "0" : "1") + '">' + esc(enabled ? t("disableEntry") : t("enableEntry")) + '</button>'
           + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
           + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
           + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
@@ -3316,32 +3434,116 @@ function appHtml(env, nonce) {
           + '</div></article>';
       }).join("");
       applyDynamicStyles();
+      updateCodeTimers();
     }
 
     async function refreshVisibleCodes() {
-      const current = entries.filter(function(e) { return e.otp_type !== "hotp"; });
-      await Promise.all(current.map(function(e) { return refreshCode(e.id, true); }));
+      const current = entries.filter(function(e) { return e.otp_type !== "hotp" && isEntryEnabled(e); });
+      await refreshCodesBatch(current, true);
     }
 
     async function refreshCode(id, silent) {
+      const entry = entries.find(function(x){ return x.id === id; });
+      if (entry && !isEntryEnabled(entry)) {
+        delete codeState[id];
+        updateEntryDisplay(id);
+        return;
+      }
       try {
         const r = await api("/api/entries/" + id + "/code?_t=" + Date.now());
-        const entry = entries.find(function(x){ return x.id === id; });
-        const period = Math.max(1, Number((entry && entry.period) || 30));
-        const progress = Math.max(0, Math.min(100, ((period - r.expiresIn) / period) * 100));
-        codeState[id] = { code: r.code, expiresIn: r.expiresIn, progress: progress };
-        const codeEl = document.getElementById("c-" + id);
-        const exEl = document.getElementById("x-" + id);
-        const pEl = document.getElementById("p-" + id);
-        if (codeEl) codeEl.textContent = r.code;
-        if (exEl) exEl.textContent = r.expiresIn + t("secLeft");
-        if (pEl) pEl.style.width = progress + "%";
+        if (Number.isFinite(r.now)) serverClockOffsetMs = (Number(r.now) * 1000) - Date.now();
+        codeState[id] = { code: r.code, fetchedStep: entryStep(entry) };
+        updateEntryDisplay(id);
       } catch (e) {
         if (!silent) alert(e.message);
       }
     }
 
+    async function refreshCodesBatch(list, silent) {
+      const current = (list || []).filter(function(e) { return e && e.otp_type !== "hotp" && isEntryEnabled(e); });
+      if (!current.length || codesRefreshing) return;
+      codesRefreshing = true;
+      try {
+        const result = await api("/api/codes/batch", {
+          method: "POST",
+          body: JSON.stringify({ entryIds: current.map(function(e) { return e.id; }) })
+        });
+        if (Number.isFinite(result.serverTime)) {
+          serverClockOffsetMs = (Number(result.serverTime) * 1000) - Date.now();
+        }
+        (result.items || []).forEach(function(item) {
+          const entry = entries.find(function(e) { return Number(e.id) === Number(item.id); });
+          if (!entry) return;
+          if (item.error || item.enabled === false) {
+            if (item.enabled === false) delete codeState[item.id];
+            return;
+          }
+          codeState[item.id] = { code: item.code, fetchedStep: entryStep(entry) };
+          updateEntryDisplay(item.id);
+        });
+        updateCodeTimers();
+      } catch (e) {
+        if (!silent) alert(e.message);
+      } finally {
+        codesRefreshing = false;
+      }
+    }
+
+    function entryPeriod(entry) {
+      return Math.max(1, Number((entry && entry.period) || 30));
+    }
+
+    function entryStep(entry) {
+      return Math.floor(serverNowSec() / entryPeriod(entry));
+    }
+
+    function entryTiming(entry) {
+      if (!isEntryEnabled(entry) || entry.otp_type === "hotp") return { expiresIn: 0, progress: entry.otp_type === "hotp" ? 100 : 0 };
+      const period = entryPeriod(entry);
+      const now = serverNowSec();
+      const elapsed = now % period;
+      return {
+        expiresIn: period - elapsed,
+        progress: Math.max(0, Math.min(100, (elapsed / period) * 100)),
+      };
+    }
+
+    function updateEntryDisplay(id) {
+      const entry = entries.find(function(e) { return Number(e.id) === Number(id); });
+      if (!entry) return;
+      const state = codeState[id] || {};
+      const enabled = isEntryEnabled(entry);
+      const timing = entryTiming(entry);
+      const codeEl = document.getElementById("c-" + id);
+      const exEl = document.getElementById("x-" + id);
+      const pEl = document.getElementById("p-" + id);
+      if (codeEl) codeEl.textContent = enabled ? (state.code || "------") : "------";
+      if (exEl) {
+        if (!enabled) exEl.textContent = t("disabledEntry");
+        else if (entry.otp_type === "hotp") exEl.textContent = t("clickGenerate");
+        else exEl.textContent = timing.expiresIn + t("secLeft");
+      }
+      if (pEl) pEl.style.width = (enabled ? timing.progress : 0) + "%";
+    }
+
+    function updateCodeTimers() {
+      let needsRefresh = [];
+      entries.forEach(function(entry) {
+        if (entry.otp_type === "hotp" || !isEntryEnabled(entry)) return;
+        updateEntryDisplay(entry.id);
+        const state = codeState[entry.id] || {};
+        const step = entryStep(entry);
+        if (!state.code || state.fetchedStep !== step) needsRefresh.push(entry);
+      });
+      if (needsRefresh.length) refreshCodesBatch(needsRefresh, true);
+    }
+
     async function copyCode(id) {
+      const entry = entries.find(function(x){ return Number(x.id) === Number(id); });
+      if (entry && !isEntryEnabled(entry)) {
+        alert(t("disabledEntry"));
+        return;
+      }
       const state = codeState[id] || {};
       const code = String(state.code || "").trim();
       if (!code || code === "------") {
@@ -3366,11 +3568,25 @@ function appHtml(env, nonce) {
     }
 
     async function genHotp(id) {
+      const entry = entries.find(function(x){ return Number(x.id) === Number(id); });
+      if (entry && !isEntryEnabled(entry)) {
+        alert(t("disabledEntry"));
+        return;
+      }
       try {
         const r = await api("/api/entries/" + id + "/hotp", { method: "POST", body: "{}" });
-        codeState[id] = { code: r.code, expiresIn: 0, progress: 100 };
+        codeState[id] = { code: r.code, fetchedStep: 0 };
         await refreshAll();
       } catch (e) { alert(e.message); }
+    }
+
+    async function toggleEntry(id, enabled) {
+      await api("/api/entries/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: enabled })
+      });
+      if (!enabled) delete codeState[id];
+      await refreshAll();
     }
 
     async function createEntry() {
@@ -3417,7 +3633,7 @@ function appHtml(env, nonce) {
     }
 
     async function editEntry(id) {
-      const e = entries.find(function(x){ return x.id === id; });
+      const e = entries.find(function(x){ return Number(x.id) === Number(id); });
       if (!e) return;
       const label = prompt(t("labelPrompt"), e.label); if (label === null) return;
       const issuer = prompt(t("issuerPrompt"), e.issuer || ""); if (issuer === null) return;
@@ -3875,6 +4091,7 @@ function appHtml(env, nonce) {
           "delete-group": function() { return deleteGroup(id); },
           "gen-hotp": function() { return genHotp(id); },
           "copy-code": function() { return copyCode(id); },
+          "toggle-entry": function() { return toggleEntry(id, evt.target.getAttribute("data-enabled") === "1"); },
           "set-entry-group": function() { return setEntryGroup(id); },
           "remove-entry-group": function() { return removeEntryGroup(id); },
           "edit-entry": function() { return editEntry(id); },
@@ -3912,11 +4129,7 @@ function appHtml(env, nonce) {
       });
     }
 
-    setInterval(function() {
-      entries.forEach(function(e) {
-        if (e.otp_type !== "hotp") refreshCode(e.id, true);
-      });
-    }, 5000);
+    setInterval(updateCodeTimers, 1000);
 
     bindUiEvents();
     init();
