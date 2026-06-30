@@ -265,7 +265,7 @@ function loginRateLimitPassThroughDb(user, state = {}) {
   };
 }
 
-function adminSessionDb(handler) {
+function authenticatedSessionDb(user, handler = {}) {
   const state = { inserts: 0, updates: 0, deletes: 0 };
   const db = {
     state,
@@ -274,6 +274,8 @@ function adminSessionDb(handler) {
         args: [],
         bind(...args) {
           statement.args = args;
+          state.binds = state.binds || [];
+          state.binds.push({ sql, args });
           return statement;
         },
         async first() {
@@ -281,9 +283,9 @@ function adminSessionDb(handler) {
             return {
               session_id: 7,
               client_type: "android",
-              id: 1,
-              username: "admin",
-              role: "admin",
+              id: user.id,
+              username: user.username,
+              role: user.role,
             };
           }
           return handler.first ? handler.first(sql, statement.args, state) : null;
@@ -304,6 +306,10 @@ function adminSessionDb(handler) {
     },
   };
   return db;
+}
+
+function adminSessionDb(handler) {
+  return authenticatedSessionDb({ id: 1, username: "admin", role: "admin" }, handler);
 }
 
 test("allows configured extension origin preflight", async () => {
@@ -331,7 +337,7 @@ test("v1 capabilities exposes client contract metadata", async () => {
 
   const response = await worker.fetch(
     request,
-    { ...envWithDb(emptyDb()), TURNSTILE_SECRET_KEY: "turnstile-secret" },
+    { ...envWithDb(emptyDb()), TURNSTILE_SECRET_KEY: "turnstile-secret", TURNSTILE_SITE_KEY: "turnstile-site" },
     ctx()
   );
   const body = await response.json();
@@ -341,9 +347,14 @@ test("v1 capabilities exposes client contract metadata", async () => {
   assert.deepEqual(body.compatibleClients, ["android", "browser_extension"]);
   assert.equal(body.auth.scheme, "Bearer");
   assert.equal(body.auth.turnstileRequired, true);
+  assert.equal(body.auth.turnstileSiteKey, "turnstile-site");
   assert.equal(body.auth.accessTokenExpiresIn, 604800);
   assert.equal(body.auth.refreshTokenRotation, true);
   assert.equal(body.endpoints.login, "/api/v1/auth/login");
+  assert.equal(body.endpoints.changePassword, "/api/v1/me/password");
+  assert.equal(body.endpoints.importOtpAuth, "/api/v1/import/otpauth");
+  assert.equal(body.endpoints.exportEncrypted, "/api/v1/export/encrypted");
+  assert.equal(body.endpoints.importEncrypted, "/api/v1/import/encrypted");
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "chrome-extension://abc123");
 });
 
@@ -765,6 +776,321 @@ test("encrypted import rejects downgraded PBKDF2 iterations", async () => {
   assert.equal(body.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
 });
 
+test("v1 import and encrypted export routes are wired to existing handlers", async () => {
+  const db = adminSessionDb({});
+  const headers = {
+    Authorization: "Bearer access-token",
+    "Content-Type": "application/json",
+  };
+
+  const exportResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/export/encrypted", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ passphrase: "short" }),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const exportBody = await exportResponse.json();
+
+  const importEncryptedResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/import/encrypted", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ passphrase: "short" }),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const importEncryptedBody = await importEncryptedResponse.json();
+
+  const importOtpAuthResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/import/otpauth", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({}),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const importOtpAuthBody = await importOtpAuthResponse.json();
+
+  assert.equal(exportResponse.status, 400);
+  assert.equal(exportBody.error, "passphrase must be at least 12 chars");
+  assert.equal(importEncryptedResponse.status, 400);
+  assert.equal(importEncryptedBody.error, "passphrase must be at least 12 chars");
+  assert.equal(importOtpAuthResponse.status, 400);
+  assert.equal(importOtpAuthBody.error, "text is required");
+});
+
+test("patching a v1 group updates only name and color", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id, user_id, name, color FROM groups WHERE id = ?")) {
+        return { id: 5, user_id: 2, name: "Old", color: "#0f766e" };
+      }
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/groups/5", {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: " New Name ", color: "#123ABC" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+  const update = db.state.binds.find((bind) => bind.sql.includes("UPDATE groups SET name = ?, color = ?"));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(update.args, ["New Name", "#123ABC", 5]);
+});
+
+test("patching a group rejects another user's group for non-admins", async () => {
+  const db = authenticatedSessionDb({ id: 1, username: "alice", role: "user" }, {
+    first(sql) {
+      if (sql.includes("SELECT id, user_id, name, color FROM groups WHERE id = ?")) {
+        return { id: 5, user_id: 2, name: "Work", color: "#0f766e" };
+      }
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/groups/5", {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: "Private" }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 403);
+  assert.equal(body.error, "Forbidden");
+  assert.equal(db.state.runs.some((sql) => sql.includes("UPDATE groups SET")), false);
+});
+
+test("patching a group reports missing and duplicate groups", async () => {
+  const missingDb = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id, user_id, name, color FROM groups WHERE id = ?")) return null;
+      return null;
+    },
+  });
+  const missingResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/groups/404", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Missing" }),
+    }),
+    envWithDb(missingDb),
+    ctx()
+  );
+  const missingBody = await missingResponse.json();
+
+  const duplicateDb = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id, user_id, name, color FROM groups WHERE id = ?")) {
+        return { id: 5, user_id: 1, name: "Work", color: "#0f766e" };
+      }
+      return null;
+    },
+    run(sql) {
+      if (sql.includes("UPDATE groups SET name = ?, color = ?")) throw new Error("UNIQUE constraint failed");
+      return { meta: { changes: 1 } };
+    },
+  });
+  const duplicateResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/groups/5", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Existing" }),
+    }),
+    envWithDb(duplicateDb),
+    ctx()
+  );
+  const duplicateBody = await duplicateResponse.json();
+
+  assert.equal(missingResponse.status, 404);
+  assert.equal(missingBody.error, "Group not found");
+  assert.equal(duplicateResponse.status, 409);
+  assert.equal(duplicateBody.error, "Group name already exists for this user");
+});
+
+test("patching a group validates name and color", async () => {
+  const groupHandler = {
+    first(sql) {
+      if (sql.includes("SELECT id, user_id, name, color FROM groups WHERE id = ?")) {
+        return { id: 5, user_id: 1, name: "Work", color: "#0f766e" };
+      }
+      return null;
+    },
+  };
+  const invalidNameDb = adminSessionDb(groupHandler);
+  const invalidColorDb = adminSessionDb(groupHandler);
+
+  const invalidNameResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/groups/5", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "   " }),
+    }),
+    envWithDb(invalidNameDb),
+    ctx()
+  );
+  const invalidNameBody = await invalidNameResponse.json();
+
+  const invalidColorResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/groups/5", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ color: "blue" }),
+    }),
+    envWithDb(invalidColorDb),
+    ctx()
+  );
+  const invalidColorBody = await invalidColorResponse.json();
+
+  assert.equal(invalidNameResponse.status, 400);
+  assert.equal(invalidNameBody.error, "name is required");
+  assert.equal(invalidColorResponse.status, 400);
+  assert.equal(invalidColorBody.error, "color must be #RRGGBB");
+});
+
+test("v1 otpauth import can bind imported entries to a group and returns imported ids", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id FROM users WHERE id = ?")) return { id: 1 };
+      if (sql.includes("SELECT id, user_id FROM groups WHERE id = ?")) return { id: 7, user_id: 1 };
+      return null;
+    },
+    run(sql) {
+      if (sql.includes("INSERT INTO totp_entries")) return { meta: { changes: 1, last_row_id: "42" } };
+      return { meta: { changes: 1 } };
+    },
+  });
+  const request = new Request("https://example.com/api/v1/import/otpauth", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      groupId: 7,
+      text: "otpauth://totp/Issuer:alice?secret=JBSWY3DPEHPK3PXP&issuer=Issuer&algorithm=SHA256",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+  const insert = db.state.binds.find((bind) => bind.sql.includes("INSERT INTO totp_entries"));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.imported, 1);
+  assert.equal(body.failed, 0);
+  assert.deepEqual(body.importedIds, [42]);
+  assert.equal(insert.args[6], "SHA-256");
+  assert.equal(insert.args[9], 7);
+});
+
+test("v1 otpauth import rejects group ids outside the target user", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id FROM users WHERE id = ?")) return { id: 1 };
+      if (sql.includes("SELECT id, user_id FROM groups WHERE id = ?")) return { id: 7, user_id: 2 };
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/import/otpauth", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      groupId: 7,
+      text: "otpauth://totp/alice?secret=JBSWY3DPEHPK3PXP&algorithm=SHA256",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 403);
+  assert.equal(body.error, "Forbidden");
+  assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+});
+
+test("v1 otpauth import returns 404 for missing group ids", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id FROM users WHERE id = ?")) return { id: 1 };
+      if (sql.includes("SELECT id, user_id FROM groups WHERE id = ?")) return null;
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/import/otpauth", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      groupId: 999,
+      text: "otpauth://totp/alice?secret=JBSWY3DPEHPK3PXP&algorithm=SHA256",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 404);
+  assert.equal(body.error, "Group not found");
+});
+
+test("v1 otpauth import rejects SHA-1 and missing algorithms per item", async () => {
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("SELECT id FROM users WHERE id = ?")) return { id: 1 };
+      return null;
+    },
+  });
+  const request = new Request("https://example.com/api/v1/import/otpauth", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text: [
+        "otpauth://totp/default?secret=JBSWY3DPEHPK3PXP",
+        "otpauth://totp/sha1?secret=JBSWY3DPEHPK3PXP&algorithm=SHA1",
+      ].join("\n"),
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.found, 2);
+  assert.equal(body.imported, 0);
+  assert.equal(body.failed, 2);
+  assert.deepEqual(body.importedIds, []);
+  assert.deepEqual(body.errors, [
+    "OTPAuth URI algorithm must be SHA-256 or SHA-512",
+    "OTPAuth URI algorithm must be SHA-256 or SHA-512",
+  ]);
+  assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+});
+
 test("creating entries rejects SHA-1 OTP algorithms", async () => {
   const db = adminSessionDb({});
   const request = new Request("https://example.com/api/v1/entries", {
@@ -956,6 +1282,42 @@ test("change own password rejects weak new password", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(body.error, "Invalid new password");
+});
+
+test("change own password clears web and API sessions after success", async () => {
+  const saltB64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
+  const db = adminSessionDb({
+    first(sql) {
+      if (sql.includes("FROM users WHERE id = ?")) {
+        return {
+          id: 1,
+          username: "admin",
+          password_hash: passwordHash("CurrentSecure-Pass123", saltB64),
+          password_salt: saltB64,
+        };
+      }
+      if (sql.includes("COUNT") && sql.includes("admin")) return { count: 1 };
+      return null;
+    },
+  });
+
+  const request = new Request("https://example.com/api/v1/me/password", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      currentPassword: "CurrentSecure-Pass123",
+      newPassword: "NewSecure-Pass123",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.ok(db.state.runs.some((sql) => sql === "UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?"));
+  assert.ok(db.state.runs.some((sql) => sql === "DELETE FROM sessions WHERE user_id = ?"));
+  assert.ok(db.state.runs.some((sql) => sql === "DELETE FROM api_sessions WHERE user_id = ?"));
 });
 
 test("admin can reset any user password", async () => {

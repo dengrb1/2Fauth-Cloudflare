@@ -65,6 +65,9 @@ const API_ROUTES = [
   ...entryRoutes("/api/v1"),
   ...groupRoutes("/api/v1"),
   ["POST", "/api/v1/codes/batch", handleApiCodesBatch],
+  ["POST", "/api/v1/import/otpauth", handleImportOtpAuth],
+  ["POST", "/api/v1/export/encrypted", handleExportDataEncrypted],
+  ["POST", "/api/v1/import/encrypted", handleImportDataEncrypted],
   ["POST", "/api/logout", handleLogout],
   ["POST", "/api/session/close-soon", handleCloseSoon],
   ["GET", "/api/me", handleMe],
@@ -105,6 +108,7 @@ function groupRoutes(prefix) {
   return [
     ["GET", `${prefix}/groups`, handleListGroups],
     ["POST", `${prefix}/groups`, handleCreateGroup],
+    ["PATCH", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleUpdateGroup],
     ["DELETE", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleDeleteGroup],
   ];
 }
@@ -304,6 +308,7 @@ async function handleApiCapabilities(request, env) {
       refreshTokenExpiresIn: API_REFRESH_TTL_SECONDS,
       refreshTokenRotation: true,
       turnstileRequired: hasTurnstileSecret(env),
+      turnstileSiteKey: String(env.TURNSTILE_SITE_KEY || ""),
     },
     limits: {
       extensionBatchMaxIds: EXTENSION_BATCH_MAX_IDS,
@@ -318,9 +323,13 @@ async function handleApiCapabilities(request, env) {
       refresh: "/api/v1/auth/refresh",
       logout: "/api/v1/auth/logout",
       me: "/api/v1/me",
+      changePassword: "/api/v1/me/password",
       entries: "/api/v1/entries",
       groups: "/api/v1/groups",
       codesBatch: "/api/v1/codes/batch",
+      importOtpAuth: "/api/v1/import/otpauth",
+      exportEncrypted: "/api/v1/export/encrypted",
+      importEncrypted: "/api/v1/import/encrypted",
     },
   });
 }
@@ -952,6 +961,40 @@ async function handleCreateGroup(request, env) {
   }
 }
 
+async function handleUpdateGroup(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  const id = pathResourceId(request, "groups");
+  if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
+
+  const existing = await env.DB.prepare("SELECT id, user_id, name, color FROM groups WHERE id = ?").bind(id).first();
+  if (!existing) return json({ error: "Group not found" }, 404);
+  if (auth.user.role !== "admin" && Number(existing.user_id) !== Number(auth.user.id)) {
+    return json({ error: "Forbidden" }, 403);
+  }
+
+  const body = await parseJson(request);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "Invalid JSON body" }, 400);
+  const keys = Object.keys(body);
+  if (!keys.length) return json({ error: "name or color is required" }, 400);
+  if (keys.some((key) => key !== "name" && key !== "color")) {
+    return json({ error: "Only name and color can be updated" }, 400);
+  }
+
+  const name = body.name !== undefined ? String(body.name ?? "").trim() : existing.name;
+  const color = body.color !== undefined ? String(body.color ?? "").trim() : existing.color;
+  if (!name) return json({ error: "name is required" }, 400);
+  if (name.length > GROUP_NAME_MAX_LENGTH) return json({ error: `name must be at most ${GROUP_NAME_MAX_LENGTH} characters` }, 400);
+  if (!validHexColor(color)) return json({ error: "color must be #RRGGBB" }, 400);
+
+  try {
+    await env.DB.prepare("UPDATE groups SET name = ?, color = ? WHERE id = ?").bind(name, color, id).run();
+    return json({ ok: true });
+  } catch {
+    return json({ error: "Group name already exists for this user" }, 409);
+  }
+}
+
 async function handleDeleteGroup(request, env) {
   const auth = await requireAuth(request, env);
   if (!auth.ok) return auth.response;
@@ -1030,6 +1073,13 @@ async function handleImportOtpAuth(request, env) {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
     if (!exists) return json({ error: "userId does not exist" }, 400);
   }
+  const groupId = parseOptionalPositiveId(body.groupId);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
+  if (groupId) {
+    const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
+    if (!group) return json({ error: "Group not found" }, 404);
+    if (Number(group.user_id) !== Number(userId)) return json({ error: "Forbidden" }, 403);
+  }
 
   const uris = extractOtpAuthUris(text);
   if (!uris.length) return json({ error: "No otpauth URI found in text" }, 400);
@@ -1039,6 +1089,7 @@ async function handleImportOtpAuth(request, env) {
   }
 
   let imported = 0;
+  const importedIds = [];
   const errors = [];
   for (const uri of uris) {
     const parsed = parseOtpAuthUri(uri);
@@ -1061,20 +1112,21 @@ async function handleImportOtpAuth(request, env) {
       if (!secretBytes.length) throw new Error("invalid");
       const digits = normalizeOtpDigits(data.digits);
       const period = normalizeTotpPeriod(data.period);
-      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1");
-      if (!algorithm) {
-        errors.push("Unsupported OTP algorithm");
+      const algorithm = normalizeAlgorithm(data.algorithm);
+      if (!data.algorithmSpecified || algorithm === "SHA-1") {
+        errors.push("OTPAuth URI algorithm must be SHA-256 or SHA-512");
         continue;
       }
       const otpType = data.otpType === "hotp" ? "hotp" : "totp";
       const hotpCounter = normalizeHotpCounter(data.hotpCounter);
       const secretEnc = await encryptText(secret, env);
-      await env.DB.prepare(
-        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)"
+      const result = await env.DB.prepare(
+        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)"
       )
-        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
+        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
         .run();
       imported += 1;
+      importedIds.push(normalizeDbId(result.meta?.last_row_id));
     } catch (e) {
       errors.push(String(e && e.message ? e.message : "failed"));
     }
@@ -1084,6 +1136,7 @@ async function handleImportOtpAuth(request, env) {
     ok: true,
     found: uris.length,
     imported,
+    importedIds,
     failed: uris.length - imported,
     errors: errors.slice(0, 5),
   });
@@ -2233,11 +2286,12 @@ function parseOtpAuthUri(uri) {
     const digits = Number(url.searchParams.get("digits") || 6);
     const period = Number(url.searchParams.get("period") || 30);
     const hotpCounter = Number(url.searchParams.get("counter") || 0);
-    const algorithm = normalizeAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
+    const algorithmParam = url.searchParams.get("algorithm");
+    const algorithm = normalizeAlgorithm(algorithmParam || "SHA-1");
     if (!algorithm) return { ok: false, error: "otpauth URI algorithm must be SHA-1, SHA-256, or SHA-512" };
     return {
       ok: true,
-      data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, otpType, hotpCounter },
+      data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, algorithmSpecified: algorithmParam !== null, otpType, hotpCounter },
     };
   } catch {
     return { ok: false, error: "Invalid otpauth URI" };

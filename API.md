@@ -19,7 +19,8 @@ Response:
     "accessTokenExpiresIn": 604800,
     "refreshTokenExpiresIn": 7776000,
     "refreshTokenRotation": true,
-    "turnstileRequired": false
+    "turnstileRequired": false,
+    "turnstileSiteKey": ""
   },
   "limits": {
     "extensionBatchMaxIds": 100
@@ -33,12 +34,18 @@ Response:
     "refresh": "/api/v1/auth/refresh",
     "logout": "/api/v1/auth/logout",
     "me": "/api/v1/me",
+    "changePassword": "/api/v1/me/password",
     "entries": "/api/v1/entries",
     "groups": "/api/v1/groups",
-    "codesBatch": "/api/v1/codes/batch"
+    "codesBatch": "/api/v1/codes/batch",
+    "importOtpAuth": "/api/v1/import/otpauth",
+    "exportEncrypted": "/api/v1/export/encrypted",
+    "importEncrypted": "/api/v1/import/encrypted"
   }
 }
 ```
+
+`auth.turnstileSiteKey` is sourced from `TURNSTILE_SITE_KEY`; it is an empty string when Turnstile is not configured.
 
 ### `POST /api/v1/auth/login`
 
@@ -99,6 +106,7 @@ Requires `Authorization: Bearer <accessToken>`.
 All routes below require `Authorization: Bearer <accessToken>`.
 
 - `GET /api/v1/me`
+- `PATCH /api/v1/me/password`
 - `GET /api/v1/entries`
 - `POST /api/v1/entries`
 - `PATCH /api/v1/entries/:id`
@@ -108,8 +116,23 @@ All routes below require `Authorization: Bearer <accessToken>`.
 - `DELETE /api/v1/entries/:id`
 - `GET /api/v1/groups`
 - `POST /api/v1/groups`
+- `PATCH /api/v1/groups/:id`
 - `DELETE /api/v1/groups/:id`
 - `POST /api/v1/codes/batch`
+- `POST /api/v1/import/otpauth`
+- `POST /api/v1/export/encrypted`
+- `POST /api/v1/import/encrypted`
+
+`PATCH /api/v1/groups/:id` accepts `name` and/or `color` only:
+
+```json
+{
+  "name": "Work",
+  "color": "#0f766e"
+}
+```
+
+`name` is trimmed, must be non-empty, and must be at most 60 characters. `color` must be `#RRGGBB`. Non-admin users can update only their own groups; admins can update any group. Duplicate group names for the same user return `409`.
 
 Batch code request:
 
@@ -154,7 +177,32 @@ Response:
 
 Encrypted export is the default safe export path:
 
+- `POST /api/v1/export/encrypted`
 - `POST /api/export/encrypted`
+
+Request:
+
+```json
+{
+  "passphrase": "Long backup passphrase"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "encrypted": {
+    "format": "worker-2fauth-encrypted-v1",
+    "kdf": "PBKDF2-SHA-256",
+    "iterations": 180000,
+    "salt": "...",
+    "iv": "...",
+    "ciphertext": "..."
+  }
+}
+```
 
 Plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password confirmation in the POST body:
 
@@ -162,6 +210,60 @@ Plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password 
 - `POST /api/export/otpauth` with `{ "confirmPassword": "<current password>" }`
 
 When the flag is disabled, both endpoints return `403`.
+
+## Import
+
+OTPAuth import:
+
+- `POST /api/v1/import/otpauth`
+- `POST /api/import/otpauth`
+
+Request:
+
+```json
+{
+  "text": "otpauth://totp/Example:alice?secret=...&algorithm=SHA256",
+  "groupId": 1
+}
+```
+
+`groupId` is optional and must belong to the target user. Missing groups return `404`; groups owned by a different target user return `403`.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "found": 1,
+  "imported": 1,
+  "importedIds": [42],
+  "failed": 0,
+  "errors": []
+}
+```
+
+Imported OTPAuth URIs must explicitly declare `SHA-256` or `SHA-512`. URIs with no algorithm or `SHA-1` are rejected per item and counted in `failed`; existing stored SHA-1 entries remain readable for compatibility.
+
+Encrypted import:
+
+- `POST /api/v1/import/encrypted`
+- `POST /api/import/encrypted`
+
+Request:
+
+```json
+{
+  "passphrase": "Long backup passphrase",
+  "encrypted": {
+    "format": "worker-2fauth-encrypted-v1",
+    "kdf": "PBKDF2-SHA-256",
+    "iterations": 180000,
+    "salt": "...",
+    "iv": "...",
+    "ciphertext": "..."
+  }
+}
+```
 
 ## Browser Extension CORS
 
@@ -176,4 +278,4 @@ Wildcard origins are ignored when credentialed CORS is enabled.
 
 ## Legacy Routes
 
-The existing `/api/mobile/*`, `/api/extension/*`, and Web UI cookie routes remain available for compatibility.
+The existing `/api/mobile/*`, `/api/extension/*`, and Web UI cookie routes remain available for compatibility. Legacy Web API routes such as `/api/import/otpauth`, `/api/export/encrypted`, `/api/import/encrypted`, and `/api/groups/:id` remain available alongside the `/api/v1` contract.
