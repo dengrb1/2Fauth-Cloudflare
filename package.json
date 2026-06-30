@@ -11,6 +11,6 @@
     "d1:migrate:remote": "wrangler d1 migrations apply worker-2fauth-db --remote"
   },
   "devDependencies": {
-    "wrangler": "^4.26.0"
+    "wrangler": "^4.105.0"
   }
 }

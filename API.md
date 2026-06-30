@@ -4,6 +4,18 @@ This Worker keeps the existing Web UI routes and exposes stable `/api/v1` bearer
 
 ## Client Authentication
 
+### `POST /api/bootstrap`
+
+Creates the first admin account only when the database has no users.
+
+Required header:
+
+```http
+X-Bootstrap-Token: <BOOTSTRAP_TOKEN>
+```
+
+`BOOTSTRAP_TOKEN` must be configured with `wrangler secret put BOOTSTRAP_TOKEN`. If the token is missing or incorrect, an empty deployment will not initialize.
+
 ### `GET /api/v1/capabilities`
 
 Returns runtime API metadata for Android apps and browser extensions before login.
@@ -204,7 +216,7 @@ Response:
 }
 ```
 
-Plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password confirmation in the POST body:
+Plaintext export is disabled by default. The plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password confirmation in the POST body:
 
 - `POST /api/export` with `{ "confirmPassword": "<current password>" }`
 - `POST /api/export/otpauth` with `{ "confirmPassword": "<current password>" }`
@@ -264,6 +276,16 @@ Request:
   }
 }
 ```
+
+Encrypted import is separately rate limited. Defaults are `ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE=5` and `ENCRYPTED_IMPORT_LOCK_MINUTES=15`.
+
+Plain JSON backup import skips entries that do not explicitly declare `SHA-256` or `SHA-512`. Entries with missing `algorithm` or `SHA-1` are not imported.
+
+## Web Cookie Writes
+
+Cookie-authenticated Web UI write requests (`POST`, `PATCH`, and `DELETE`) must be same-origin JSON requests. Requests carrying `__Host-session` must send `Origin` equal to the Worker origin, must not send `Sec-Fetch-Site: cross-site`, and must use `Content-Type: application/json`.
+
+Bearer-only API requests do not require these cookie write checks.
 
 ## Browser Extension CORS
 
