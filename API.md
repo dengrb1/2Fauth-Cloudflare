@@ -4,6 +4,8 @@ This Worker keeps the existing Web UI routes and exposes stable `/api/v1` bearer
 
 ## Client Authentication
 
+Requests must use exactly one authentication mechanism. Do not send the Web UI `__Host-session` cookie together with an `Authorization: Bearer ...` header; mixed authentication requests are rejected.
+
 ### `POST /api/bootstrap`
 
 Creates the first admin account only when the database has no users.
@@ -71,7 +73,7 @@ Request:
 }
 ```
 
-Passwords created through bootstrap or user management must be at least 12 characters and include uppercase, lowercase, number, and symbol.
+Passwords created through bootstrap or user management must be 12 to 256 characters and include uppercase, lowercase, number, and symbol.
 
 For browser extensions, use `"clientType": "browser_extension"` and optionally include:
 
@@ -279,24 +281,28 @@ Request:
 
 Encrypted import is separately rate limited. Defaults are `ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE=5` and `ENCRYPTED_IMPORT_LOCK_MINUTES=15`.
 
+Encrypted backup passphrases must be 12 to 256 characters.
+
+Bootstrap token failures are separately rate limited. Defaults are `BOOTSTRAP_MAX_REQUESTS_PER_MINUTE=5` and `BOOTSTRAP_LOCK_MINUTES=15`.
+
 Plain JSON backup import skips entries that do not explicitly declare `SHA-256` or `SHA-512`. Entries with missing `algorithm` or `SHA-1` are not imported.
 
 ## Web Cookie Writes
 
 Cookie-authenticated Web UI write requests (`POST`, `PATCH`, and `DELETE`) must be same-origin JSON requests. Requests carrying `__Host-session` must send `Origin` equal to the Worker origin, must not send `Sec-Fetch-Site: cross-site`, and must use `Content-Type: application/json`.
 
-Bearer-only API requests do not require these cookie write checks.
+Bearer-only API requests do not require these cookie write checks. Requests carrying both the Web session cookie and a Bearer token are rejected before route handling.
 
 ## Browser Extension CORS
 
-Set `CORS_ALLOWED_ORIGINS` as a comma-separated list of exact extension origins, for example:
+Set `CORS_ALLOWED_ORIGINS` as a comma-separated list of exact extension or HTTPS origins, for example:
 
 ```text
-chrome-extension://<extension-id>,moz-extension://<extension-id>
+chrome-extension://<extension-id>,moz-extension://<extension-id>,https://app.example.com
 ```
 
 The Worker does not allow cross-origin API reads by default.
-Wildcard origins are ignored when credentialed CORS is enabled.
+Wildcard origins and non-local `http://` origins are ignored. Use `http://localhost:<port>` only for local development.
 
 ## Legacy Routes
 

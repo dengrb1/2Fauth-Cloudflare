@@ -131,6 +131,7 @@ function webAppDataDb(state = {}) {
 
 function loginRiskDb(state = {}) {
   return {
+    state,
     prepare(sql) {
       const statement = {
         bind(...args) {
@@ -313,6 +314,7 @@ function adminSessionDb(handler) {
 }
 
 function bootstrapDb(state = {}) {
+  state.riskRows = state.riskRows || new Map();
   return {
     state,
     prepare(sql) {
@@ -330,6 +332,7 @@ function bootstrapDb(state = {}) {
             if (state.initialized || (state.userChecks > 1 && state.concurrentInitialized)) return { id: 1 };
             return null;
           }
+          if (sql.includes("FROM login_risk_control")) return state.riskRows.get(statement.args[0]) || null;
           if (sql.includes("INSERT INTO users") && sql.includes("RETURNING id")) {
             state.atomicInsertAttempted = true;
             return state.insertReturnsNull ? null : { id: 1 };
@@ -340,6 +343,18 @@ function bootstrapDb(state = {}) {
         async run() {
           state.runs = state.runs || [];
           state.runs.push(sql);
+          if (sql.includes("login_risk_control")) {
+            const [key, username, ip, windowStart, requestCount, lockUntil, updatedAt] = statement.args;
+            state.riskRows.set(key, {
+              key,
+              username,
+              ip,
+              window_start: windowStart,
+              request_count: requestCount,
+              lock_until: lockUntil,
+              updated_at: updatedAt,
+            });
+          }
           if (sql.includes("INSERT INTO sessions")) return { meta: { changes: 1, last_row_id: 10 } };
           return { meta: { changes: 1 } };
         },
@@ -494,6 +509,37 @@ test("rejects unconfigured extension origin preflight", async () => {
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), null);
 });
 
+test("CORS allowlist rejects insecure non-local HTTP origins", async () => {
+  const insecureResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/me", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "http://evil.example",
+        "Access-Control-Request-Method": "GET",
+      },
+    }),
+    { ...envWithDb(emptyDb()), CORS_ALLOWED_ORIGINS: "http://evil.example" },
+    ctx()
+  );
+
+  const localhostResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/me", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "http://localhost:8787",
+        "Access-Control-Request-Method": "GET",
+      },
+    }),
+    { ...envWithDb(emptyDb()), CORS_ALLOWED_ORIGINS: "http://localhost:8787" },
+    ctx()
+  );
+
+  assert.equal(insecureResponse.status, 403);
+  assert.equal(insecureResponse.headers.get("Access-Control-Allow-Origin"), null);
+  assert.equal(localhostResponse.status, 204);
+  assert.equal(localhostResponse.headers.get("Access-Control-Allow-Origin"), "http://localhost:8787");
+});
+
 test("invalid JSON body returns 400 instead of falling through", async () => {
   const request = new Request("https://example.com/api/v1/auth/login", {
     method: "POST",
@@ -547,6 +593,22 @@ test("TURNSTILE_KEY also enforces login verification", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(body.error, "Turnstile verification failed");
+});
+
+test("login rejects oversized passwords before user lookup", async () => {
+  const db = loginRiskDb();
+  const request = new Request("https://example.com/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: `Aa1!${"x".repeat(300)}` }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(body.error, "Invalid credentials");
+  assert.equal((db.state.binds || []).some((bind) => bind.sql.includes("FROM users WHERE username = ?")), false);
 });
 
 test("web login remains compatible with pre-api-session D1 schema", async () => {
@@ -726,6 +788,41 @@ test("cookie-authenticated writes require same-origin JSON requests", async () =
   assert.equal(crossSiteBody.error, "Cross-site requests are not allowed");
   assert.equal(nonJsonResponse.status, 415);
   assert.equal(nonJsonBody.error, "Content-Type must be application/json");
+});
+
+test("requests cannot mix Cookie sessions and Bearer authorization", async () => {
+  const writeResponse = await worker.fetch(
+    new Request("https://example.com/api/groups", {
+      method: "POST",
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Authorization: "Bearer bogus",
+        Origin: "https://evil.example",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "evil" }),
+    }),
+    envWithDb(emptyDb()),
+    ctx()
+  );
+  const writeBody = await writeResponse.json();
+
+  const readResponse = await worker.fetch(
+    new Request("https://example.com/api/me", {
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Authorization: "Bearer bogus",
+      },
+    }),
+    envWithDb(emptyDb()),
+    ctx()
+  );
+  const readBody = await readResponse.json();
+
+  assert.equal(writeResponse.status, 400);
+  assert.equal(writeBody.error, "Do not send both Cookie session and Authorization bearer token");
+  assert.equal(readResponse.status, 400);
+  assert.equal(readBody.error, "Do not send both Cookie session and Authorization bearer token");
 });
 
 test("malformed cookies are skipped without failing the request", async () => {
@@ -965,6 +1062,95 @@ test("encrypted import rejects excessive PBKDF2 iterations", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(body.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
+});
+
+test("encrypted import rejects unsupported KDF and malformed field sizes", async () => {
+  const unsupportedKdfDb = adminSessionDb({});
+  const shortIvDb = adminSessionDb({});
+  const headers = {
+    Authorization: "Bearer access-token",
+    "Content-Type": "application/json",
+  };
+
+  const unsupportedKdfResponse = await worker.fetch(
+    new Request("https://example.com/api/import/encrypted", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        passphrase: "correct horse",
+        encrypted: {
+          format: "worker-2fauth-encrypted-v1",
+          kdf: "PBKDF2-SHA-1",
+          iterations: 180_000,
+          salt: "AQIDBAUGBwgJCgsMDQ4PEA==",
+          iv: "AQIDBAUGBwgJCgsM",
+          ciphertext: "AQIDBAUGBwgJCgsMDQ4PEA==",
+        },
+      }),
+    }),
+    envWithDb(unsupportedKdfDb),
+    ctx()
+  );
+  const unsupportedKdfBody = await unsupportedKdfResponse.json();
+
+  const shortIvResponse = await worker.fetch(
+    new Request("https://example.com/api/import/encrypted", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        passphrase: "correct horse",
+        encrypted: {
+          format: "worker-2fauth-encrypted-v1",
+          kdf: "PBKDF2-SHA-256",
+          iterations: 180_000,
+          salt: "AQIDBAUGBwgJCgsMDQ4PEA==",
+          iv: "AQID",
+          ciphertext: "AQIDBAUGBwgJCgsMDQ4PEA==",
+        },
+      }),
+    }),
+    envWithDb(shortIvDb),
+    ctx()
+  );
+  const shortIvBody = await shortIvResponse.json();
+
+  assert.equal(unsupportedKdfResponse.status, 400);
+  assert.equal(unsupportedKdfBody.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
+  assert.equal(shortIvResponse.status, 400);
+  assert.equal(shortIvBody.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
+});
+
+test("encrypted backup passphrases have a maximum length", async () => {
+  const exportDb = adminSessionDb({});
+  const importDb = adminSessionDb({});
+  const longPassphrase = "A".repeat(257);
+
+  const exportResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/export/encrypted", {
+      method: "POST",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: longPassphrase }),
+    }),
+    envWithDb(exportDb),
+    ctx()
+  );
+  const exportBody = await exportResponse.json();
+
+  const importResponse = await worker.fetch(
+    new Request("https://example.com/api/v1/import/encrypted", {
+      method: "POST",
+      headers: { Authorization: "Bearer access-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: longPassphrase, encrypted: {} }),
+    }),
+    envWithDb(importDb),
+    ctx()
+  );
+  const importBody = await importResponse.json();
+
+  assert.equal(exportResponse.status, 400);
+  assert.equal(exportBody.error, "passphrase must be at most 256 chars");
+  assert.equal(importResponse.status, 400);
+  assert.equal(importBody.error, "passphrase must be at most 256 chars");
 });
 
 test("encrypted import has a dedicated rate limit", async () => {
@@ -1579,6 +1765,34 @@ test("bootstrap requires the configured bootstrap token", async () => {
   assert.equal(wrongTokenDb.state.atomicInsertAttempted, undefined);
 });
 
+test("bootstrap token failures are rate limited", async () => {
+  const db = bootstrapDb();
+  const env = {
+    ...envWithDb(db),
+    BOOTSTRAP_TOKEN: "setup-token",
+    BOOTSTRAP_MAX_REQUESTS_PER_MINUTE: "2",
+    BOOTSTRAP_LOCK_MINUTES: "15",
+  };
+  const makeRequest = () =>
+    new Request("https://example.com/api/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Bootstrap-Token": "wrong" },
+      body: JSON.stringify({ username: "admin", password: "Valid-Pass123" }),
+    });
+
+  const firstResponse = await worker.fetch(makeRequest(), env, ctx());
+  const firstBody = await firstResponse.json();
+  const secondResponse = await worker.fetch(makeRequest(), env, ctx());
+  const secondBody = await secondResponse.json();
+
+  assert.equal(firstResponse.status, 403);
+  assert.equal(firstBody.error, "Invalid bootstrap token");
+  assert.equal(secondResponse.status, 429);
+  assert.equal(secondBody.error, "Too many bootstrap attempts. Temporarily locked.");
+  assert.equal(secondResponse.headers.get("Retry-After") !== null, true);
+  assert.equal(db.state.atomicInsertAttempted, undefined);
+});
+
 test("bootstrap fails closed when BOOTSTRAP_TOKEN is not configured", async () => {
   const db = bootstrapDb();
   const response = await worker.fetch(
@@ -1642,9 +1856,11 @@ test("bootstrap rejects weak passwords before hashing", async () => {
         },
         async first() {
           if (sql.includes("SELECT id FROM users LIMIT 1")) return null;
+          if (sql.includes("FROM login_risk_control")) return null;
           throw new Error(`Unexpected first() query: ${sql}`);
         },
         async run() {
+          if (sql.includes("login_risk_control")) return { meta: { changes: 1 } };
           throw new Error(`Unexpected run() query: ${sql}`);
         },
       };

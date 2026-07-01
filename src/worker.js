@@ -10,16 +10,24 @@ const PBKDF2_ITERATIONS = 100_000;
 const MIN_PASSWORD_PBKDF2_ITERATIONS = 10_000;
 const MAX_PASSWORD_PBKDF2_ITERATIONS = 1_000_000;
 const PBKDF2_HASH = "SHA-256";
-const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase, number, and symbol";
+const PASSWORD_POLICY_DESCRIPTION = "12 to 256 chars with uppercase, lowercase, number, and symbol";
+const PASSWORD_MAX_LENGTH = 256;
 const PASSPHRASE_PBKDF2_ITERATIONS = 180_000;
 const MAX_PASSPHRASE_PBKDF2_ITERATIONS = 300_000;
 const ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH = 12;
+const ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH = 256;
+const ENCRYPTED_BACKUP_SALT_BYTES = 16;
+const ENCRYPTED_BACKUP_IV_BYTES = 12;
+const ENCRYPTED_BACKUP_MIN_CIPHERTEXT_BYTES = 16;
+const ENCRYPTED_BACKUP_MAX_CIPHERTEXT_BYTES = 1_048_576;
 const DEFAULT_JSON_BODY_MAX_BYTES = 1_048_576;
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
 const DEFAULT_ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE = 5;
 const DEFAULT_ENCRYPTED_IMPORT_LOCK_MINUTES = 15;
+const DEFAULT_BOOTSTRAP_MAX_REQUESTS_PER_MINUTE = 5;
+const DEFAULT_BOOTSTRAP_LOCK_MINUTES = 15;
 const DEFAULT_TOTP_VERIFY_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_TOTP_VERIFY_LOCK_MINUTES = 5;
 const DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE = 5;
@@ -154,6 +162,8 @@ export default {
       const route = findApiRoute(method, path);
       if (route) {
         scheduleBackgroundMaintenance(ctx, env, path);
+        const authMixViolation = validateAuthMethodConsistency(request);
+        if (authMixViolation) return withCors(request, authMixViolation, env);
         const cookieWriteViolation = validateCookieWriteRequest(request);
         if (cookieWriteViolation) return withCors(request, cookieWriteViolation, env);
         const encryptedImportLimited = await applyEncryptedImportRateLimit(request, env);
@@ -206,14 +216,16 @@ async function handleStatus(request, env) {
 }
 
 async function handleBootstrap(request, env) {
-  const body = await parseJson(request);
-  const username = normalizeUsername(body.username);
-  const password = String(body.password || "");
   const initialized = await hasAnyUser(env);
   if (initialized) return json({ error: "Already initialized" }, 400);
+  const bootstrapLimited = await applyBootstrapRateLimit(request, env);
+  if (bootstrapLimited) return bootstrapLimited;
   const bootstrapTokenCheck = validateBootstrapToken(request, env);
   if (!bootstrapTokenCheck.ok) return json({ error: bootstrapTokenCheck.error }, 403);
 
+  const body = await parseJson(request);
+  const username = normalizeUsername(body.username);
+  const password = String(body.password || "");
   if (!username || !validPassword(password)) {
     // F-04: vague error 鈥?do not disclose password policy details.
     return json({ error: "Invalid username or password" }, 400);
@@ -256,6 +268,7 @@ async function handleLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
     const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
@@ -375,6 +388,7 @@ async function loginForApiClient(request, env, clientType) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
     const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
@@ -443,6 +457,7 @@ async function handleExtensionLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
 
   // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
   const turnstileToken = String(body.turnstileToken || "");
@@ -1300,6 +1315,9 @@ async function handleExportDataEncrypted(request, env) {
   if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) {
     return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
   }
+  if (passphrase.length > ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH) {
+    return json({ error: `passphrase must be at most ${ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH} chars` }, 400);
+  }
 
   const plainData = await getExportPayload(auth, env);
   const encrypted = await encryptWithPassphrase(plainData, passphrase);
@@ -1314,6 +1332,7 @@ async function handleImportDataEncrypted(request, env) {
   const passphrase = String(body.passphrase || "");
   const encrypted = body.encrypted;
   if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
+  if (passphrase.length > ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH) return json({ error: `passphrase must be at most ${ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH} chars` }, 400);
   if (!encrypted || typeof encrypted !== "object") return json({ error: "encrypted payload is required" }, 400);
 
   let data;
@@ -1776,10 +1795,15 @@ async function applyHotpConsumeRateLimit(request, env, entryId) {
   return null;
 }
 
+function validateAuthMethodConsistency(request) {
+  if (!readBearerToken(request)) return null;
+  if (!readCookie(request, SESSION_COOKIE)) return null;
+  return json({ error: "Do not send both Cookie session and Authorization bearer token" }, 400);
+}
+
 function validateCookieWriteRequest(request) {
   const method = request.method.toUpperCase();
   if (!COOKIE_WRITE_METHODS.has(method)) return null;
-  if (readBearerToken(request)) return null;
   if (!readCookie(request, SESSION_COOKIE)) return null;
 
   const url = new URL(request.url);
@@ -1793,6 +1817,43 @@ function validateCookieWriteRequest(request) {
   const contentType = String(request.headers.get("content-type") || "").toLowerCase().split(";")[0].trim();
   if (contentType !== "application/json") return json({ error: "Content-Type must be application/json" }, 415);
 
+  return null;
+}
+
+async function applyBootstrapRateLimit(request, env) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const maxRequests = normalizeInteger(
+    env.BOOTSTRAP_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_BOOTSTRAP_MAX_REQUESTS_PER_MINUTE,
+    1,
+    60
+  );
+  const lockMinutes = normalizeInteger(
+    env.BOOTSTRAP_LOCK_MINUTES,
+    DEFAULT_BOOTSTRAP_LOCK_MINUTES,
+    1,
+    1440
+  );
+  const ip = clientIp(request);
+  const subjectIp = ip === "unknown" ? "unknown-global" : ip;
+  const rateKey = await sha256Base64(`bootstrap|ip|${subjectIp}`);
+  const policy = { maxRequestsPerMinute: maxRequests, lockMinutes };
+
+  let result;
+  try {
+    result = await updateLoginRiskBucket(env, rateKey, "__bootstrap__", ip, nowSec, policy);
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return null;
+    return json({ error: "Bootstrap rate limiter unavailable" }, 503);
+  }
+
+  if (result.blocked) {
+    return json(
+      { error: "Too many bootstrap attempts. Temporarily locked.", retryAfterSeconds: result.retryAfterSeconds },
+      429,
+      { "Retry-After": String(result.retryAfterSeconds) }
+    );
+  }
   return null;
 }
 
@@ -1980,6 +2041,7 @@ async function getCurrentUser(request, env) {
         apiClientType: String(row.client_type || ANDROID_CLIENT_TYPE),
       };
     }
+    if (readCookie(request, SESSION_COOKIE)) return null;
   }
 
   const token = readCookie(request, SESSION_COOKIE);
@@ -2346,13 +2408,26 @@ async function encryptWithPassphrase(data, passphrase) {
 
 async function decryptWithPassphrase(payload, passphrase) {
   if (payload.format !== "worker-2fauth-encrypted-v1") throw new Error("unsupported format");
+  if (payload.kdf !== "PBKDF2-SHA-256") throw new Error("unsupported kdf");
   const iterations = normalizePassphraseIterations(payload.iterations);
-  const salt = b64ToBytes(String(payload.salt || ""));
-  const iv = b64ToBytes(String(payload.iv || ""));
-  const ciphertext = b64ToBytes(String(payload.ciphertext || ""));
+  const salt = decodeBackupB64Field(payload.salt, ENCRYPTED_BACKUP_SALT_BYTES);
+  const iv = decodeBackupB64Field(payload.iv, ENCRYPTED_BACKUP_IV_BYTES);
+  const ciphertext = decodeBackupB64Field(
+    payload.ciphertext,
+    null,
+    ENCRYPTED_BACKUP_MIN_CIPHERTEXT_BYTES,
+    ENCRYPTED_BACKUP_MAX_CIPHERTEXT_BYTES
+  );
   const key = await derivePassphraseKey(passphrase, salt, iterations);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
   return JSON.parse(dec(new Uint8Array(plain)));
+}
+
+function decodeBackupB64Field(value, exactLength, minLength = exactLength, maxLength = exactLength) {
+  const bytes = b64ToBytes(String(value || ""));
+  if (minLength !== null && bytes.length < minLength) throw new Error("invalid encrypted backup field length");
+  if (maxLength !== null && bytes.length > maxLength) throw new Error("invalid encrypted backup field length");
+  return bytes;
 }
 
 async function derivePassphraseKey(passphrase, salt, iterations = PASSPHRASE_PBKDF2_ITERATIONS) {
@@ -2552,12 +2627,17 @@ function normalizeUsername(v) {
 function validPassword(p) {
   return (
     typeof p === "string" &&
+    validPasswordLength(p) &&
     p.length >= 12 &&
     /[a-z]/.test(p) &&
     /[A-Z]/.test(p) &&
     /[0-9]/.test(p) &&
     /[^A-Za-z0-9]/.test(p)
   );
+}
+
+function validPasswordLength(p) {
+  return typeof p === "string" && p.length <= PASSWORD_MAX_LENGTH;
 }
 
 function validHexColor(v) {
@@ -2781,7 +2861,8 @@ function isSafeCorsOrigin(origin) {
   // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
   try {
     const url = new URL(origin);
-    if (["https:", "http:"].includes(url.protocol)) return origin === url.origin;
+    if (url.protocol === "https:") return origin === url.origin;
+    if (url.protocol === "http:") return origin === url.origin && isLocalHttpOrigin(url);
     if (EXTENSION_CORS_PROTOCOLS.has(url.protocol)) {
       const normalized = `${url.protocol}//${url.host}`;
       return origin === normalized && !!url.host;
@@ -2790,6 +2871,10 @@ function isSafeCorsOrigin(origin) {
   } catch {
     return false;
   }
+}
+
+function isLocalHttpOrigin(url) {
+  return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
 }
 
 function appendVary(current, value) {
@@ -3211,7 +3296,7 @@ function appHtml(env, nonce) {
         encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
         plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
         plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
-        setBackupPassphrase: "设置备份口令（至少10位）",
+        setBackupPassphrase: "设置备份口令（12 到 256 位）",
         copyExportJson: "复制导出 JSON",
         copyEncryptedExportJson: "复制加密导出 JSON",
         importedDone: "导入完成",
@@ -3284,7 +3369,7 @@ function appHtml(env, nonce) {
         encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
         plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
         plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
-        setBackupPassphrase: "Set backup passphrase (>=10 chars):",
+        setBackupPassphrase: "Set backup passphrase (12-256 chars):",
         copyExportJson: "Copy export JSON:",
         copyEncryptedExportJson: "Copy encrypted export JSON:",
         importedDone: "Import completed",
