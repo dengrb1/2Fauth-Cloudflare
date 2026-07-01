@@ -46,6 +46,7 @@ Set runtime secrets:
 ```bash
 npx wrangler secret put ENCRYPTION_KEY
 npx wrangler secret put SESSION_PEPPER
+npx wrangler secret put BOOTSTRAP_TOKEN
 ```
 
 `ENCRYPTION_KEY` must be a 32-byte base64 value, for example:
@@ -58,9 +59,13 @@ Optional settings:
 
 - `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login.
 - `TURNSTILE_SITE_KEY`: renders Turnstile in the Web UI.
-- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions, for example `chrome-extension://<id>,moz-extension://<id>`. Wildcards are ignored.
-- `ALLOW_PLAINTEXT_EXPORT`: set to `true` to enable `/api/export` and `/api/export/otpauth`; encrypted export stays available either way. This repo enables it in `wrangler.toml` by default.
+- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions or HTTPS clients, for example `chrome-extension://<id>,moz-extension://<id>,https://app.example.com`. Wildcards and non-local `http://` origins are ignored; `http://localhost` is allowed for local development.
+- `ALLOW_PLAINTEXT_EXPORT`: defaults to disabled. Temporarily set to `true` only when you need `/api/export` or `/api/export/otpauth`; encrypted export stays available either way.
 - `API_RATE_MAX_REQUESTS_PER_MINUTE`: optional per-session/IP API rate limit, default `120`.
+- `ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE`: optional encrypted import rate limit, default `5`.
+- `ENCRYPTED_IMPORT_LOCK_MINUTES`: optional encrypted import lock duration after the limit is exceeded, default `15`.
+- `BOOTSTRAP_MAX_REQUESTS_PER_MINUTE`: optional bootstrap token attempt limit, default `5`.
+- `BOOTSTRAP_LOCK_MINUTES`: optional bootstrap lock duration after the limit is exceeded, default `15`.
 - `DEBUG_ERRORS`: set to `true` only outside production to include internal error details in JSON error responses.
 
 ## Database Migrations
@@ -85,7 +90,7 @@ The current migration chain includes API session storage and indexes for refresh
 npm run dev
 ```
 
-Then open the local Worker URL. On first use, bootstrap the first admin account from the Web UI.
+Then open the local Worker URL. On first use, bootstrap the first admin account from the Web UI with the configured `BOOTSTRAP_TOKEN`.
 
 ## Verification
 
@@ -116,7 +121,9 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 
 - Never commit real secrets or production `wrangler.toml` values.
 - Treat export payloads as sensitive. Plaintext export should be enabled only when you explicitly need it; prefer encrypted export when sharing backups.
+- Keep `BOOTSTRAP_TOKEN` configured until the first admin account has been created. An empty deployment cannot initialize without it.
+- Do not send Web UI cookies and API bearer tokens in the same request. Mixed authentication is rejected to keep CSRF checks and rate-limit buckets unambiguous.
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.
 - Configure `CORS_ALLOWED_ORIGINS` with exact browser-extension origins, not wildcards.
-- New passwords must be at least 12 characters and include uppercase, lowercase, number, and symbol.
+- New passwords must be 12 to 256 characters and include uppercase, lowercase, number, and symbol.
 - New OTP entries accept SHA-256 or SHA-512 algorithms only.
