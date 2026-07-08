@@ -27,6 +27,8 @@ const BACKGROUND_MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
 const API_SESSION_LAST_USED_UPDATE_INTERVAL_SECONDS = 15 * 60;
 const ENTRY_LABEL_MAX_LENGTH = 200;
 const ENTRY_ISSUER_MAX_LENGTH = 100;
+const OTP_ALGORITHM_DEFAULT = "SHA-1";
+const OTP_ALGORITHM_ERROR = "algorithm must be SHA-1, SHA-256, or SHA-512";
 const GROUP_NAME_MAX_LENGTH = 60;
 const DEFAULT_API_RATE_LOCK_MINUTES = 15;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
@@ -685,44 +687,21 @@ async function handleCreateEntry(request, env) {
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
-  let payload = { ...body };
-  if (payload.otpauthUri && !payload.secret) {
-    const parsed = parseOtpAuthUri(String(payload.otpauthUri));
-    if (!parsed.ok) return json({ error: parsed.error }, 400);
-    payload = { ...payload, ...parsed.data };
-  }
+  const normalized = normalizeOtpEntryInput(body, { strictParameters: true });
+  if (!normalized.ok) return json({ error: normalized.error }, 400);
+  const payload = normalized.data;
 
-  const label = String(payload.label || "").trim();
-  const issuer = payload.issuer ? String(payload.issuer).trim() : "";
+  const { label, issuer, secret, digits, period, algorithm, otpType, hotpCounter } = payload;
   if (label.length > ENTRY_LABEL_MAX_LENGTH) return json({ error: `label must be at most ${ENTRY_LABEL_MAX_LENGTH} characters` }, 400);
   if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) return json({ error: `issuer must be at most ${ENTRY_ISSUER_MAX_LENGTH} characters` }, 400);
-  const secret = String(payload.secret || "").trim();
-  const digits = Number(payload.digits || 6);
-  const period = Number(payload.period || 30);
-  const algorithm = normalizeAlgorithm(payload.algorithm || "SHA-256");
-  const otpType = payload.otpType === "hotp" ? "hotp" : "totp";
-  const hotpCounter = Number(payload.hotpCounter || 0);
-  const enabled = payload.enabled === undefined ? 1 : booleanFlag(payload.enabled);
-  const groupId = parseOptionalPositiveId(payload.groupId);
-  const requestedUserId = Number(payload.userId !== undefined ? payload.userId : auth.user.id);
+  const enabled = body.enabled === undefined ? 1 : booleanFlag(body.enabled);
+  const groupId = parseOptionalPositiveId(body.groupId);
+  const requestedUserId = Number(body.userId !== undefined ? body.userId : auth.user.id);
   const userId = auth.user.role === "admin" ? requestedUserId : auth.user.id;
 
-  if (!label || !secret) return json({ error: "label and secret are required" }, 400);
   if (!Number.isInteger(userId) || userId <= 0) return json({ error: "userId must be a positive integer" }, 400);
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
-  if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
-  if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
-  if (algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
-  if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
   if (enabled === false) return json({ error: "enabled must be a boolean" }, 400);
-
-  try {
-    const bytes = base32Decode(secret);
-    if (!bytes.length) throw new Error("empty");
-  } catch {
-    return json({ error: "secret is not valid base32" }, 400);
-  }
 
   if (auth.user.role === "admin") {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
@@ -772,18 +751,17 @@ async function handleUpdateEntry(request, env) {
   if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
   if (![6, 7, 8].includes(digits)) return json({ error: "digits must be 6/7/8" }, 400);
   if (otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) return json({ error: "period must be between 15 and 120" }, 400);
-  if (!algorithm) return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
-  if (body.algorithm !== undefined && algorithm === "SHA-1") return json({ error: "algorithm must be SHA-256 or SHA-512" }, 400);
+  if (!algorithm) return json({ error: OTP_ALGORITHM_ERROR }, 400);
   if (otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) return json({ error: "hotpCounter must be >= 0" }, 400);
   if (enabled === false) return json({ error: "enabled must be a boolean" }, 400);
 
   let secretEnc = existing.secret_enc;
   if (body.secret !== undefined) {
-    const secret = String(body.secret || "").trim();
-    if (!secret) return json({ error: "secret cannot be empty" }, 400);
+    const rawSecret = String(body.secret || "").trim();
+    if (!rawSecret) return json({ error: "secret cannot be empty" }, 400);
+    let secret;
     try {
-      const bytes = base32Decode(secret);
-      if (!bytes.length) throw new Error("empty");
+      secret = canonicalizeBase32Secret(rawSecret);
     } catch {
       return json({ error: "secret is not valid base32" }, 400);
     }
@@ -1041,33 +1019,16 @@ async function handleImportOtpAuth(request, env) {
   let imported = 0;
   const errors = [];
   for (const uri of uris) {
-    const parsed = parseOtpAuthUri(uri);
-    if (!parsed.ok) {
-      errors.push(parsed.error);
+    const normalized = normalizeOtpEntryInput({ otpauthUri: uri }, { strictParameters: false, missingMessage: "Missing secret/label" });
+    if (!normalized.ok) {
+      errors.push(normalized.error);
       continue;
     }
-    const data = parsed.data;
-    const secret = String(data.secret || "").trim();
-    const label = String(data.label || "").trim();
-    if (!secret || !label) {
-      errors.push("Missing secret/label");
-      continue;
-    }
+    const data = normalized.data;
+    const { secret, label, issuer, digits, period, algorithm, otpType, hotpCounter } = data;
     if (label.length > ENTRY_LABEL_MAX_LENGTH) { errors.push("Label too long"); continue; }
-    const issuer = String(data.issuer || "").trim();
     if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) { errors.push("Issuer too long"); continue; }
     try {
-      const secretBytes = base32Decode(secret);
-      if (!secretBytes.length) throw new Error("invalid");
-      const digits = normalizeOtpDigits(data.digits);
-      const period = normalizeTotpPeriod(data.period);
-      const algorithm = normalizeAlgorithm(data.algorithm || "SHA-1");
-      if (!algorithm) {
-        errors.push("Unsupported OTP algorithm");
-        continue;
-      }
-      const otpType = data.otpType === "hotp" ? "hotp" : "totp";
-      const hotpCounter = normalizeHotpCounter(data.hotpCounter);
       const secretEnc = await encryptText(secret, env);
       await env.DB.prepare(
         "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)"
@@ -1194,21 +1155,20 @@ async function importPayload(body, auth, env) {
   }
 
   for (const e of entries) {
-    const secret = String(e.secret || "").trim();
+    let secret;
     const label = String(e.label || "").trim();
     const issuer = String(e.issuer || "").trim();
-    if (!secret || !label) continue;
+    if (!e.secret || !label) continue;
     if (label.length > ENTRY_LABEL_MAX_LENGTH) continue;
     if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) continue;
     try {
-      const secretBytes = base32Decode(secret);
-      if (!secretBytes.length) continue;
+      secret = canonicalizeBase32Secret(e.secret);
     } catch {
       continue;
     }
     const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
     const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
-    const algorithm = normalizeAlgorithm(e.algorithm || "SHA-1");
+    const algorithm = normalizeAlgorithm(e.algorithm || OTP_ALGORITHM_DEFAULT);
     if (!algorithm) continue;
     const digits = normalizeOtpDigits(e.digits);
     const period = normalizeTotpPeriod(e.period);
@@ -2244,6 +2204,76 @@ function parseOtpAuthUri(uri) {
   }
 }
 
+function normalizeOtpEntryInput(input, options = {}) {
+  const strictParameters = options.strictParameters !== false;
+  const missingMessage = options.missingMessage || "label and secret are required";
+  const payload = { ...(input || {}) };
+  const explicitSecret = String(payload.secret || "").trim();
+  const explicitUri = String(payload.otpauthUri || payload.uri || "").trim();
+  const uriFromSecret = explicitSecret ? firstOtpAuthUri(explicitSecret) : "";
+  const uri = explicitUri || uriFromSecret;
+  let data = { ...payload };
+
+  if (uri) {
+    const parsed = parseOtpAuthUri(uri);
+    if (!parsed.ok) return parsed;
+    if (explicitSecret && !uriFromSecret) {
+      let explicitCanonical;
+      let parsedCanonical;
+      try {
+        explicitCanonical = canonicalizeBase32Secret(explicitSecret);
+        parsedCanonical = canonicalizeBase32Secret(parsed.data.secret);
+      } catch {
+        return { ok: false, error: "secret is not valid base32" };
+      }
+      if (explicitCanonical !== parsedCanonical) {
+        return { ok: false, error: "secret and otpauthUri conflict" };
+      }
+    }
+    data = { ...payload, ...parsed.data, secret: parsed.data.secret };
+  }
+
+  const label = String(data.label || "").trim();
+  const issuer = String(data.issuer || "").trim();
+  const rawSecret = String(data.secret || "").trim();
+  if (!label || !rawSecret) return { ok: false, error: missingMessage };
+
+  let secret;
+  try {
+    secret = canonicalizeBase32Secret(rawSecret);
+  } catch {
+    return { ok: false, error: "secret is not valid base32" };
+  }
+
+  const algorithm = normalizeAlgorithm(data.algorithm || OTP_ALGORITHM_DEFAULT);
+  if (!algorithm) return { ok: false, error: OTP_ALGORITHM_ERROR };
+
+  const otpType = data.otpType === "hotp" ? "hotp" : "totp";
+  const digits = strictParameters ? Number(data.digits || 6) : normalizeOtpDigits(data.digits);
+  if (strictParameters && ![6, 7, 8].includes(digits)) {
+    return { ok: false, error: "digits must be 6/7/8" };
+  }
+
+  const period = strictParameters ? Number(data.period || 30) : normalizeTotpPeriod(data.period);
+  if (strictParameters && otpType === "totp" && (!Number.isFinite(period) || period < 15 || period > 120)) {
+    return { ok: false, error: "period must be between 15 and 120" };
+  }
+
+  const hotpCounter = strictParameters ? Number(data.hotpCounter || 0) : normalizeHotpCounter(data.hotpCounter);
+  if (strictParameters && otpType === "hotp" && (!Number.isInteger(hotpCounter) || hotpCounter < 0)) {
+    return { ok: false, error: "hotpCounter must be >= 0" };
+  }
+
+  return {
+    ok: true,
+    data: { ...data, label, issuer, secret, digits, period, algorithm, otpType, hotpCounter },
+  };
+}
+
+function firstOtpAuthUri(text) {
+  return extractOtpAuthUris(String(text || ""))[0] || "";
+}
+
 function extractOtpAuthUris(text) {
   // F-07: limit input length to prevent DoS via regex on large payloads.
   if (typeof text !== "string" || text.length > 65536) return [];
@@ -2312,6 +2342,13 @@ function base32Decode(input) {
     bytes.push(parseInt(bits.slice(i, i + 8), 2));
   }
   return new Uint8Array(bytes);
+}
+
+function canonicalizeBase32Secret(input) {
+  const secret = String(input || "").toUpperCase().replace(/[\s=-]/g, "");
+  const bytes = base32Decode(secret);
+  if (!bytes.length) throw new Error("empty base32");
+  return secret;
 }
 
 function normalizeAlgorithm(value) {
@@ -2886,8 +2923,8 @@ function appHtml(env, nonce) {
       </div>
 
       <div id="importPanel" class="panel stack hidden">
-        <h3 class="flush">导入备份 JSON</h3>
-        <textarea id="importText" placeholder='粘贴 /api/export 的 JSON'></textarea>
+        <h3 class="flush">导入</h3>
+        <textarea id="importText" placeholder='粘贴备份 JSON、加密备份 JSON 或 otpauth:// URI 文本'></textarea>
         <div class="row">
           <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" />
           <input id="importPassphrase" type="password" placeholder="口令（用于加密备份）" />
@@ -2904,7 +2941,7 @@ function appHtml(env, nonce) {
             <h3 class="flush">新建条目</h3>
             <input id="eLabel" placeholder="标签（如 GitHub）" />
             <input id="eIssuer" placeholder="发行方（可选）" />
-            <input id="eSecret" placeholder="Base32 密钥" />
+            <input id="eSecret" placeholder="Base32 密钥或 otpauth 文本" />
             <input id="eUri" placeholder="或 otpauth://totp/... / otpauth://hotp/..." />
             <div class="row">
               <button class="ghost" data-action="start-scan">摄像头扫码</button>
@@ -3052,6 +3089,10 @@ function appHtml(env, nonce) {
         minutes: "分钟",
         otpauthExportDone: "otpauth 文本已下载。",
         otpauthImportDone: "otpauth 导入完成",
+        otpUriDetected: "已识别 otpauth URI。",
+        otpSecretDetected: "已识别 Base32 密钥。",
+        otpInputUnsupported: "请输入 otpauth URI 或 Base32 密钥。",
+        qrInvalid: "二维码不包含 otpauth URI 或 Base32 密钥。",
         importFileLoaded: "文件内容已加载到导入框。",
         turnstileRequired: "请先完成 Cloudflare Turnstile 验证。",
       },
@@ -3125,6 +3166,10 @@ function appHtml(env, nonce) {
         minutes: "minutes",
         otpauthExportDone: "otpauth text downloaded.",
         otpauthImportDone: "otpauth import completed",
+        otpUriDetected: "otpauth URI detected.",
+        otpSecretDetected: "Base32 secret detected.",
+        otpInputUnsupported: "Enter an otpauth URI or Base32 secret.",
+        qrInvalid: "QR code does not contain an otpauth URI or Base32 secret.",
         importFileLoaded: "File content loaded into import box.",
         turnstileRequired: "Please complete Cloudflare Turnstile verification first.",
       }
@@ -3332,6 +3377,90 @@ function appHtml(env, nonce) {
     }
 
     function v(id) { return document.getElementById(id).value; }
+
+    function findOtpAuthUri(text) {
+      const match = String(text || "").match(/otpauth:\/\/[^\s"'<>]+/i);
+      return match ? match[0] : "";
+    }
+
+    function canonicalFormBase32(input) {
+      return String(input || "").toUpperCase().replace(/[\s=-]/g, "");
+    }
+
+    function isLikelyBase32Secret(input) {
+      const secret = canonicalFormBase32(input);
+      return secret.length >= 8 && /^[A-Z2-7]+$/.test(secret);
+    }
+
+    function normalizeFormAlgorithm(value) {
+      const v = String(value || "").toUpperCase();
+      if (v === "SHA1" || v === "SHA-1") return "SHA-1";
+      if (v === "SHA256" || v === "SHA-256") return "SHA-256";
+      if (v === "SHA512" || v === "SHA-512") return "SHA-512";
+      return "SHA-1";
+    }
+
+    function applyOtpUriToForm(uri) {
+      try {
+        const url = new URL(uri);
+        if (url.protocol !== "otpauth:" || !["totp", "hotp"].includes(url.hostname)) return false;
+        const secret = canonicalFormBase32(url.searchParams.get("secret") || "");
+        if (!isLikelyBase32Secret(secret)) return false;
+        const labelRaw = decodeURIComponent(url.pathname.startsWith("/") ? url.pathname.slice(1) : url.pathname);
+        let issuer = String(url.searchParams.get("issuer") || "").trim();
+        let label = labelRaw;
+        const colon = labelRaw.indexOf(":");
+        if (colon >= 0) {
+          if (!issuer) issuer = labelRaw.slice(0, colon).trim();
+          label = labelRaw.slice(colon + 1).trim();
+        }
+        document.getElementById("eUri").value = String(uri || "").trim();
+        document.getElementById("eSecret").value = "";
+        document.getElementById("eLabel").value = label || issuer || "OTP";
+        document.getElementById("eIssuer").value = issuer;
+        document.getElementById("eOtpType").value = url.hostname === "hotp" ? "hotp" : "totp";
+        document.getElementById("eAlgo").value = normalizeFormAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
+        document.getElementById("eDigits").value = String(Number(url.searchParams.get("digits") || 6) || 6);
+        document.getElementById("ePeriod").value = String(Number(url.searchParams.get("period") || 30) || 30);
+        document.getElementById("eCounter").value = String(Number(url.searchParams.get("counter") || 0) || 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function applyOtpInput(raw, messageId) {
+      const value = String(raw || "").trim();
+      if (!value) return true;
+      const uri = findOtpAuthUri(value);
+      if (uri) {
+        if (!applyOtpUriToForm(uri)) {
+          if (messageId) msg(messageId, t("otpInputUnsupported"), true);
+          return false;
+        }
+        if (messageId) msg(messageId, t("otpUriDetected"));
+        return true;
+      }
+      if (isLikelyBase32Secret(value)) {
+        document.getElementById("eSecret").value = canonicalFormBase32(value);
+        document.getElementById("eUri").value = "";
+        if (messageId) msg(messageId, t("otpSecretDetected"));
+        return true;
+      }
+      if (messageId) msg(messageId, t("otpInputUnsupported"), true);
+      return false;
+    }
+
+    function bindOtpInputRecognition(id) {
+      const el = document.getElementById(id);
+      ["paste", "change"].forEach(function(evtName) {
+        el.addEventListener(evtName, function() {
+          setTimeout(function() {
+            if (el.value) applyOtpInput(el.value, "entryMsg");
+          }, 0);
+        });
+      });
+    }
 
     async function refreshAll() {
       const data = await api("/api/app-data");
@@ -3591,20 +3720,27 @@ function appHtml(env, nonce) {
 
     async function createEntry() {
       try {
+        if (v("eUri") && !applyOtpInput(v("eUri"), "entryMsg")) return;
+        if (v("eSecret") && !applyOtpInput(v("eSecret"), "entryMsg")) return;
+        const hasUri = !!String(v("eUri") || "").trim();
+        const payload = {
+          label: v("eLabel"),
+          issuer: v("eIssuer"),
+          groupId: v("eGroup") ? Number(v("eGroup")) : null
+        };
+        if (hasUri) {
+          payload.otpauthUri = v("eUri");
+        } else {
+          payload.secret = v("eSecret");
+          payload.otpType = v("eOtpType");
+          payload.algorithm = v("eAlgo");
+          payload.digits = Number(v("eDigits") || 6);
+          payload.period = Number(v("ePeriod") || 30);
+          payload.hotpCounter = Number(v("eCounter") || 0);
+        }
         await api("/api/entries", {
           method: "POST",
-          body: JSON.stringify({
-            label: v("eLabel"),
-            issuer: v("eIssuer"),
-            secret: v("eSecret"),
-            otpauthUri: v("eUri"),
-            otpType: v("eOtpType"),
-            algorithm: v("eAlgo"),
-            digits: Number(v("eDigits") || 6),
-            period: Number(v("ePeriod") || 30),
-            hotpCounter: Number(v("eCounter") || 0),
-            groupId: v("eGroup") ? Number(v("eGroup")) : null
-          })
+          body: JSON.stringify(payload)
         });
         msg("entryMsg", t("saved"));
         ["eLabel","eIssuer","eSecret","eUri"].forEach(function(id){ document.getElementById(id).value = ""; });
@@ -3856,7 +3992,9 @@ function appHtml(env, nonce) {
       try {
         const text = String(v("importText") || "");
         const d = await api("/api/import/otpauth", { method: "POST", body: JSON.stringify({ text: text }) });
-        msg("importMsg", t("otpauthImportDone") + ": found=" + d.found + ", imported=" + d.imported + ", failed=" + d.failed);
+        let detail = t("otpauthImportDone") + ": found=" + d.found + ", imported=" + d.imported + ", failed=" + d.failed;
+        if (d.errors && d.errors.length) detail += " - " + d.errors.join("; ");
+        msg("importMsg", detail, Number(d.failed || 0) > 0);
         await refreshAll();
       } catch (e) { msg("importMsg", e.message, true); }
     }
@@ -3968,8 +4106,11 @@ function appHtml(env, nonce) {
     }
 
     function applyScannedOtpUri(raw) {
-      document.getElementById("eUri").value = String(raw || "").trim();
-      msg("scanMsg", t("qrDetected") + " " + t("qrReadyToSave"));
+      if (applyOtpInput(raw, "scanMsg")) {
+        msg("scanMsg", t("qrDetected") + " " + t("qrReadyToSave"));
+      } else {
+        msg("scanMsg", t("qrInvalid"), true);
+      }
     }
 
     async function ensureJsQrLoaded() {
@@ -4116,6 +4257,8 @@ function appHtml(env, nonce) {
       document.getElementById("groupFilter").addEventListener("change", renderEntries);
       document.getElementById("importFile").addEventListener("change", loadImportFile);
       document.getElementById("qrImageFile").addEventListener("change", scanImageFile);
+      bindOtpInputRecognition("eSecret");
+      bindOtpInputRecognition("eUri");
     }
 
     function applyDynamicStyles() {

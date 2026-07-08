@@ -132,7 +132,7 @@ Batch code response:
 
 HOTP entries are not consumed by the batch endpoint. Use `POST /api/v1/entries/:id/hotp` for HOTP so the counter can be advanced atomically.
 
-New TOTP/HOTP entries accept `SHA-256` or `SHA-512` only. `POST /api/v1/entries/:id/verify` validates a submitted TOTP code with a +/-1 time-step window:
+New TOTP/HOTP entries accept `SHA-1`, `SHA-256`, or `SHA-512` (`SHA1`, `SHA256`, and `SHA512` aliases are normalized). Missing algorithms default to `SHA-1` for otpauth compatibility. `POST /api/v1/entries/:id/verify` validates a submitted TOTP code with a +/-1 time-step window:
 
 ```json
 {

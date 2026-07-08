@@ -306,6 +306,28 @@ function adminSessionDb(handler) {
   return db;
 }
 
+function entryCaptureDb(handler = {}) {
+  return adminSessionDb({
+    first(sql, args, state) {
+      if (sql.includes("SELECT id FROM users WHERE id = ?")) return { id: args[0] };
+      return handler.first ? handler.first(sql, args, state) : null;
+    },
+    run(sql, args, state) {
+      if (sql.includes("INSERT INTO totp_entries")) {
+        state.entryInserts = state.entryInserts || [];
+        state.entryInserts.push(args);
+        return { meta: { changes: 1, last_row_id: state.entryInserts.length } };
+      }
+      if (sql.includes("UPDATE totp_entries")) {
+        state.entryUpdates = state.entryUpdates || [];
+        state.entryUpdates.push(args);
+      }
+      return handler.run ? handler.run(sql, args, state) : { meta: { changes: 1 } };
+    },
+    all: handler.all,
+  });
+}
+
 test("allows configured extension origin preflight", async () => {
   const request = new Request("https://example.com/api/v1/me", {
     method: "OPTIONS",
@@ -765,8 +787,8 @@ test("encrypted import rejects downgraded PBKDF2 iterations", async () => {
   assert.equal(body.error, "failed to decrypt payload (wrong passphrase or payload corrupted)");
 });
 
-test("creating entries rejects SHA-1 OTP algorithms", async () => {
-  const db = adminSessionDb({});
+test("creating entries accepts explicit SHA-1 OTP algorithms", async () => {
+  const db = entryCaptureDb();
   const request = new Request("https://example.com/api/v1/entries", {
     method: "POST",
     headers: {
@@ -783,12 +805,136 @@ test("creating entries rejects SHA-1 OTP algorithms", async () => {
   const response = await worker.fetch(request, envWithDb(db), ctx());
   const body = await response.json();
 
-  assert.equal(response.status, 400);
-  assert.equal(body.error, "algorithm must be SHA-256 or SHA-512");
-  assert.equal(db.state.runs.some((sql) => sql.includes("INSERT INTO totp_entries")), false);
+  assert.equal(response.status, 201);
+  assert.equal(body.ok, true);
+  assert.equal(db.state.entryInserts.length, 1);
+  assert.equal(db.state.entryInserts[0][6], "SHA-1");
 });
 
-test("updating entries rejects SHA-1 OTP algorithms", async () => {
+test("creating an entry from otpauth URI defaults omitted algorithm to SHA-1", async () => {
+  const db = entryCaptureDb();
+  const request = new Request("https://example.com/api/v1/entries", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      otpauthUri: "otpauth://totp/NVIDIA:alice%40example.com?secret=jbsw-y3dp-ehpk3pxp&issuer=NVIDIA",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(body.ok, true);
+  assert.equal(db.state.entryInserts.length, 1);
+  assert.equal(db.state.entryInserts[0][1], "alice@example.com");
+  assert.equal(db.state.entryInserts[0][2], "NVIDIA");
+  assert.equal(db.state.entryInserts[0][4], 6);
+  assert.equal(db.state.entryInserts[0][5], 30);
+  assert.equal(db.state.entryInserts[0][6], "SHA-1");
+});
+
+test("creating an entry from otpauth URI accepts algorithm=SHA1", async () => {
+  const db = entryCaptureDb();
+  const request = new Request("https://example.com/api/v1/entries", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      otpauthUri: "otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA1",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(body.ok, true);
+  assert.equal(db.state.entryInserts.length, 1);
+  assert.equal(db.state.entryInserts[0][6], "SHA-1");
+});
+
+test("creating an entry from a raw secret without algorithm defaults to SHA-1", async () => {
+  const db = entryCaptureDb();
+  const request = new Request("https://example.com/api/v1/entries", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      label: "Email",
+      secret: "jbsw y3dp-ehpk3pxp==",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(body.ok, true);
+  assert.equal(db.state.entryInserts.length, 1);
+  assert.equal(db.state.entryInserts[0][6], "SHA-1");
+});
+
+test("creating an entry rejects conflicting secret and otpauthUri inputs", async () => {
+  const db = entryCaptureDb();
+  const request = new Request("https://example.com/api/v1/entries", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      label: "Conflict",
+      secret: "JBSWY3DPEHPK3PXP",
+      otpauthUri: "otpauth://totp/Conflict?secret=AAAAAAAA",
+    }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error, "secret and otpauthUri conflict");
+  assert.equal(db.state.entryInserts || undefined, undefined);
+});
+
+test("otpauth import accepts omitted and SHA1 algorithms", async () => {
+  const db = entryCaptureDb();
+  const text = [
+    "otpauth://totp/NVIDIA:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=NVIDIA",
+    "otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA1",
+  ].join("\n");
+  const request = new Request("https://example.com/api/import/otpauth", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer access-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ text }),
+  });
+
+  const response = await worker.fetch(request, envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    { found: body.found, imported: body.imported, failed: body.failed },
+    { found: 2, imported: 2, failed: 0 }
+  );
+  assert.equal(db.state.entryInserts.length, 2);
+  assert.deepEqual(db.state.entryInserts.map((args) => args[6]), ["SHA-1", "SHA-1"]);
+});
+
+test("captured NVIDIA otpauth sample imports after sanitization", { todo: true }, () => {});
+
+test("updating entries accepts SHA-1 OTP algorithms", async () => {
   const db = adminSessionDb({
     first(sql) {
       if (sql.includes("SELECT * FROM totp_entries WHERE id = ?")) {
@@ -808,6 +954,13 @@ test("updating entries rejects SHA-1 OTP algorithms", async () => {
       }
       return null;
     },
+    run(sql, args, state) {
+      if (sql.includes("UPDATE totp_entries")) {
+        state.entryUpdates = state.entryUpdates || [];
+        state.entryUpdates.push(args);
+      }
+      return { meta: { changes: 1 } };
+    },
   });
   const request = new Request("https://example.com/api/v1/entries/5", {
     method: "PATCH",
@@ -821,9 +974,10 @@ test("updating entries rejects SHA-1 OTP algorithms", async () => {
   const response = await worker.fetch(request, envWithDb(db), ctx());
   const body = await response.json();
 
-  assert.equal(response.status, 400);
-  assert.equal(body.error, "algorithm must be SHA-256 or SHA-512");
-  assert.equal(db.state.runs.some((sql) => sql.includes("UPDATE totp_entries")), false);
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(db.state.entryUpdates.length, 1);
+  assert.equal(db.state.entryUpdates[0][5], "SHA-1");
 });
 
 test("bootstrap rejects weak passwords before hashing", async () => {

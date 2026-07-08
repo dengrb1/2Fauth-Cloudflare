@@ -1,0 +1,16 @@
+{"t":1783490084792,"type":"start","id":"d2bc9f43633644c4#0","label":"repo-scan","phase":"Repo scan","effort":"xhigh","model":"gpt-5.5"}
+{"t":1783490578356,"type":"end","id":"d2bc9f43633644c4#0","label":"repo-scan","phase":"Repo scan","effort":"xhigh","model":"gpt-5.5","tokens":1086097,"ms":493562}
+{"t":1783490578365,"type":"start","id":"79a301964fd03038#0","label":"root-cause","phase":"Independent analyses","effort":"high","model":"gpt-5.5"}
+{"t":1783490578367,"type":"start","id":"bf6bd9e0763ac260#0","label":"otp-compat","phase":"Independent analyses","effort":"high","model":"gpt-5.5"}
+{"t":1783490578370,"type":"start","id":"807f159064625279#0","label":"nvidia-inference","phase":"Independent analyses","effort":"high","model":"gpt-5.5"}
+{"t":1783490578371,"type":"start","id":"f13eb3b188d9980a#0","label":"auto-recognition","phase":"Independent analyses","effort":"high","model":"gpt-5.5"}
+{"t":1783490578371,"type":"start","id":"de4c04a97a6b192d#0","label":"storage-import","phase":"Independent analyses","effort":"high","model":"gpt-5.5"}
+{"t":1783490793107,"type":"end","id":"f13eb3b188d9980a#0","label":"auto-recognition","phase":"Independent analyses","effort":"high","model":"gpt-5.5","tokens":342527,"ms":214735}
+{"t":1783490804009,"type":"end","id":"79a301964fd03038#0","label":"root-cause","phase":"Independent analyses","effort":"high","model":"gpt-5.5","tokens":241852,"ms":225637}
+{"t":1783490807798,"type":"end","id":"bf6bd9e0763ac260#0","label":"otp-compat","phase":"Independent analyses","effort":"high","model":"gpt-5.5","tokens":239753,"ms":229426}
+{"t":1783490853659,"type":"end","id":"de4c04a97a6b192d#0","label":"storage-import","phase":"Independent analyses","effort":"high","model":"gpt-5.5","tokens":326013,"ms":275287}
+{"t":1783490945014,"type":"end","id":"807f159064625279#0","label":"nvidia-inference","phase":"Independent analyses","effort":"high","model":"gpt-5.5","tokens":647630,"ms":366642}
+{"t":1783490945017,"type":"start","id":"bdf0adda0299173c#0","label":"adversarial","phase":"Adversarial review","effort":"xhigh","model":"gpt-5.5"}
+{"t":1783491184668,"type":"end","id":"bdf0adda0299173c#0","label":"adversarial","phase":"Adversarial review","effort":"xhigh","model":"gpt-5.5","tokens":516333,"ms":239651}
+{"t":1783491184671,"type":"start","id":"8b83dbc98b247f17#0","label":"synthesis","phase":"Synthesis","effort":"xhigh","model":"gpt-5.5"}
+{"t":1783491415163,"type":"end","id":"8b83dbc98b247f17#0","label":"synthesis","phase":"Synthesis","effort":"xhigh","model":"gpt-5.5","tokens":395797,"ms":230491}

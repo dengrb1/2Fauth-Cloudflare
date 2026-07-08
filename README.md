@@ -119,4 +119,4 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.
 - Configure `CORS_ALLOWED_ORIGINS` with exact browser-extension origins, not wildcards.
 - New passwords must be at least 12 characters and include uppercase, lowercase, number, and symbol.
-- New OTP entries accept SHA-256 or SHA-512 algorithms only.
+- OTP entries accept SHA-1, SHA-256, or SHA-512. Missing otpauth algorithms default to SHA-1 for authenticator compatibility.
