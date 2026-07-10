@@ -535,6 +535,22 @@ test("web UI renders the modern workspace shell and accessible dialogs", async (
   assert.match(html, /prefers-reduced-motion/);
 });
 
+test("web UI keeps phone and tablet navigation responsive", async () => {
+  const response = await worker.fetch(new Request("https://example.com/"), envWithDb(emptyDb()), ctx());
+  const html = await response.text();
+
+  assert.match(html, /viewport-fit=cover/);
+  assert.match(html, /@media \(max-width: 900px\)/);
+  assert.match(html, /safe-area-inset-bottom/);
+  assert.match(html, /\.topbar-search \{ order: 5; flex: 1 0 100%/);
+  assert.match(html, /data-action="toggle-sidebar"[^>]*aria-controls="sidebar"[^>]*aria-expanded="false"/);
+  assert.match(html, /function setSidebarOpen\(open\)/);
+  assert.match(html, /matchMedia\("\(min-width: 901px\)"\)/);
+  assert.match(html, /sidebar\.setAttribute\("inert", ""\)/);
+  assert.match(html, /\.entries-grid, \.transfer-grid, \.settings-grid \{ grid-template-columns: 1fr; \}/);
+  assert.match(html, /min-height: 44px; display: inline-flex/);
+});
+
 test("web UI includes Chinese and English copy without native business dialogs", async () => {
   const response = await worker.fetch(new Request("https://example.com/"), envWithDb(emptyDb()), ctx());
   const html = await response.text();
