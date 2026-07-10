@@ -9,4 +9,4 @@ database_name = "worker-2fauth-db"
 database_id = "b388dc9b-021e-4184-a256-5599139acfa6"
 
 [vars]
-ALLOW_PLAINTEXT_EXPORT = "true"
+ALLOW_PLAINTEXT_EXPORT = "false"

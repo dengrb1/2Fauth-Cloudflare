@@ -10,6 +10,6 @@
     }
   ],
   "vars": {
-    "ALLOW_PLAINTEXT_EXPORT": "true"
+    "ALLOW_PLAINTEXT_EXPORT": "false"
   }
 }
