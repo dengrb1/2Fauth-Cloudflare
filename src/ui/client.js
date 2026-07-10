@@ -240,7 +240,37 @@ export const CLIENT_SCRIPT = String.raw`
     byId("pageTitle").textContent = titles[workspace][0];
     byId("pageSubtitle").textContent = titles[workspace][1];
     byId("globalSearchWrap").classList.toggle("hidden", workspace !== "codes");
-    if (closeDrawer !== false) document.body.classList.remove("sidebar-open");
+    if (closeDrawer !== false) setSidebarOpen(false);
+  }
+
+  let sidebarReturnFocus = null;
+
+  function setSidebarOpen(open) {
+    const wasOpen = document.body.classList.contains("sidebar-open");
+    const sidebar = byId("sidebar");
+    const drawerMode = window.matchMedia("(max-width: 900px)").matches;
+    document.body.classList.toggle("sidebar-open", open);
+    const toggle = document.querySelector('[data-action="toggle-sidebar"]');
+    if (toggle) toggle.setAttribute("aria-expanded", String(open));
+    document.querySelectorAll(".topbar, .main").forEach((region) => {
+      if (open) region.setAttribute("inert", "");
+      else region.removeAttribute("inert");
+    });
+    if (drawerMode && !open) {
+      sidebar.setAttribute("inert", "");
+      sidebar.setAttribute("aria-hidden", "true");
+    } else {
+      sidebar.removeAttribute("inert");
+      sidebar.removeAttribute("aria-hidden");
+    }
+    if (open) {
+      sidebarReturnFocus = document.activeElement;
+      requestAnimationFrame(() => sidebar.querySelector(".nav-item:not(.hidden)")?.focus());
+    } else if (wasOpen && sidebarReturnFocus instanceof HTMLElement) {
+      const returnTarget = sidebarReturnFocus;
+      sidebarReturnFocus = null;
+      requestAnimationFrame(() => returnTarget.focus());
+    }
   }
 
   async function refreshAll() {
@@ -858,8 +888,8 @@ export const CLIENT_SCRIPT = String.raw`
     if (action === "login") return submitLogin();
     if (action === "logout") return logout();
     if (action === "navigate") return navigate(target.dataset.workspace);
-    if (action === "toggle-sidebar") return document.body.classList.toggle("sidebar-open");
-    if (action === "close-sidebar") return document.body.classList.remove("sidebar-open");
+    if (action === "toggle-sidebar") return setSidebarOpen(!document.body.classList.contains("sidebar-open"));
+    if (action === "close-sidebar") return setSidebarOpen(false);
     if (action === "refresh-all") return refreshAll();
     if (action === "open-entry") return openEntry(0, target);
     if (action === "close-entry") return closeEntry();
@@ -945,14 +975,17 @@ export const CLIENT_SCRIPT = String.raw`
   byId("search").addEventListener("input", renderEntries);
   byId("eSecret").addEventListener("paste", () => setTimeout(() => applyOtpInput(value("eSecret"), true), 0));
   byId("entryDialog").addEventListener("close", stopScan);
+  const desktopNavigation = window.matchMedia("(min-width: 901px)");
+  desktopNavigation.addEventListener("change", () => setSidebarOpen(false));
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      document.body.classList.remove("sidebar-open");
+      setSidebarOpen(false);
       document.querySelectorAll(".entry-menu").forEach((menu) => menu.classList.add("hidden"));
     }
   });
 
   setInterval(updateCodeTimers, 1000);
+  setSidebarOpen(false);
   void init();
 })();
 `;

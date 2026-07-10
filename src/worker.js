@@ -12,14 +12,24 @@ const PBKDF2_ITERATIONS = 100_000;
 const MIN_PASSWORD_PBKDF2_ITERATIONS = 10_000;
 const MAX_PASSWORD_PBKDF2_ITERATIONS = 1_000_000;
 const PBKDF2_HASH = "SHA-256";
-const PASSWORD_POLICY_DESCRIPTION = "at least 12 chars with uppercase, lowercase, number, and symbol";
+const PASSWORD_POLICY_DESCRIPTION = "12 to 256 chars with uppercase, lowercase, number, and symbol";
+const PASSWORD_MAX_LENGTH = 256;
 const PASSPHRASE_PBKDF2_ITERATIONS = 180_000;
-const MAX_PASSPHRASE_PBKDF2_ITERATIONS = 1_000_000;
+const MAX_PASSPHRASE_PBKDF2_ITERATIONS = 300_000;
 const ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH = 12;
+const ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH = 256;
+const ENCRYPTED_BACKUP_SALT_BYTES = 16;
+const ENCRYPTED_BACKUP_IV_BYTES = 12;
+const ENCRYPTED_BACKUP_MIN_CIPHERTEXT_BYTES = 16;
+const ENCRYPTED_BACKUP_MAX_CIPHERTEXT_BYTES = 1_048_576;
 const DEFAULT_JSON_BODY_MAX_BYTES = 1_048_576;
 const DEFAULT_RISK_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_RISK_LOCK_MINUTES = 15;
 const DEFAULT_API_RATE_MAX_REQUESTS_PER_MINUTE = 120;
+const DEFAULT_ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE = 5;
+const DEFAULT_ENCRYPTED_IMPORT_LOCK_MINUTES = 15;
+const DEFAULT_BOOTSTRAP_MAX_REQUESTS_PER_MINUTE = 5;
+const DEFAULT_BOOTSTRAP_LOCK_MINUTES = 15;
 const DEFAULT_TOTP_VERIFY_MAX_REQUESTS_PER_MINUTE = 10;
 const DEFAULT_TOTP_VERIFY_LOCK_MINUTES = 5;
 const DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE = 5;
@@ -33,12 +43,17 @@ const OTP_ALGORITHM_DEFAULT = "SHA-1";
 const OTP_ALGORITHM_ERROR = "algorithm must be SHA-1, SHA-256, or SHA-512";
 const GROUP_NAME_MAX_LENGTH = 60;
 const DEFAULT_API_RATE_LOCK_MINUTES = 15;
+const OTP_SECRET_MIN_BASE32_CHARS = 16;
+const OTP_SECRET_MAX_BASE32_CHARS = 256;
+const OTP_SECRET_MIN_BYTES = 10;
+const OTP_SECRET_MAX_BYTES = 128;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
 const DB_ID_PATH_PATTERN = "[1-9]\\d{0,15}";
 const EXTENSION_CORS_PROTOCOLS = new Set(["chrome-extension:", "moz-extension:", "safari-web-extension:"]);
+const COOKIE_WRITE_METHODS = new Set(["POST", "PATCH", "DELETE"]);
 
 // N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
 const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
@@ -71,6 +86,9 @@ const API_ROUTES = [
   ...entryRoutes("/api/v1"),
   ...groupRoutes("/api/v1"),
   ["POST", "/api/v1/codes/batch", handleApiCodesBatch],
+  ["POST", "/api/v1/import/otpauth", handleImportOtpAuth],
+  ["POST", "/api/v1/export/encrypted", handleExportDataEncrypted],
+  ["POST", "/api/v1/import/encrypted", handleImportDataEncrypted],
   ["POST", "/api/logout", handleLogout],
   ["POST", "/api/session/close-soon", handleCloseSoon],
   ["GET", "/api/me", handleMe],
@@ -111,6 +129,7 @@ function groupRoutes(prefix) {
   return [
     ["GET", `${prefix}/groups`, handleListGroups],
     ["POST", `${prefix}/groups`, handleCreateGroup],
+    ["PATCH", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleUpdateGroup],
     ["DELETE", routePattern(prefix, `/groups/${DB_ID_PATH_PATTERN}`), handleDeleteGroup],
   ];
 }
@@ -149,6 +168,12 @@ export default {
       const route = findApiRoute(method, path);
       if (route) {
         scheduleBackgroundMaintenance(ctx, env, path);
+        const authMixViolation = validateAuthMethodConsistency(request);
+        if (authMixViolation) return withCors(request, authMixViolation, env);
+        const cookieWriteViolation = validateCookieWriteRequest(request);
+        if (cookieWriteViolation) return withCors(request, cookieWriteViolation, env);
+        const encryptedImportLimited = await applyEncryptedImportRateLimit(request, env);
+        if (encryptedImportLimited) return withCors(request, encryptedImportLimited, env);
         const limited = await applyApiRateLimit(request, env, route);
         if (limited) return withCors(request, limited, env);
         return withCors(request, await route.handler(request, env), env);
@@ -198,6 +223,19 @@ async function handleStatus(request, env) {
 
 async function handleBootstrap(request, env) {
   const body = await parseJson(request);
+  const bootstrapTokenCheck = validateBootstrapToken(request, env, body);
+  if (!bootstrapTokenCheck.ok) {
+    if (env.BOOTSTRAP_TOKEN || env.INIT_SECRET) {
+      const bootstrapLimited = await applyBootstrapRateLimit(request, env);
+      if (bootstrapLimited) return bootstrapLimited;
+    }
+    return json({ error: bootstrapTokenCheck.error }, 403);
+  }
+  const initialized = await isBootstrapClosed(env);
+  if (initialized) return json({ error: "Already initialized" }, 400);
+  const bootstrapLimited = await applyBootstrapRateLimit(request, env);
+  if (bootstrapLimited) return bootstrapLimited;
+
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
   if (!username || !validPassword(password)) {
@@ -205,30 +243,19 @@ async function handleBootstrap(request, env) {
     return json({ error: "Invalid username or password" }, 400);
   }
 
-  const tokenCheck = await requireBootstrapToken(request, env, body);
-  if (tokenCheck) return tokenCheck;
-
-  if (await isBootstrapClosed(env)) return json({ error: "Already initialized" }, 400);
-
   const { hashB64, saltB64 } = await hashPassword(password);
   const now = nowIso();
-  const result = await env.DB.prepare(
-    "INSERT INTO users (username, password_hash, password_salt, role, created_at) SELECT ?, ?, ?, 'admin', ? WHERE NOT EXISTS (SELECT 1 FROM users)"
+  const row = await env.DB.prepare(
+    "INSERT INTO users (username, password_hash, password_salt, role, created_at) SELECT ?, ?, ?, 'admin', ? WHERE NOT EXISTS (SELECT 1 FROM users) RETURNING id"
   )
     .bind(username, encodePasswordHash(hashB64), saltB64, now)
-    .run();
+    .first();
 
-  if (Number(result.meta?.changes || 0) !== 1) {
+  let userId = normalizeDbId(row?.id);
+  if (!userId) {
     await markBootstrapCompleted(env).catch(() => {});
     return json({ error: "Already initialized" }, 400);
   }
-
-  let userId = normalizeDbId(result.meta?.last_row_id);
-  if (!userId) {
-    const row = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
-    userId = normalizeDbId(row?.id);
-  }
-  if (!userId) return json({ error: "Failed to create user id" }, 500);
   await markBootstrapCompleted(env);
   const { cookie } = await regenerateWebSession(request, env, userId);
   return json(
@@ -254,6 +281,7 @@ async function handleLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
     const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
@@ -318,6 +346,7 @@ async function handleApiCapabilities(request, env) {
       refreshTokenExpiresIn: API_REFRESH_TTL_SECONDS,
       refreshTokenRotation: true,
       turnstileRequired: hasTurnstileSecret(env),
+      turnstileSiteKey: String(env.TURNSTILE_SITE_KEY || ""),
     },
     limits: {
       extensionBatchMaxIds: EXTENSION_BATCH_MAX_IDS,
@@ -332,9 +361,13 @@ async function handleApiCapabilities(request, env) {
       refresh: "/api/v1/auth/refresh",
       logout: "/api/v1/auth/logout",
       me: "/api/v1/me",
+      changePassword: "/api/v1/me/password",
       entries: "/api/v1/entries",
       groups: "/api/v1/groups",
       codesBatch: "/api/v1/codes/batch",
+      importOtpAuth: "/api/v1/import/otpauth",
+      exportEncrypted: "/api/v1/export/encrypted",
+      importEncrypted: "/api/v1/import/encrypted",
     },
   });
 }
@@ -368,6 +401,7 @@ async function loginForApiClient(request, env, clientType) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
     const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
     if (!ts.ok) {
@@ -435,6 +469,7 @@ async function handleExtensionLogin(request, env) {
     );
   }
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
+  if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
 
   // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
   const turnstileToken = String(body.turnstileToken || "");
@@ -932,6 +967,40 @@ async function handleCreateGroup(request, env) {
   }
 }
 
+async function handleUpdateGroup(request, env) {
+  const auth = await requireAuth(request, env);
+  if (!auth.ok) return auth.response;
+  const id = pathResourceId(request, "groups");
+  if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
+
+  const existing = await env.DB.prepare("SELECT id, user_id, name, color FROM groups WHERE id = ?").bind(id).first();
+  if (!existing) return json({ error: "Group not found" }, 404);
+  if (auth.user.role !== "admin" && Number(existing.user_id) !== Number(auth.user.id)) {
+    return json({ error: "Forbidden" }, 403);
+  }
+
+  const body = await parseJson(request);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "Invalid JSON body" }, 400);
+  const keys = Object.keys(body);
+  if (!keys.length) return json({ error: "name or color is required" }, 400);
+  if (keys.some((key) => key !== "name" && key !== "color")) {
+    return json({ error: "Only name and color can be updated" }, 400);
+  }
+
+  const name = body.name !== undefined ? String(body.name ?? "").trim() : existing.name;
+  const color = body.color !== undefined ? String(body.color ?? "").trim() : existing.color;
+  if (!name) return json({ error: "name is required" }, 400);
+  if (name.length > GROUP_NAME_MAX_LENGTH) return json({ error: `name must be at most ${GROUP_NAME_MAX_LENGTH} characters` }, 400);
+  if (!validHexColor(color)) return json({ error: "color must be #RRGGBB" }, 400);
+
+  try {
+    await env.DB.prepare("UPDATE groups SET name = ?, color = ? WHERE id = ?").bind(name, color, id).run();
+    return json({ ok: true });
+  } catch {
+    return json({ error: "Group name already exists for this user" }, 409);
+  }
+}
+
 async function handleDeleteGroup(request, env) {
   const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
@@ -990,7 +1059,7 @@ async function handleExportOtpAuth(request, env) {
 }
 
 async function handleImportOtpAuth(request, env) {
-  const auth = await requireWebSession(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const body = await parseJson(request);
   const text = String(body.text || "");
@@ -1010,6 +1079,13 @@ async function handleImportOtpAuth(request, env) {
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
     if (!exists) return json({ error: "userId does not exist" }, 400);
   }
+  const groupId = parseOptionalPositiveId(body.groupId);
+  if (groupId === false) return json({ error: "groupId must be a positive integer or null" }, 400);
+  if (groupId) {
+    const group = await env.DB.prepare("SELECT id, user_id FROM groups WHERE id = ?").bind(groupId).first();
+    if (!group) return json({ error: "Group not found" }, 404);
+    if (Number(group.user_id) !== Number(userId)) return json({ error: "Forbidden" }, 403);
+  }
 
   const uris = extractOtpAuthUris(text);
   if (!uris.length) return json({ error: "No otpauth URI found in text" }, 400);
@@ -1019,6 +1095,7 @@ async function handleImportOtpAuth(request, env) {
   }
 
   let imported = 0;
+  const importedIds = [];
   const errors = [];
   for (const uri of uris) {
     const normalized = normalizeOtpEntryInput({ otpauthUri: uri }, { strictParameters: false, missingMessage: "Missing secret/label" });
@@ -1032,12 +1109,13 @@ async function handleImportOtpAuth(request, env) {
     if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) { errors.push("Issuer too long"); continue; }
     try {
       const secretEnc = await encryptText(secret, env);
-      await env.DB.prepare(
-        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)"
+      const result = await env.DB.prepare(
+        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)"
       )
-        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, nowIso())
+        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, groupId, nowIso())
         .run();
       imported += 1;
+      importedIds.push(normalizeDbId(result.meta?.last_row_id));
     } catch (e) {
       errors.push(String(e && e.message ? e.message : "failed"));
     }
@@ -1047,6 +1125,7 @@ async function handleImportOtpAuth(request, env) {
     ok: true,
     found: uris.length,
     imported,
+    importedIds,
     failed: uris.length - imported,
     errors: errors.slice(0, 5),
   });
@@ -1192,48 +1271,52 @@ async function importPayload(body, auth, env) {
   }
 
   for (const e of entries) {
-    let secret;
     const label = String(e.label || "").trim();
     const issuer = String(e.issuer || "").trim();
     if (!e.secret || !label) continue;
     if (label.length > ENTRY_LABEL_MAX_LENGTH) continue;
     if (issuer.length > ENTRY_ISSUER_MAX_LENGTH) continue;
+    const algorithm = normalizeAlgorithm(e.algorithm || OTP_ALGORITHM_DEFAULT);
+    if (!algorithm) continue;
     try {
-      secret = canonicalizeBase32Secret(e.secret);
+      const secret = canonicalizeBase32Secret(e.secret);
+      const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
+      const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
+      const digits = normalizeOtpDigits(e.digits);
+      const period = normalizeTotpPeriod(e.period);
+      const hotpCounter = normalizeHotpCounter(e.hotp_counter);
+      const enabled = e.enabled === undefined ? 1 : booleanFlag(e.enabled);
+      if (enabled === false) continue;
+      const secretEnc = await encryptText(secret, env);
+
+      await env.DB.prepare(
+        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, nowIso())
+        .run();
+      imported.entries += 1;
     } catch {
       continue;
     }
-    const groupId = e.group_id !== undefined && e.group_id !== null ? groupMap.get(String(e.group_id)) || null : null;
-    const otpType = e.otp_type === "hotp" ? "hotp" : "totp";
-    const algorithm = normalizeAlgorithm(e.algorithm || OTP_ALGORITHM_DEFAULT);
-    if (!algorithm) continue;
-    const digits = normalizeOtpDigits(e.digits);
-    const period = normalizeTotpPeriod(e.period);
-    const hotpCounter = normalizeHotpCounter(e.hotp_counter);
-    const enabled = e.enabled === undefined ? 1 : booleanFlag(e.enabled);
-    if (enabled === false) continue;
-    const secretEnc = await encryptText(secret, env);
-
-    await env.DB.prepare(
-      "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-      .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, nowIso())
-      .run();
-    imported.entries += 1;
   }
 
   return json({ ok: true, imported });
 }
 
 async function handleExportDataEncrypted(request, env) {
-  const auth = await requireWebSession(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const body = await parseJson(request);
-  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
-  if (stepUp) return stepUp;
+  if (auth.sessionKind === "web") {
+    const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+    if (stepUp) return stepUp;
+  }
   const passphrase = String(body.passphrase || "");
   if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) {
     return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
+  }
+  if (passphrase.length > ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH) {
+    return json({ error: `passphrase must be at most ${ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH} chars` }, 400);
   }
 
   const plainData = await getExportPayload(auth, env);
@@ -1242,13 +1325,14 @@ async function handleExportDataEncrypted(request, env) {
 }
 
 async function handleImportDataEncrypted(request, env) {
-  const auth = await requireWebSession(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
   const passphrase = String(body.passphrase || "");
   const encrypted = body.encrypted;
   if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
+  if (passphrase.length > ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH) return json({ error: `passphrase must be at most ${ENCRYPTED_BACKUP_PASSPHRASE_MAX_LENGTH} chars` }, 400);
   if (!encrypted || typeof encrypted !== "object") return json({ error: "encrypted payload is required" }, 400);
 
   let data;
@@ -1483,9 +1567,9 @@ async function markBootstrapCompleted(env) {
     .run();
 }
 
-async function requireBootstrapToken(request, env, body) {
+function validateBootstrapToken(request, env, body) {
   const expected = String(env.BOOTSTRAP_TOKEN || env.INIT_SECRET || "");
-  if (!expected) return json({ error: "Bootstrap token is required" }, 403);
+  if (!expected) return { ok: false, error: "Bootstrap token is required" };
   const provided = String(
     request.headers.get(BOOTSTRAP_TOKEN_HEADER) ||
       request.headers.get("x-init-secret") ||
@@ -1494,9 +1578,9 @@ async function requireBootstrapToken(request, env, body) {
       ""
   );
   if (!provided || !constantTimeStringEqual(provided, expected)) {
-    return json({ error: "Invalid bootstrap token" }, 403);
+    return { ok: false, error: "Invalid bootstrap token" };
   }
-  return null;
+  return { ok: true };
 }
 
 function constantTimeStringEqual(a, b) {
@@ -1754,6 +1838,140 @@ async function applyHotpConsumeRateLimit(request, env, entryId) {
   return null;
 }
 
+function validateAuthMethodConsistency(request) {
+  if (!readBearerToken(request)) return null;
+  if (!readCookie(request, SESSION_COOKIE)) return null;
+  return json({ error: "Do not send both Cookie session and Authorization bearer token" }, 400);
+}
+
+function validateCookieWriteRequest(request) {
+  const method = request.method.toUpperCase();
+  if (!COOKIE_WRITE_METHODS.has(method)) return null;
+  if (!readCookie(request, SESSION_COOKIE)) return null;
+
+  const url = new URL(request.url);
+  const expectedOrigin = `${url.protocol}//${url.host}`;
+  const origin = request.headers.get("origin");
+  if (origin !== expectedOrigin) return json({ error: "Invalid origin" }, 403);
+
+  const fetchSite = String(request.headers.get("sec-fetch-site") || "").toLowerCase();
+  if (fetchSite === "cross-site") return json({ error: "Cross-site requests are not allowed" }, 403);
+
+  const contentType = String(request.headers.get("content-type") || "").toLowerCase().split(";")[0].trim();
+  if (contentType !== "application/json") return json({ error: "Content-Type must be application/json" }, 415);
+
+  return null;
+}
+
+async function applyBootstrapRateLimit(request, env) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const maxRequests = normalizeInteger(
+    env.BOOTSTRAP_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_BOOTSTRAP_MAX_REQUESTS_PER_MINUTE,
+    1,
+    60
+  );
+  const lockMinutes = normalizeInteger(
+    env.BOOTSTRAP_LOCK_MINUTES,
+    DEFAULT_BOOTSTRAP_LOCK_MINUTES,
+    1,
+    1440
+  );
+  const ip = clientIp(request);
+  const subjectIp = ip === "unknown" ? "unknown-global" : ip;
+  const rateKey = await sha256Base64(`bootstrap|ip|${subjectIp}`);
+  const policy = { maxRequestsPerMinute: maxRequests, lockMinutes };
+
+  let result;
+  try {
+    result = await updateLoginRiskBucket(env, rateKey, "__bootstrap__", ip, nowSec, policy);
+  } catch (err) {
+    if (isMissingTableError(err, "login_risk_control")) return null;
+    return json({ error: "Bootstrap rate limiter unavailable" }, 503);
+  }
+
+  if (result.blocked) {
+    return json(
+      { error: "Too many bootstrap attempts. Temporarily locked.", retryAfterSeconds: result.retryAfterSeconds },
+      429,
+      { "Retry-After": String(result.retryAfterSeconds) }
+    );
+  }
+  return null;
+}
+
+async function applyEncryptedImportRateLimit(request, env) {
+  if (request.method.toUpperCase() !== "POST") return null;
+  const path = new URL(request.url).pathname;
+  if (path !== "/api/import/encrypted" && path !== "/api/v1/import/encrypted") return null;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const maxRequests = normalizeInteger(
+    env.ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE,
+    1,
+    60
+  );
+  const lockMinutes = normalizeInteger(
+    env.ENCRYPTED_IMPORT_LOCK_MINUTES,
+    DEFAULT_ENCRYPTED_IMPORT_LOCK_MINUTES,
+    1,
+    1440
+  );
+  const subject = await apiRateLimitSubject(request, env);
+  const rateKey = await sha256Base64(`encrypted-import|${subject}`);
+
+  let row;
+  try {
+    row = await env.DB.prepare(
+      "SELECT key, window_start, request_count, lock_until FROM login_risk_control WHERE key = ?"
+    )
+      .bind(rateKey)
+      .first();
+  } catch {
+    return json({ error: "Encrypted import rate limiter unavailable" }, 503);
+  }
+
+  if (row && Number(row.lock_until) > nowSec) {
+    const retryAfterSeconds = Number(row.lock_until) - nowSec;
+    return json(
+      { error: "Too many encrypted import requests. Temporarily locked.", retryAfterSeconds },
+      429,
+      { "Retry-After": String(retryAfterSeconds) }
+    );
+  }
+
+  let windowStart = nowSec;
+  let requestCount = 1;
+  let lockUntil = 0;
+  if (row && nowSec - Number(row.window_start) < 60) {
+    windowStart = Number(row.window_start);
+    requestCount = Number(row.request_count) + 1;
+  }
+  if (requestCount > maxRequests) {
+    lockUntil = nowSec + lockMinutes * 60;
+  }
+
+  try {
+    await env.DB.prepare(
+      "INSERT INTO login_risk_control (key, username, ip, window_start, request_count, lock_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET username = excluded.username, ip = excluded.ip, window_start = excluded.window_start, request_count = excluded.request_count, lock_until = excluded.lock_until, updated_at = excluded.updated_at"
+    )
+      .bind(rateKey, "__encrypted_import__", clientIp(request), windowStart, requestCount, lockUntil, nowSec)
+      .run();
+  } catch {
+    return json({ error: "Encrypted import rate limiter unavailable" }, 503);
+  }
+
+  if (lockUntil > nowSec) {
+    return json(
+      { error: "Too many encrypted import requests. Temporarily locked.", retryAfterSeconds: lockUntil - nowSec },
+      429,
+      { "Retry-After": String(lockUntil - nowSec) }
+    );
+  }
+  return null;
+}
+
 function shouldRateLimitRoute(request, route) {
   if (request.method.toUpperCase() === "OPTIONS") return false;
   const path = new URL(request.url).pathname;
@@ -1785,6 +2003,11 @@ async function apiRateLimitSubject(request, env) {
 function normalizeRateLimit(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 10 && n <= 5000 ? Math.floor(n) : fallback;
+}
+
+function normalizeInteger(value, fallback, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : fallback;
 }
 
 function isMissingTableError(err, tableName) {
@@ -2282,13 +2505,26 @@ async function encryptWithPassphrase(data, passphrase) {
 
 async function decryptWithPassphrase(payload, passphrase) {
   if (payload.format !== "worker-2fauth-encrypted-v1") throw new Error("unsupported format");
+  if (payload.kdf !== "PBKDF2-SHA-256") throw new Error("unsupported kdf");
   const iterations = normalizePassphraseIterations(payload.iterations);
-  const salt = b64ToBytes(String(payload.salt || ""));
-  const iv = b64ToBytes(String(payload.iv || ""));
-  const ciphertext = b64ToBytes(String(payload.ciphertext || ""));
+  const salt = decodeBackupB64Field(payload.salt, ENCRYPTED_BACKUP_SALT_BYTES);
+  const iv = decodeBackupB64Field(payload.iv, ENCRYPTED_BACKUP_IV_BYTES);
+  const ciphertext = decodeBackupB64Field(
+    payload.ciphertext,
+    null,
+    ENCRYPTED_BACKUP_MIN_CIPHERTEXT_BYTES,
+    ENCRYPTED_BACKUP_MAX_CIPHERTEXT_BYTES
+  );
   const key = await derivePassphraseKey(passphrase, salt, iterations);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
   return JSON.parse(dec(new Uint8Array(plain)));
+}
+
+function decodeBackupB64Field(value, exactLength, minLength = exactLength, maxLength = exactLength) {
+  const bytes = b64ToBytes(String(value || ""));
+  if (minLength !== null && bytes.length < minLength) throw new Error("invalid encrypted backup field length");
+  if (maxLength !== null && bytes.length > maxLength) throw new Error("invalid encrypted backup field length");
+  return bytes;
 }
 
 async function derivePassphraseKey(passphrase, salt, iterations = PASSPHRASE_PBKDF2_ITERATIONS) {
@@ -2340,11 +2576,12 @@ function parseOtpAuthUri(uri) {
     const digits = Number(url.searchParams.get("digits") || 6);
     const period = Number(url.searchParams.get("period") || 30);
     const hotpCounter = Number(url.searchParams.get("counter") || 0);
-    const algorithm = normalizeAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
+    const algorithmParam = url.searchParams.get("algorithm");
+    const algorithm = normalizeAlgorithm(algorithmParam || "SHA-1");
     if (!algorithm) return { ok: false, error: "otpauth URI algorithm must be SHA-1, SHA-256, or SHA-512" };
     return {
       ok: true,
-      data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, otpType, hotpCounter },
+      data: { secret, issuer, label: label || issuer || "OTP", digits, period, algorithm, algorithmSpecified: algorithmParam !== null, otpType, hotpCounter },
     };
   } catch {
     return { ok: false, error: "Invalid otpauth URI" };
@@ -2476,25 +2713,38 @@ async function generateHotp(secretBase32, digits, algorithm, counter) {
 }
 
 function base32Decode(input) {
-  const clean = String(input).toUpperCase().replace(/[\s=-]/g, "");
+  const clean = cleanBase32Secret(input);
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = "";
+  let buffer = 0;
+  let bitsLeft = 0;
+  const bytes = [];
   for (const ch of clean) {
     const idx = alphabet.indexOf(ch);
     if (idx < 0) throw new Error("invalid base32");
-    bits += idx.toString(2).padStart(5, "0");
-  }
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+    buffer = (buffer << 5) | idx;
+    bitsLeft += 5;
+    while (bitsLeft >= 8) {
+      bytes.push((buffer >>> (bitsLeft - 8)) & 0xff);
+      bitsLeft -= 8;
+      buffer &= (1 << bitsLeft) - 1;
+    }
   }
   return new Uint8Array(bytes);
 }
 
+function cleanBase32Secret(input) {
+  return String(input || "").toUpperCase().replace(/[\s=-]/g, "");
+}
+
 function canonicalizeBase32Secret(input) {
-  const secret = String(input || "").toUpperCase().replace(/[\s=-]/g, "");
+  const secret = cleanBase32Secret(input);
+  if (secret.length < OTP_SECRET_MIN_BASE32_CHARS || secret.length > OTP_SECRET_MAX_BASE32_CHARS) {
+    throw new Error("secret is not valid base32");
+  }
   const bytes = base32Decode(secret);
-  if (!bytes.length) throw new Error("empty base32");
+  if (bytes.length < OTP_SECRET_MIN_BYTES || bytes.length > OTP_SECRET_MAX_BYTES) {
+    throw new Error("secret is not valid base32");
+  }
   return secret;
 }
 
@@ -2544,12 +2794,17 @@ function normalizeUsername(v) {
 function validPassword(p) {
   return (
     typeof p === "string" &&
+    validPasswordLength(p) &&
     p.length >= 12 &&
     /[a-z]/.test(p) &&
     /[A-Z]/.test(p) &&
     /[0-9]/.test(p) &&
     /[^A-Za-z0-9]/.test(p)
   );
+}
+
+function validPasswordLength(p) {
+  return typeof p === "string" && p.length <= PASSWORD_MAX_LENGTH;
 }
 
 function validHexColor(v) {
@@ -2564,7 +2819,11 @@ function parseCookies(request) {
     if (idx < 0) continue;
     const k = part.slice(0, idx).trim();
     const v = part.slice(idx + 1).trim();
-    map[k] = decodeURIComponent(v);
+    try {
+      map[k] = decodeURIComponent(v);
+    } catch {
+      continue;
+    }
   }
   return map;
 }
@@ -2769,7 +3028,8 @@ function isSafeCorsOrigin(origin) {
   // Extensions must be explicitly listed in CORS_ALLOWED_ORIGINS.
   try {
     const url = new URL(origin);
-    if (["https:", "http:"].includes(url.protocol)) return origin === url.origin;
+    if (url.protocol === "https:") return origin === url.origin;
+    if (url.protocol === "http:") return origin === url.origin && isLocalHttpOrigin(url);
     if (EXTENSION_CORS_PROTOCOLS.has(url.protocol)) {
       const normalized = `${url.protocol}//${url.host}`;
       return origin === normalized && !!url.host;
@@ -2778,6 +3038,10 @@ function isSafeCorsOrigin(origin) {
   } catch {
     return false;
   }
+}
+
+function isLocalHttpOrigin(url) {
+  return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
 }
 
 function appendVary(current, value) {

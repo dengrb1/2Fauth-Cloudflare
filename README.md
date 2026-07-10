@@ -61,9 +61,13 @@ Optional settings:
 - `BOOTSTRAP_TOKEN` or `INIT_SECRET`: required one-time initialization secret for `/api/bootstrap`. Do not deploy an uninitialized public Worker without this secret.
 - `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login.
 - `TURNSTILE_SITE_KEY`: renders Turnstile in the Web UI.
-- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions, for example `chrome-extension://<id>,moz-extension://<id>`. Wildcards are ignored.
-- `ALLOW_PLAINTEXT_EXPORT`: set to `true` to enable `/api/export` and `/api/export/otpauth`; encrypted export stays available either way. This repo enables it in `wrangler.toml` by default.
+- `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions or HTTPS clients, for example `chrome-extension://<id>,moz-extension://<id>,https://app.example.com`. Wildcards and non-local `http://` origins are ignored; `http://localhost` is allowed for local development.
+- `ALLOW_PLAINTEXT_EXPORT`: defaults to disabled. Temporarily set to `true` only when you need `/api/export` or `/api/export/otpauth`; encrypted export stays available either way.
 - `API_RATE_MAX_REQUESTS_PER_MINUTE`: optional per-session/IP API rate limit, default `120`.
+- `ENCRYPTED_IMPORT_MAX_REQUESTS_PER_MINUTE`: optional encrypted import rate limit, default `5`.
+- `ENCRYPTED_IMPORT_LOCK_MINUTES`: optional encrypted import lock duration after the limit is exceeded, default `15`.
+- `BOOTSTRAP_MAX_REQUESTS_PER_MINUTE`: optional bootstrap token attempt limit, default `5`.
+- `BOOTSTRAP_LOCK_MINUTES`: optional bootstrap lock duration after the limit is exceeded, default `15`.
 - `DEBUG_ERRORS`: set to `true` only outside production to include internal error details in JSON error responses.
 
 ## Database Migrations
@@ -130,7 +134,9 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 
 - Never commit real secrets or production `wrangler.toml` values.
 - Treat export payloads as sensitive. Plaintext export should be enabled only when you explicitly need it; prefer encrypted export when sharing backups. Encrypted export requires a current-password step-up confirmation and then honors a 5-minute recent-authentication window for sensitive Web UI actions.
+- Keep `BOOTSTRAP_TOKEN` configured until the first admin account has been created. An empty deployment cannot initialize without it.
+- Do not send Web UI cookies and API bearer tokens in the same request. Mixed authentication is rejected to keep CSRF checks and rate-limit buckets unambiguous.
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.
 - Configure `CORS_ALLOWED_ORIGINS` with exact browser-extension origins, not wildcards.
-- New passwords must be at least 12 characters and include uppercase, lowercase, number, and symbol.
+- New passwords must be 12 to 256 characters and include uppercase, lowercase, number, and symbol.
 - OTP entries accept SHA-1, SHA-256, or SHA-512. Missing otpauth algorithms default to SHA-1 for authenticator compatibility.

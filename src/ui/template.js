@@ -26,7 +26,7 @@ export function renderAppHtml(env, nonce) {
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#102d30" />
   <title>2FAuth 验证器</title>
   <style nonce="${nonce}">${APP_STYLES}</style>
@@ -89,10 +89,10 @@ export function renderAppHtml(env, nonce) {
         <button class="btn btn-quiet" data-action="logout">${ICONS.logout}<span data-i18n="logout">退出登录</span></button>
       </div>
     </aside>
-    <button class="sidebar-scrim" data-action="close-sidebar" aria-label="Close navigation"></button>
+    <button class="sidebar-scrim" data-action="close-sidebar" aria-label="Close navigation" aria-controls="sidebar"></button>
 
     <header class="topbar">
-      <button class="btn btn-secondary icon-btn mobile-menu" data-action="toggle-sidebar" aria-label="Open navigation">${ICONS.menu}</button>
+      <button class="btn btn-secondary icon-btn mobile-menu" data-action="toggle-sidebar" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button>
       <div class="page-title"><h1 id="pageTitle">验证码</h1><p id="pageSubtitle" data-i18n="codesSubtitle">快速取用并管理动态验证码</p></div>
       <label class="topbar-search" id="globalSearchWrap">${ICONS.search}<span class="sr-only" data-i18n="search">搜索</span><input id="search" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索标签或发行方" /></label>
       <div class="spacer"></div>
