@@ -1,5 +1,7 @@
-﻿const SESSION_COOKIE = "__Host-session";
+const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+import { renderAppHtml } from "./ui/template.js";
+const STEP_UP_TTL_SECONDS = 5 * 60; // 5 minutes
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
@@ -41,7 +43,9 @@ const EXTENSION_CORS_PROTOCOLS = new Set(["chrome-extension:", "moz-extension:",
 // N-01 fix: dummy salt/hash for constant-time PBKDF2 on missing user
 const FAKE_PASSWORD_SALT = "AAAAAAAAAAAAAAAAAAAAAA";
 const FAKE_PASSWORD_HASH = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type";
+const BOOTSTRAP_COMPLETED_SETTING = "bootstrap_completed";
+const BOOTSTRAP_TOKEN_HEADER = "x-bootstrap-token";
+const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type, X-Bootstrap-Token, X-Init-Secret";
 const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
 
 let nextBackgroundMaintenanceAt = 0;
@@ -188,29 +192,36 @@ function findApiRoute(method, path) {
 }
 
 async function handleStatus(request, env) {
-  const initialized = await hasAnyUser(env);
-  return json({ initialized });
+  const initialized = await isBootstrapClosed(env);
+  return json({ initialized, bootstrapTokenRequired: !initialized });
 }
 
 async function handleBootstrap(request, env) {
   const body = await parseJson(request);
   const username = normalizeUsername(body.username);
   const password = String(body.password || "");
-    if (!username || !validPassword(password)) {
-      // F-04: vague error 鈥?do not disclose password policy details.
-      return json({ error: "Invalid username or password" }, 400);
+  if (!username || !validPassword(password)) {
+    // F-04: vague error — do not disclose password policy details.
+    return json({ error: "Invalid username or password" }, 400);
   }
 
-  const initialized = await hasAnyUser(env);
-  if (initialized) return json({ error: "Already initialized" }, 400);
+  const tokenCheck = await requireBootstrapToken(request, env, body);
+  if (tokenCheck) return tokenCheck;
+
+  if (await isBootstrapClosed(env)) return json({ error: "Already initialized" }, 400);
 
   const { hashB64, saltB64 } = await hashPassword(password);
   const now = nowIso();
   const result = await env.DB.prepare(
-    "INSERT INTO users (username, password_hash, password_salt, role, created_at) VALUES (?, ?, ?, 'admin', ?)"
+    "INSERT INTO users (username, password_hash, password_salt, role, created_at) SELECT ?, ?, ?, 'admin', ? WHERE NOT EXISTS (SELECT 1 FROM users)"
   )
     .bind(username, encodePasswordHash(hashB64), saltB64, now)
     .run();
+
+  if (Number(result.meta?.changes || 0) !== 1) {
+    await markBootstrapCompleted(env).catch(() => {});
+    return json({ error: "Already initialized" }, 400);
+  }
 
   let userId = normalizeDbId(result.meta?.last_row_id);
   if (!userId) {
@@ -218,6 +229,7 @@ async function handleBootstrap(request, env) {
     userId = normalizeDbId(row?.id);
   }
   if (!userId) return json({ error: "Failed to create user id" }, 500);
+  await markBootstrapCompleted(env);
   const { cookie } = await regenerateWebSession(request, env, userId);
   return json(
     { ok: true, user: { id: userId, username, role: "admin" } },
@@ -286,9 +298,9 @@ async function handleMobileRefresh(request, env) {
 }
 
 async function handleMobileLogout(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireApiSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "api" || auth.apiClientType !== ANDROID_CLIENT_TYPE) {
+  if (auth.apiClientType !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Mobile bearer token required" }, 400);
   }
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
@@ -402,9 +414,8 @@ async function handleApiClientRefresh(request, env) {
 }
 
 async function handleApiClientLogout(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireApiSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
   return json({ ok: true });
 }
@@ -474,44 +485,33 @@ async function handleExtensionRefresh(request, env) {
 }
 
 async function handleExtensionLogout(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireExtensionSession(request, env);
   if (!auth.ok) return auth.response;
-  if (!isExtensionClientType(auth.apiClientType)) {
-    return json({ error: "Extension bearer token required" }, 400);
-  }
   await env.DB.prepare("DELETE FROM api_sessions WHERE id = ?").bind(auth.sessionId).run();
   return json({ ok: true });
 }
 
 async function handleExtensionEntries(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireExtensionSession(request, env);
   if (!auth.ok) return auth.response;
-  if (!isExtensionClientType(auth.apiClientType)) {
-    return json({ error: "Extension bearer token required" }, 400);
-  }
-  return handleListEntries(request, env);
+  return json({ entries: await listEntriesForAuth(env, auth) });
 }
 
 async function handleExtensionCodesBatch(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireExtensionSession(request, env);
   if (!auth.ok) return auth.response;
-  if (!isExtensionClientType(auth.apiClientType)) {
-    return json({ error: "Extension bearer token required" }, 400);
-  }
   return handleCodesBatchForAuth(request, env, auth);
 }
 
 async function handleApiCodesBatch(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireApiSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "api") return json({ error: "API bearer token required" }, 400);
   return handleCodesBatchForAuth(request, env, auth);
 }
 
 async function handleWebCodesBatch(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "web") return json({ error: "Web session required" }, 400);
   return handleCodesBatchForAuth(request, env, auth);
 }
 
@@ -640,7 +640,10 @@ function isAllowedCloseSoonRequest(request) {
 }
 
 async function handleMe(request, env) {
-  const auth = await requireAuth(request, env);
+  const path = new URL(request.url).pathname;
+  const auth = path.startsWith("/api/v1/")
+    ? await requireApiSession(request, env)
+    : await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
   if (auth.sessionKind === "web") {
     await refreshSessionTtl(request, env).catch(() => {});
@@ -649,9 +652,8 @@ async function handleMe(request, env) {
 }
 
 async function handleAppData(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.sessionKind !== "web") return json({ error: "Web session required" }, 400);
 
   const [entries, groups] = await Promise.all([
     listEntriesForAuth(env, auth),
@@ -661,7 +663,7 @@ async function handleAppData(request, env) {
 }
 
 async function handleListEntries(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   return json({ entries: await listEntriesForAuth(env, auth) });
 }
@@ -683,7 +685,7 @@ async function listEntriesForAuth(env, auth) {
 }
 
 async function handleCreateEntry(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
@@ -725,7 +727,7 @@ async function handleCreateEntry(request, env) {
 }
 
 async function handleUpdateEntry(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -783,7 +785,7 @@ async function handleUpdateEntry(request, env) {
 }
 
 async function handleEntryCode(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -810,7 +812,7 @@ async function handleEntryCode(request, env) {
 }
 
 async function handleVerifyTotp(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -844,7 +846,7 @@ async function handleVerifyTotp(request, env) {
 }
 
 async function handleConsumeHotp(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -881,7 +883,7 @@ async function handleConsumeHotp(request, env) {
 }
 
 async function handleListGroups(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   return json({ groups: await listGroupsForAuth(env, auth) });
 }
@@ -902,7 +904,7 @@ async function listGroupsForAuth(env, auth) {
 }
 
 async function handleCreateGroup(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
@@ -931,7 +933,7 @@ async function handleCreateGroup(request, env) {
 }
 
 async function handleDeleteGroup(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "groups");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -946,7 +948,7 @@ async function handleDeleteGroup(request, env) {
 }
 
 async function handleExportData(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
   const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
   if (confirmation) return confirmation;
@@ -954,7 +956,7 @@ async function handleExportData(request, env) {
 }
 
 async function handleImportData(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
@@ -962,7 +964,7 @@ async function handleImportData(request, env) {
 }
 
 async function handleExportOtpAuth(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
   const confirmation = await requirePlaintextExportConfirmation(request, env, auth);
   if (confirmation) return confirmation;
@@ -988,7 +990,7 @@ async function handleExportOtpAuth(request, env) {
 }
 
 async function handleImportOtpAuth(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
   const body = await parseJson(request);
   const text = String(body.text || "");
@@ -1074,7 +1076,42 @@ async function requirePlaintextExportConfirmation(request, env, auth) {
   if (!passwordCheck) {
     return json({ error: "Invalid password confirmation" }, 401);
   }
+  await markWebSessionStepUp(env, auth).catch(() => {});
   return null;
+}
+
+function isStepUpFresh(auth) {
+  const lastMs = Date.parse(String(auth.stepUpAt || ""));
+  return Number.isFinite(lastMs) && Date.now() - lastMs <= STEP_UP_TTL_SECONDS * 1000;
+}
+
+async function requireRecentWebStepUp(request, env, auth, body) {
+  if (auth.sessionKind !== "web") return json({ error: "Web session required" }, 403);
+  if (isStepUpFresh(auth)) return null;
+  const password = String(body.confirmPassword || body.currentPassword || "");
+  if (!password) return json({ error: "Current password confirmation required" }, 401);
+
+  const userRow = await env.DB.prepare(
+    "SELECT password_hash, password_salt FROM users WHERE id = ?"
+  ).bind(auth.user.id).first();
+  if (!userRow) return json({ error: "User not found" }, 401);
+
+  const passwordCheck = await verifyPasswordDetailed(password, userRow.password_salt, userRow.password_hash);
+  if (!passwordCheck.ok) return json({ error: "Invalid password confirmation" }, 401);
+  await markWebSessionStepUp(env, auth).catch(() => {});
+  return null;
+}
+
+async function markWebSessionStepUp(env, auth, at = nowIso()) {
+  if (!auth || auth.sessionKind !== "web" || !auth.tokenHash) return;
+  try {
+    await env.DB.prepare("UPDATE sessions SET step_up_at = ? WHERE token_hash = ?")
+      .bind(at, auth.tokenHash)
+      .run();
+    auth.stepUpAt = at;
+  } catch (err) {
+    if (!isMissingColumnError(err, "step_up_at")) throw err;
+  }
 }
 
 async function getExportPayload(auth, env) {
@@ -1189,9 +1226,11 @@ async function importPayload(body, auth, env) {
 }
 
 async function handleExportDataEncrypted(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
   const body = await parseJson(request);
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
   const passphrase = String(body.passphrase || "");
   if (passphrase.length < ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH) {
     return json({ error: `passphrase must be at least ${ENCRYPTED_BACKUP_PASSPHRASE_MIN_LENGTH} chars` }, 400);
@@ -1203,7 +1242,7 @@ async function handleExportDataEncrypted(request, env) {
 }
 
 async function handleImportDataEncrypted(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireWebSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
@@ -1223,7 +1262,7 @@ async function handleImportDataEncrypted(request, env) {
 }
 
 async function handleDeleteEntry(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
   const id = pathResourceId(request, "entries");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -1237,18 +1276,16 @@ async function handleDeleteEntry(request, env) {
 }
 
 async function handleListUsers(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const rows = await env.DB.prepare("SELECT id, username, role, created_at FROM users ORDER BY id ASC").all();
   return json({ users: rows.results || [] });
 }
 
 async function handleCreateUser(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const body = await parseJson(request);
   const username = normalizeUsername(body.username);
@@ -1273,7 +1310,7 @@ async function handleCreateUser(request, env) {
 }
 
 async function handleChangeMyPassword(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireRouteSession(request, env);
   if (!auth.ok) return auth.response;
 
   const body = await parseJson(request);
@@ -1303,9 +1340,8 @@ async function handleChangeMyPassword(request, env) {
 }
 
 async function handleResetUserPassword(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
@@ -1314,6 +1350,8 @@ async function handleResetUserPassword(request, env) {
   }
 
   const body = await parseJson(request);
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
   const newPassword = String(body.newPassword || body.password || "");
   if (!validPassword(newPassword)) {
     return json({ error: "Invalid new password" }, 400);
@@ -1330,13 +1368,14 @@ async function handleResetUserPassword(request, env) {
 }
 
 async function handleUpdateUserRole(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   const body = await parseJson(request);
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
   const role = body.role === "admin" ? "admin" : body.role === "user" ? "user" : null;
   if (!role) return json({ error: "role must be admin or user" }, 400);
   if (id === auth.user.id && role !== "admin") {
@@ -1353,13 +1392,15 @@ async function handleUpdateUserRole(request, env) {
 }
 
 async function handleDeleteUser(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const id = pathResourceId(request, "users");
   if (!Number.isFinite(id)) return json({ error: "Invalid id" }, 400);
   if (id === auth.user.id) return json({ error: "Cannot delete yourself" }, 400);
+  const body = await parseJson(request);
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
 
   const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE id = ?").bind(id).first();
   if (!target) return json({ error: "User not found" }, 404);
@@ -1379,18 +1420,18 @@ async function handleDeleteUser(request, env) {
 }
 
 async function handleGetLoginPolicy(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
   return json(await getLoginPolicy(env));
 }
 
 async function handleUpdateLoginPolicy(request, env) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAdminWebSession(request, env);
   if (!auth.ok) return auth.response;
-  if (auth.user.role !== "admin") return json({ error: "Forbidden" }, 403);
 
   const body = await parseJson(request);
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
   const maxRequestsPerMinute = Number(body.maxRequestsPerMinute);
   const lockMinutes = Number(body.lockMinutes);
   if (!Number.isFinite(maxRequestsPerMinute) || maxRequestsPerMinute < 3 || maxRequestsPerMinute > 100) {
@@ -1418,6 +1459,50 @@ async function handleUpdateLoginPolicy(request, env) {
 async function hasAnyUser(env) {
   const row = await env.DB.prepare("SELECT id FROM users LIMIT 1").first();
   return !!row;
+}
+
+async function isBootstrapClosed(env) {
+  if (await hasAnyUser(env)) return true;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?")
+      .bind(BOOTSTRAP_COMPLETED_SETTING)
+      .first();
+    return String(row?.value || "").toLowerCase() === "true";
+  } catch (err) {
+    if (isMissingTableError(err, "app_settings")) return false;
+    throw err;
+  }
+}
+
+async function markBootstrapCompleted(env) {
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    "INSERT INTO app_settings (key, value, updated_at) VALUES (?, 'true', ?) ON CONFLICT(key) DO UPDATE SET value = 'true', updated_at = excluded.updated_at"
+  )
+    .bind(BOOTSTRAP_COMPLETED_SETTING, now)
+    .run();
+}
+
+async function requireBootstrapToken(request, env, body) {
+  const expected = String(env.BOOTSTRAP_TOKEN || env.INIT_SECRET || "");
+  if (!expected) return json({ error: "Bootstrap token is required" }, 403);
+  const provided = String(
+    request.headers.get(BOOTSTRAP_TOKEN_HEADER) ||
+      request.headers.get("x-init-secret") ||
+      body.bootstrapToken ||
+      body.initSecret ||
+      ""
+  );
+  if (!provided || !constantTimeStringEqual(provided, expected)) {
+    return json({ error: "Invalid bootstrap token" }, 403);
+  }
+  return null;
+}
+
+function constantTimeStringEqual(a, b) {
+  const left = enc(String(a || ""));
+  const right = enc(String(b || ""));
+  return constantTimeEqual(left, right);
 }
 
 async function countAdmins(env) {
@@ -1460,9 +1545,7 @@ async function applyLoginRiskControl(request, env, username) {
   const nowSec = Math.floor(Date.now() / 1000);
   const policy = await getLoginPolicy(env);
   const ip = clientIp(request);
-  const usernameKey = await sha256Base64(`login|user-ip|${username || "__empty__"}|${ip}`);
-  // P1 fix: use global bucket for unknown IP to prevent cross-user lockout
-  const ipKey = ip === "unknown" ? await sha256Base64("login|ip|unknown-global") : await sha256Base64(`login|ip|${ip}`);
+  const { usernameKey, ipKey } = await buildLoginRiskKeys(username, ip);
   const ipPolicy = { ...policy, maxRequestsPerMinute: policy.maxRequestsPerMinute * 2 };
   let userRisk;
   let ipRisk;
@@ -1525,11 +1608,20 @@ async function updateLoginRiskBucket(env, riskKey, username, ip, nowSec, policy)
 
 async function clearLoginRiskControl(request, env, username) {
   const ip = clientIp(request);
-  const usernameKey = await sha256Base64(`login|user-ip|${username || "__empty__"}|${ip}`);
-  const ipKey = await sha256Base64(`login|ip|${ip}`);
+  const { usernameKey, ipKey } = await buildLoginRiskKeys(username, ip);
   await env.DB.prepare("DELETE FROM login_risk_control WHERE key IN (?, ?)")
     .bind(usernameKey, ipKey)
     .run();
+}
+
+async function buildLoginRiskKeys(username, ip) {
+  const normalizedUsername = username || "__empty__";
+  const normalizedIp = ip || "unknown";
+  const ipBucket = normalizedIp === "unknown" ? "unknown-global" : normalizedIp;
+  return {
+    usernameKey: await sha256Base64(`login|user-ip|${normalizedUsername}|${normalizedIp}`),
+    ipKey: await sha256Base64(`login|ip|${ipBucket}`),
+  };
 }
 
 async function clearLoginRiskForUsername(env, username) {
@@ -1736,52 +1828,107 @@ async function verifyTurnstileToken(token, remoteip, env) {
   return { ok: !!data.success };
 }
 
+async function requireWebSession(request, env) {
+  const current = await getCurrentWebSession(request, env);
+  if (!current) {
+    const status = readBearerToken(request) ? 403 : 401;
+    const message = status === 403 ? "Web session required" : "Unauthorized";
+    return { ok: false, response: json({ error: message }, status) };
+  }
+  return { ok: true, ...current };
+}
+
+async function requireAdminWebSession(request, env) {
+  const auth = await requireWebSession(request, env);
+  if (!auth.ok) return auth;
+  if (auth.user.role !== "admin") return { ok: false, response: json({ error: "Forbidden" }, 403) };
+  return auth;
+}
+
+async function requireApiSession(request, env) {
+  const current = await getCurrentApiSession(request, env);
+  if (!current) return { ok: false, response: json({ error: "API bearer token required" }, 401) };
+  return { ok: true, ...current };
+}
+
+async function requireExtensionSession(request, env) {
+  const auth = await requireApiSession(request, env);
+  if (!auth.ok) return auth;
+  if (!isExtensionClientType(auth.apiClientType)) {
+    return { ok: false, response: json({ error: "Extension bearer token required" }, 400) };
+  }
+  return auth;
+}
+
+async function requireRouteSession(request, env) {
+  const path = new URL(request.url).pathname;
+  if (path.startsWith("/api/v1/")) return requireApiSession(request, env);
+  return requireWebSession(request, env);
+}
+
 async function requireAuth(request, env) {
-  const current = await getCurrentUser(request, env);
+  const current = (await getCurrentApiSession(request, env)) || (await getCurrentWebSession(request, env));
   if (!current) return { ok: false, response: json({ error: "Unauthorized" }, 401) };
   return { ok: true, ...current };
 }
 
-async function getCurrentUser(request, env) {
+async function getCurrentApiSession(request, env) {
   const bearerToken = readBearerToken(request);
-  if (bearerToken) {
-    const tokenHash = await hashSessionToken(bearerToken, env);
-    const nowMs = Date.now();
-    const now = new Date(nowMs).toISOString();
-    let row = null;
-    try {
-      row = await env.DB.prepare(
-        "SELECT s.id AS session_id, s.client_type, s.last_used_at, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
-      )
-        .bind(tokenHash, now)
-        .first();
-    } catch (err) {
-      if (!isMissingTableError(err, "api_sessions")) throw err;
-    }
-    if (row) {
-      if (shouldUpdateApiSessionLastUsed(row.last_used_at, nowMs)) {
-        await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
-      }
-      return {
-        user: { id: row.id, username: row.username, role: row.role },
-        sessionKind: "api",
-        sessionId: row.session_id,
-        apiClientType: String(row.client_type || ANDROID_CLIENT_TYPE),
-      };
-    }
+  if (!bearerToken) return null;
+  const tokenHash = await hashSessionToken(bearerToken, env);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  let row = null;
+  try {
+    row = await env.DB.prepare(
+      "SELECT s.id AS session_id, s.client_type, s.last_used_at, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
+    )
+      .bind(tokenHash, now)
+      .first();
+  } catch (err) {
+    if (!isMissingTableError(err, "api_sessions")) throw err;
   }
+  if (!row) return null;
+  if (shouldUpdateApiSessionLastUsed(row.last_used_at, nowMs)) {
+    await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
+  }
+  return {
+    user: { id: row.id, username: row.username, role: row.role },
+    sessionKind: "api",
+    sessionId: row.session_id,
+    apiClientType: String(row.client_type || ANDROID_CLIENT_TYPE),
+  };
+}
 
+async function getCurrentWebSession(request, env) {
   const token = readCookie(request, SESSION_COOKIE);
   if (!token) return null;
   const tokenHash = await hashSessionToken(token, env);
   const now = nowIso();
-  const row = await env.DB.prepare(
-    "SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
-  )
-    .bind(tokenHash, now)
-    .first();
-  if (!row) return null;
-  return { user: row, sessionKind: "web" };
+  const queries = [
+    "SELECT s.id AS session_id, s.step_up_at, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
+    "SELECT s.id AS session_id, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
+    "SELECT s.id AS session_id, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
+  ];
+  let lastMissingColumn = null;
+  for (const sql of queries) {
+    try {
+      const row = await env.DB.prepare(sql).bind(tokenHash, now).first();
+      if (!row) return null;
+      return {
+        user: { id: row.id, username: row.username, role: row.role },
+        sessionKind: "web",
+        sessionId: row.session_id,
+        tokenHash,
+        stepUpAt: row.step_up_at || null,
+      };
+    } catch (err) {
+      if (!isMissingColumnError(err, "step_up_at") && !isMissingColumnError(err, "client_type")) throw err;
+      lastMissingColumn = err;
+    }
+  }
+  if (lastMissingColumn) return null;
+  return null;
 }
 
 function shouldUpdateApiSessionLastUsed(lastUsedAt, nowMs) {
@@ -2712,1571 +2859,5 @@ function html(markup, nonce) {
 
 
 function appHtml(env, nonce) {
-  const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>2FAuth 验证器</title>
-  <style nonce="${nonce}">
-    :root {
-      --bg: #f3f7f6;
-      --ink: #102a2c;
-      --muted: #5c7173;
-      --card: #ffffff;
-      --line: #d8e4e1;
-      --ok: #0f766e;
-      --warn: #b42318;
-      --chip: #e5f2ef;
-      --shadow: 0 14px 36px rgba(16, 42, 44, 0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", Arial, sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at 20% 0%, #d9ede8 0, transparent 40%),
-        linear-gradient(160deg, #f7faf9, #eef5f3 45%, #e8f2f0);
-      min-height: 100vh;
-    }
-    .page { max-width: 1180px; margin: 28px auto; padding: 0 16px 32px; }
-    .top {
-      display: flex; justify-content: space-between; align-items: center; gap: 12px;
-      margin-bottom: 14px;
-    }
-    h1 { margin: 0; font-size: 24px; }
-    .sub { color: var(--muted); font-size: 13px; }
-    .disabled { opacity: .62; }
-    .panel {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      box-shadow: var(--shadow);
-      padding: 14px;
-      margin-bottom: 12px;
-    }
-    .grid { display: grid; grid-template-columns: 320px 1fr; gap: 12px; align-items: start; }
-    .row { display: flex; flex-wrap: wrap; gap: 8px; }
-    .flush { margin: 0; }
-    .hidden { display: none; }
-    .visible { display: block !important; }
-    .top-actions { justify-content: space-between; align-items: center; }
-    .narrow-74 { width: 74px; }
-    .narrow-86 { width: 86px; }
-    .narrow-110 { width: 110px; }
-    .mt-8 { margin-top: 8px; }
-    .group-row {
-      justify-content: space-between;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 7px;
-    }
-    .swatch {
-      display: inline-block;
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: #0f766e;
-    }
-    .stack { display: grid; gap: 8px; }
-    input, select, button, textarea {
-      border-radius: 10px;
-      border: 1px solid var(--line);
-      padding: 9px 11px;
-      font-size: 14px;
-      min-height: 38px;
-    }
-    textarea { min-height: 90px; resize: vertical; width: 100%; }
-    input, select { background: #fff; color: var(--ink); }
-    button { border: 0; cursor: pointer; background: var(--ok); color: #fff; }
-    button.ghost { background: #eff5f3; color: var(--ink); border: 1px solid var(--line); }
-    button.warn { background: var(--warn); }
-    .muted { color: var(--muted); font-size: 12px; }
-    .error { color: var(--warn); font-size: 12px; }
-    video { width: 100%; border-radius: 10px; border: 1px solid var(--line); background: #dfe9e6; }
-    .entry-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-      gap: 10px;
-      align-content: start;
-      grid-auto-rows: max-content;
-    }
-    .entry {
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px;
-      background: #fff;
-      height: auto;
-    }
-    .entry .title { font-weight: 600; margin-bottom: 4px; }
-    .entry .meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-    .chip {
-      display: inline-flex; align-items: center; gap: 5px;
-      padding: 3px 9px; border-radius: 999px; background: var(--chip);
-      font-size: 12px;
-    }
-    .code { font-size: 28px; letter-spacing: 2px; font-weight: 700; margin: 8px 0 3px; }
-    .bar { height: 6px; background: #ecf2f0; border-radius: 99px; overflow: hidden; }
-    .bar > i { display: block; height: 100%; background: var(--ok); width: 0%; transition: width .3s; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border-bottom: 1px solid var(--line); padding: 7px 4px; text-align: left; font-size: 13px; }
-    #bootstrap, #login, #app { display: none; }
-    @media (max-width: 980px) {
-      .grid { grid-template-columns: 1fr; }
-      .top { flex-direction: column; align-items: flex-start; }
-    }
-    @media (max-width: 768px) {
-      .page { margin: 12px auto; padding: 0 10px 20px; }
-      .panel { padding: 12px; border-radius: 12px; }
-      .row { gap: 6px; }
-      .row > input,
-      .row > select,
-      .row > button {
-        width: 100%;
-      }
-      input, select, button, textarea {
-        min-height: 42px;
-        font-size: 15px;
-      }
-      .entry-grid {
-        grid-template-columns: 1fr;
-      }
-      .code {
-        font-size: 24px;
-      }
-      #langSelect, #autoLogoutSelect {
-        width: 100%;
-      }
-      table {
-        font-size: 12px;
-      }
-      th, td {
-        padding: 6px 3px;
-        word-break: break-word;
-      }
-    }
-  </style>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</head>
-<body>
-  <div class="page">
-    <div class="top">
-      <div>
-        <h1>2FAuth 验证器</h1>
-        <div id="state" class="sub">加载中...</div>
-      </div>
-      <div class="row">
-        <select id="langSelect">
-          <option value="zh-CN">简体中文</option>
-          <option value="en-US">English</option>
-        </select>
-        <select id="autoLogoutSelect">
-          <option value="15">15分钟自动退出</option>
-          <option value="30">30分钟自动退出</option>
-          <option value="60">60分钟自动退出</option>
-          <option value="120">120分钟自动退出</option>
-          <option value="0">不自动退出</option>
-        </select>
-        <div id="whoami" class="sub"></div>
-      </div>
-    </div>
-
-    <section id="bootstrap" class="panel stack">
-      <h3 class="flush">初始化管理员</h3>
-      <div class="row">
-        <input id="bsUser" placeholder="管理员用户名" />
-        <input id="bsPass" type="password" placeholder="密码（至少12位，含大小写/数字/符号）" />
-        <button type="button" data-action="bootstrap">初始化</button>
-      </div>
-      <div id="bsMsg" class="muted"></div>
-    </section>
-
-    <section id="login" class="panel stack">
-      <h3 class="flush">登录</h3>
-      <div class="row">
-        <input id="loginUser" placeholder="用户名" />
-        <input id="loginPass" type="password" placeholder="密码" />
-        <button type="button" data-action="login">登录</button>
-      </div>
-      <div id="turnstileBox" class="row hidden"></div>
-      <div id="loginMsg" class="muted"></div>
-    </section>
-
-    <section id="app">
-      <div class="panel row top-actions">
-        <div class="row">
-          <input id="search" placeholder="搜索标签/发行方..." />
-          <select id="groupFilter"><option value="">全部分组</option></select>
-          <button class="ghost" data-action="refresh-all">刷新</button>
-        </div>
-        <div class="row">
-          <button class="ghost" data-action="export-data">导出</button>
-          <button class="ghost" data-action="export-otpauth">导出 otpauth 文本</button>
-          <button class="ghost" data-action="export-encrypted">加密导出</button>
-          <button class="ghost" data-action="toggle-import">导入</button>
-          <button class="ghost" data-action="change-my-password">修改密码</button>
-          <button type="button" class="warn" data-action="logout">退出登录</button>
-        </div>
-      </div>
-
-      <div id="importPanel" class="panel stack hidden">
-        <h3 class="flush">导入</h3>
-        <textarea id="importText" placeholder='粘贴备份 JSON、加密备份 JSON 或 otpauth:// URI 文本'></textarea>
-        <div class="row">
-          <input id="importFile" type="file" accept=".json,.txt,text/plain,application/json" />
-          <input id="importPassphrase" type="password" placeholder="口令（用于加密备份）" />
-          <button data-action="import-data">执行导入</button>
-          <button class="ghost" data-action="import-otpauth">导入 otpauth 文本</button>
-          <button class="ghost" data-action="import-encrypted">执行加密导入</button>
-        </div>
-        <div id="importMsg" class="muted"></div>
-      </div>
-
-      <div class="grid">
-        <div class="stack">
-          <div class="panel stack">
-            <h3 class="flush">新建条目</h3>
-            <input id="eLabel" placeholder="标签（如 GitHub）" />
-            <input id="eIssuer" placeholder="发行方（可选）" />
-            <input id="eSecret" placeholder="Base32 密钥或 otpauth 文本" />
-            <input id="eUri" placeholder="或 otpauth://totp/... / otpauth://hotp/..." />
-            <div class="row">
-              <button class="ghost" data-action="start-scan">摄像头扫码</button>
-              <button class="ghost" data-action="stop-scan">停止扫码</button>
-              <input id="qrImageFile" type="file" accept="image/*" />
-            </div>
-            <video id="scanVideo" autoplay playsinline class="hidden"></video>
-            <div id="scanMsg" class="muted"></div>
-            <div class="row">
-              <select id="eOtpType"><option value="totp">TOTP</option><option value="hotp">HOTP</option></select>
-              <select id="eAlgo"><option>SHA-1</option><option>SHA-256</option><option>SHA-512</option></select>
-              <input id="eDigits" value="6" class="narrow-74" />
-              <input id="ePeriod" value="30" class="narrow-74" />
-              <input id="eCounter" value="0" class="narrow-86" />
-            </div>
-            <select id="eGroup"><option value="">不分组</option></select>
-            <button data-action="create-entry">保存条目</button>
-            <div id="entryMsg" class="muted"></div>
-          </div>
-
-          <div class="panel stack">
-            <h3 class="flush">分组</h3>
-            <div class="row">
-              <input id="gName" placeholder="分组名称" />
-              <input id="gColor" value="#0f766e" class="narrow-110" />
-              <button data-action="create-group">新增</button>
-            </div>
-            <div id="groupsList" class="stack"></div>
-          </div>
-
-          <div id="adminPanel" class="panel stack hidden">
-            <h3 class="flush">用户管理（管理员）</h3>
-            <div class="row">
-              <input id="uName" placeholder="用户名" />
-              <input id="uPass" type="password" placeholder="密码 >=12 位，含大小写/数字/符号" />
-              <select id="uRole"><option value="user">user</option><option value="admin">admin</option></select>
-              <button data-action="create-user">创建</button>
-            </div>
-            <div id="userMsg" class="muted"></div>
-            <table id="usersTable"></table>
-            <div class="panel stack mt-8">
-              <h4 class="flush">登录风控设置</h4>
-              <div class="row">
-                <input id="riskMaxReq" type="number" min="3" max="100" placeholder="每分钟请求阈值（默认10）" />
-                <input id="riskLockMin" type="number" min="1" max="1440" placeholder="锁定分钟数（默认15）" />
-                <button data-action="save-login-policy">保存风控设置</button>
-              </div>
-              <div id="riskMsg" class="muted"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel stack">
-          <h3 class="flush">我的验证码</h3>
-          <div id="entries" class="entry-grid"></div>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <script nonce="${nonce}">
-    const TURNSTILE_SITE_KEY = ${JSON.stringify(turnstileSiteKey)};
-    const PLAINTEXT_EXPORT_ENABLED = ${JSON.stringify(String((env && env.ALLOW_PLAINTEXT_EXPORT) || "").toLowerCase() === "true")};
-    let currentUser = null;
-    let entries = [];
-    let groups = [];
-    let codeState = {};
-    let serverClockOffsetMs = 0;
-    let codesRefreshing = false;
-    let scanStream = null;
-    let scanTimer = null;
-    let jsQrReady = false;
-    let inactivityTimer = null;
-    let activityBound = false;
-    let turnstileWidgetId = null;
-    let turnstileToken = "";
-    const I18N = {
-      "zh-CN": {
-        loading: "加载中...",
-        systemNotInitialized: "系统尚未初始化，请先创建管理员。",
-        pleaseLogin: "请先登录。",
-        ready: "已就绪",
-        logoutTimeout: "会话因长时间无操作已自动退出。",
-        noGroup: "不分组",
-        allGroups: "全部分组",
-        noGroupsYet: "暂无分组。",
-        noEntriesMatched: "当前筛选下没有条目。",
-        noIssuer: "无发行方",
-        clickGenerate: "点击生成",
-        secLeft: "秒后过期",
-        copyCode: "复制验证码",
-        codeCopied: "验证码已复制",
-        copyFailed: "复制失败，请手动复制",
-        setGroup: "设为分组",
-        removeGroup: "移出分组",
-        groupUpdated: "分组已更新",
-        generateHotp: "生成 HOTP",
-        enableEntry: "启用",
-        disableEntry: "停用",
-        disabledEntry: "已停用",
-        edit: "编辑",
-        delete: "删除",
-        deleteEntryConfirm: "确认删除该条目？",
-        deleteGroupConfirm: "确认删除分组？分组下条目将变为不分组。",
-        deleteUserConfirm: "确认删除用户？",
-        backupCopied: "备份 JSON 已复制到剪贴板。",
-        encryptedBackupCopied: "加密备份 JSON 已复制到剪贴板。",
-        plaintextExportConfirm: "明文导出会包含所有 OTP 密钥。确认继续？",
-        plaintextExportDisabled: "当前部署未开启明文导出，请使用“加密导出”。",
-        setBackupPassphrase: "设置备份口令（至少10位）",
-        copyExportJson: "复制导出 JSON",
-        copyEncryptedExportJson: "复制加密导出 JSON",
-        importedDone: "导入完成",
-        encryptedImportedDone: "加密导入完成",
-        cameraNotSupported: "当前浏览器不支持 BarcodeDetector。",
-        cameraFallback: "已启用兼容扫码模式（jsQR）。",
-        cameraStarted: "摄像头扫码已启动...",
-        qrDetected: "已识别二维码，URI 已填入表单。",
-        qrReadyToSave: "二维码已识别，点击“保存条目”即可添加。",
-        cameraDenied: "无法访问摄像头：",
-        noQrFound: "图片中未识别到二维码。",
-        qrFromImage: "图片二维码识别成功。",
-        scanImageFailed: "图片扫码失败：",
-        saved: "已保存",
-        userCreated: "用户已创建",
-        changePassword: "修改密码",
-        resetPassword: "重置密码",
-        currentPassword: "当前密码",
-        newPassword: "新密码",
-        passwordChanged: "密码已修改，请重新登录。",
-        passwordReset: "密码已重置",
-        passwordResetConfirm: "确认重置该用户的密码？",
-        labelPrompt: "标签",
-        issuerPrompt: "发行方",
-        groupIdPrompt: "分组 ID（留空代表不分组）",
-        usersThId: "ID",
-        usersThName: "用户名",
-        usersThRole: "角色",
-        usersThAction: "操作",
-        setRole: "设置为",
-        riskPolicySaved: "风控设置已保存",
-        riskPolicyLoaded: "当前风控：每分钟",
-        times: "次",
-        lockFor: "，锁定",
-        minutes: "分钟",
-        otpauthExportDone: "otpauth 文本已下载。",
-        otpauthImportDone: "otpauth 导入完成",
-        otpUriDetected: "已识别 otpauth URI。",
-        otpSecretDetected: "已识别 Base32 密钥。",
-        otpInputUnsupported: "请输入 otpauth URI 或 Base32 密钥。",
-        qrInvalid: "二维码不包含 otpauth URI 或 Base32 密钥。",
-        importFileLoaded: "文件内容已加载到导入框。",
-        turnstileRequired: "请先完成 Cloudflare Turnstile 验证。",
-      },
-      "en-US": {
-        loading: "Loading...",
-        systemNotInitialized: "System not initialized yet.",
-        pleaseLogin: "Please login.",
-        ready: "Ready",
-        logoutTimeout: "Logged out due to inactivity.",
-        noGroup: "No group",
-        allGroups: "All groups",
-        noGroupsYet: "No groups yet.",
-        noEntriesMatched: "No entries match current filters.",
-        noIssuer: "No issuer",
-        clickGenerate: "Click Generate",
-        secLeft: "s left",
-        copyCode: "Copy Code",
-        codeCopied: "Code copied",
-        copyFailed: "Copy failed, please copy manually",
-        setGroup: "Set Group",
-        removeGroup: "Remove Group",
-        groupUpdated: "Group updated",
-        generateHotp: "Generate HOTP",
-        enableEntry: "Enable",
-        disableEntry: "Disable",
-        disabledEntry: "Disabled",
-        edit: "Edit",
-        delete: "Delete",
-        deleteEntryConfirm: "Delete this entry?",
-        deleteGroupConfirm: "Delete group? Entries will be ungrouped.",
-        deleteUserConfirm: "Delete user?",
-        backupCopied: "Backup JSON copied to clipboard.",
-        encryptedBackupCopied: "Encrypted backup JSON copied to clipboard.",
-        plaintextExportConfirm: "Plaintext export includes all OTP secrets. Continue?",
-        plaintextExportDisabled: "Plaintext export is disabled in this deployment. Use encrypted export instead.",
-        setBackupPassphrase: "Set backup passphrase (>=10 chars):",
-        copyExportJson: "Copy export JSON:",
-        copyEncryptedExportJson: "Copy encrypted export JSON:",
-        importedDone: "Import completed",
-        encryptedImportedDone: "Encrypted import completed",
-        cameraNotSupported: "BarcodeDetector is not supported by this browser.",
-        cameraFallback: "Using compatible scanner mode (jsQR).",
-        cameraStarted: "Camera scanning started...",
-        qrDetected: "QR detected. URI filled in form.",
-        qrReadyToSave: "QR parsed. Click 'Save Entry' to add it.",
-        cameraDenied: "Camera access denied or unavailable: ",
-        noQrFound: "No QR code found in image.",
-        qrFromImage: "QR detected from image.",
-        scanImageFailed: "Failed to scan image: ",
-        saved: "Saved",
-        userCreated: "User created",
-        changePassword: "Change Password",
-        resetPassword: "Reset Password",
-        currentPassword: "Current password",
-        newPassword: "New password",
-        passwordChanged: "Password changed. Please login again.",
-        passwordReset: "Password reset",
-        passwordResetConfirm: "Confirm reset this user's password?",
-        labelPrompt: "Label",
-        issuerPrompt: "Issuer",
-        groupIdPrompt: "Group ID (empty for none)",
-        usersThId: "ID",
-        usersThName: "Username",
-        usersThRole: "Role",
-        usersThAction: "Action",
-        setRole: "Set",
-        riskPolicySaved: "Risk policy saved",
-        riskPolicyLoaded: "Current policy:",
-        times: "times/min",
-        lockFor: ", lock for ",
-        minutes: "minutes",
-        otpauthExportDone: "otpauth text downloaded.",
-        otpauthImportDone: "otpauth import completed",
-        otpUriDetected: "otpauth URI detected.",
-        otpSecretDetected: "Base32 secret detected.",
-        otpInputUnsupported: "Enter an otpauth URI or Base32 secret.",
-        qrInvalid: "QR code does not contain an otpauth URI or Base32 secret.",
-        importFileLoaded: "File content loaded into import box.",
-        turnstileRequired: "Please complete Cloudflare Turnstile verification first.",
-      }
-    };
-    let currentLang = localStorage.getItem("ui_lang") || "zh-CN";
-    let autoLogoutMinutes = Number(localStorage.getItem("auto_logout_minutes") || "30");
-
-    function t(key) {
-      const pack = I18N[currentLang] || I18N["zh-CN"];
-      return pack[key] || key;
-    }
-
-    function changeLang(lang) {
-      currentLang = I18N[lang] ? lang : "zh-CN";
-      localStorage.setItem("ui_lang", currentLang);
-      applyLanguage();
-      renderGroups();
-      renderEntries();
-      if (currentUser && currentUser.role === "admin") refreshUsers();
-    }
-
-    function changeAutoLogout(minutes) {
-      autoLogoutMinutes = Number(minutes || 0);
-      localStorage.setItem("auto_logout_minutes", String(autoLogoutMinutes));
-      scheduleAutoLogout();
-    }
-
-    function applyLanguage() {
-      document.documentElement.lang = currentLang;
-      document.getElementById("langSelect").value = currentLang;
-      document.getElementById("autoLogoutSelect").value = String(autoLogoutMinutes);
-      syncPlaintextExportUi();
-      if (!currentUser) {
-        document.getElementById("state").textContent = t("loading");
-      }
-    }
-
-    function syncPlaintextExportUi() {
-      const buttons = document.querySelectorAll('[data-action="export-data"], [data-action="export-otpauth"]');
-      buttons.forEach(function(button) {
-        button.disabled = !PLAINTEXT_EXPORT_ENABLED;
-        button.title = PLAINTEXT_EXPORT_ENABLED ? "" : t("plaintextExportDisabled");
-      });
-    }
-
-    async function timeoutLogout() {
-      try {
-        await api("/api/logout", { method: "POST", body: "{}" });
-      } finally {
-        alert(t("logoutTimeout"));
-        location.reload();
-      }
-    }
-
-    function scheduleAutoLogout() {
-      if (inactivityTimer) clearTimeout(inactivityTimer);
-      if (!currentUser) return;
-      if (!Number.isFinite(autoLogoutMinutes) || autoLogoutMinutes <= 0) return;
-      inactivityTimer = setTimeout(timeoutLogout, autoLogoutMinutes * 60 * 1000);
-    }
-
-    function onActivity() {
-      scheduleAutoLogout();
-    }
-
-    function bindActivityEvents() {
-      if (activityBound) return;
-      activityBound = true;
-      ["click", "keydown", "mousemove", "touchstart", "scroll"].forEach(function(evt) {
-        window.addEventListener(evt, onActivity, { passive: true });
-      });
-      window.addEventListener("pagehide", closeSoonOnLeave);
-      window.addEventListener("beforeunload", closeSoonOnLeave);
-    }
-
-    function closeSoonOnLeave() {
-      if (!currentUser) return;
-      try {
-        const blob = new Blob(['{}'], { type: "application/json" });
-        // N-06 fix: use sendBeacon as primary; only fall back to fetch on failure
-        const ok = navigator.sendBeacon("/api/session/close-soon", blob);
-        if (!ok) {
-          fetch("/api/session/close-soon", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Session-Close": "web-beforeunload" },
-            body: "{}",
-            keepalive: true,
-            credentials: "same-origin"
-          }).catch(function() {});
-        }
-      } catch {}
-    }
-
-    function initTurnstile() {
-      if (!TURNSTILE_SITE_KEY) return;
-      const box = document.getElementById("turnstileBox");
-      if (!box) return;
-      box.classList.remove("hidden");
-
-      let tries = 0;
-      const tryRender = function() {
-        if (turnstileWidgetId !== null) return;
-        if (window.turnstile && typeof window.turnstile.render === "function") {
-          turnstileWidgetId = window.turnstile.render("#turnstileBox", {
-            sitekey: TURNSTILE_SITE_KEY,
-            callback: function(token) { turnstileToken = token || ""; },
-            "expired-callback": function() { turnstileToken = ""; },
-            "error-callback": function() { turnstileToken = ""; }
-          });
-          return;
-        }
-        tries += 1;
-        if (tries < 40) setTimeout(tryRender, 100);
-      };
-      tryRender();
-    }
-
-    async function api(path, opts = {}) {
-      const res = await fetch(path, {
-        ...opts,
-        headers: { "content-type": "application/json", ...(opts.headers || {}) },
-        credentials: "include"
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail ? data.error + ": " + data.detail : (data.error || ("HTTP " + res.status)));
-      return data;
-    }
-
-    function msg(id, text, err) {
-      const el = document.getElementById(id);
-      el.textContent = text || "";
-      el.className = err ? "error" : "muted";
-    }
-
-    async function init() {
-      applyLanguage();
-      try {
-        const status = await api("/api/status");
-        if (!status.initialized) {
-          document.getElementById("state").textContent = t("systemNotInitialized");
-          document.getElementById("bootstrap").classList.add("visible");
-          return;
-        }
-        const me = await api("/api/me").catch(() => null);
-        if (!me) {
-          document.getElementById("state").textContent = t("pleaseLogin");
-          document.getElementById("login").classList.add("visible");
-          initTurnstile();
-          return;
-        }
-        currentUser = me.user;
-        document.getElementById("state").textContent = t("ready");
-        document.getElementById("whoami").textContent = me.user.username + " (" + me.user.role + ")";
-        document.getElementById("app").classList.add("visible");
-        bindActivityEvents();
-        scheduleAutoLogout();
-        if (me.user.role === "admin") document.getElementById("adminPanel").classList.remove("hidden");
-        await refreshAll();
-        if (me.user.role === "admin") {
-          await refreshUsers();
-          await loadLoginPolicy();
-        }
-      } catch (e) {
-        document.getElementById("state").textContent = e.message;
-      }
-    }
-
-    async function bootstrap(evt) {
-      if (evt && typeof evt.preventDefault === "function") evt.preventDefault();
-      try {
-        await api("/api/bootstrap", {
-          method: "POST",
-          body: JSON.stringify({ username: v("bsUser"), password: v("bsPass") })
-        });
-        window.location.replace("/");
-      } catch (e) { msg("bsMsg", e.message, true); }
-    }
-
-    async function login(evt) {
-      if (evt && typeof evt.preventDefault === "function") evt.preventDefault();
-      try {
-        if (TURNSTILE_SITE_KEY && !turnstileToken) {
-          msg("loginMsg", t("turnstileRequired"), true);
-          return;
-        }
-        await api("/api/login", {
-          method: "POST",
-          body: JSON.stringify({ username: v("loginUser"), password: v("loginPass"), turnstileToken: turnstileToken })
-        });
-        window.location.replace("/");
-      } catch (e) {
-        msg("loginMsg", e.message, true);
-        if (window.turnstile && turnstileWidgetId !== null) {
-          try { window.turnstile.reset(turnstileWidgetId); } catch {}
-          turnstileToken = "";
-        }
-      }
-    }
-
-    async function logout(evt) {
-      if (evt && typeof evt.preventDefault === "function") evt.preventDefault();
-      if (inactivityTimer) clearTimeout(inactivityTimer);
-      await api("/api/logout", { method: "POST", body: "{}" });
-      window.location.replace("/");
-    }
-
-    function v(id) { return document.getElementById(id).value; }
-
-    function findOtpAuthUri(text) {
-      const match = String(text || "").match(/otpauth:\/\/[^\s"'<>]+/i);
-      return match ? match[0] : "";
-    }
-
-    function canonicalFormBase32(input) {
-      return String(input || "").toUpperCase().replace(/[\s=-]/g, "");
-    }
-
-    function isLikelyBase32Secret(input) {
-      const secret = canonicalFormBase32(input);
-      return secret.length >= 8 && /^[A-Z2-7]+$/.test(secret);
-    }
-
-    function normalizeFormAlgorithm(value) {
-      const v = String(value || "").toUpperCase();
-      if (v === "SHA1" || v === "SHA-1") return "SHA-1";
-      if (v === "SHA256" || v === "SHA-256") return "SHA-256";
-      if (v === "SHA512" || v === "SHA-512") return "SHA-512";
-      return "SHA-1";
-    }
-
-    function applyOtpUriToForm(uri) {
-      try {
-        const url = new URL(uri);
-        if (url.protocol !== "otpauth:" || !["totp", "hotp"].includes(url.hostname)) return false;
-        const secret = canonicalFormBase32(url.searchParams.get("secret") || "");
-        if (!isLikelyBase32Secret(secret)) return false;
-        const labelRaw = decodeURIComponent(url.pathname.startsWith("/") ? url.pathname.slice(1) : url.pathname);
-        let issuer = String(url.searchParams.get("issuer") || "").trim();
-        let label = labelRaw;
-        const colon = labelRaw.indexOf(":");
-        if (colon >= 0) {
-          if (!issuer) issuer = labelRaw.slice(0, colon).trim();
-          label = labelRaw.slice(colon + 1).trim();
-        }
-        document.getElementById("eUri").value = String(uri || "").trim();
-        document.getElementById("eSecret").value = "";
-        document.getElementById("eLabel").value = label || issuer || "OTP";
-        document.getElementById("eIssuer").value = issuer;
-        document.getElementById("eOtpType").value = url.hostname === "hotp" ? "hotp" : "totp";
-        document.getElementById("eAlgo").value = normalizeFormAlgorithm(url.searchParams.get("algorithm") || "SHA-1");
-        document.getElementById("eDigits").value = String(Number(url.searchParams.get("digits") || 6) || 6);
-        document.getElementById("ePeriod").value = String(Number(url.searchParams.get("period") || 30) || 30);
-        document.getElementById("eCounter").value = String(Number(url.searchParams.get("counter") || 0) || 0);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-
-    function applyOtpInput(raw, messageId) {
-      const value = String(raw || "").trim();
-      if (!value) return true;
-      const uri = findOtpAuthUri(value);
-      if (uri) {
-        if (!applyOtpUriToForm(uri)) {
-          if (messageId) msg(messageId, t("otpInputUnsupported"), true);
-          return false;
-        }
-        if (messageId) msg(messageId, t("otpUriDetected"));
-        return true;
-      }
-      if (isLikelyBase32Secret(value)) {
-        document.getElementById("eSecret").value = canonicalFormBase32(value);
-        document.getElementById("eUri").value = "";
-        if (messageId) msg(messageId, t("otpSecretDetected"));
-        return true;
-      }
-      if (messageId) msg(messageId, t("otpInputUnsupported"), true);
-      return false;
-    }
-
-    function bindOtpInputRecognition(id) {
-      const el = document.getElementById(id);
-      ["paste", "change"].forEach(function(evtName) {
-        el.addEventListener(evtName, function() {
-          setTimeout(function() {
-            if (el.value) applyOtpInput(el.value, "entryMsg");
-          }, 0);
-        });
-      });
-    }
-
-    async function refreshAll() {
-      const data = await api("/api/app-data");
-      entries = data.entries || [];
-      groups = data.groups || [];
-      pruneCodeState();
-      hydrateGroupSelects();
-      renderGroups();
-      renderEntries();
-      await refreshVisibleCodes();
-    }
-
-    function isEntryEnabled(entry) {
-      return !entry || entry.enabled === undefined || entry.enabled === null || Number(entry.enabled) !== 0;
-    }
-
-    function serverNowSec() {
-      return Math.floor((Date.now() + serverClockOffsetMs) / 1000);
-    }
-
-    function pruneCodeState() {
-      const validIds = new Set(entries.map(function(e) { return String(e.id); }));
-      Object.keys(codeState).forEach(function(id) {
-        if (!validIds.has(String(id))) delete codeState[id];
-      });
-    }
-
-    function hydrateGroupSelects() {
-      const opts = ['<option value="">' + esc(t("noGroup")) + '</option>'];
-      const filter = ['<option value="">' + esc(t("allGroups")) + '</option>'];
-      groups.forEach(function(g) {
-        opts.push('<option value="' + g.id + '">' + esc(g.name) + '</option>');
-        filter.push('<option value="' + g.id + '">' + esc(g.name) + '</option>');
-      });
-      document.getElementById("eGroup").innerHTML = opts.join("");
-      document.getElementById("groupFilter").innerHTML = filter.join("");
-    }
-
-    function renderGroups() {
-      const box = document.getElementById("groupsList");
-      if (!groups.length) { box.innerHTML = '<div class="muted">' + esc(t("noGroupsYet")) + '</div>'; return; }
-      box.innerHTML = groups.map(function(g) {
-        return '<div class="row group-row">'
-          + '<span class="chip"><i class="swatch" data-color="' + esc(g.color || "#0f766e") + '"></i>' + esc(g.name) + '</span>'
-          + '<button class="warn" data-action="delete-group" data-id="' + g.id + '">' + esc(t("delete")) + '</button>'
-          + '</div>';
-      }).join("");
-      applyDynamicStyles();
-    }
-
-    function groupOptionsHtml(selectedGroupId) {
-      const selected = selectedGroupId === null || selectedGroupId === undefined ? "" : String(selectedGroupId);
-      const opts = ['<option value="">' + esc(t("noGroup")) + '</option>'];
-      groups.forEach(function(g) {
-        const val = String(g.id);
-        const isSelected = val === selected ? " selected" : "";
-        opts.push('<option value="' + esc(val) + '"' + isSelected + '>' + esc(g.name) + '</option>');
-      });
-      return opts.join("");
-    }
-
-    function renderEntries() {
-      const q = v("search").trim().toLowerCase();
-      const gf = v("groupFilter");
-      const list = entries.filter(function(e) {
-        const text = (e.label + " " + (e.issuer || "")).toLowerCase();
-        if (q && !text.includes(q)) return false;
-        if (gf && String(e.group_id || "") !== gf) return false;
-        return true;
-      });
-      const out = document.getElementById("entries");
-      if (!list.length) { out.innerHTML = '<div class="muted">' + esc(t("noEntriesMatched")) + '</div>'; return; }
-      out.innerHTML = list.map(function(e) {
-        const state = codeState[e.id] || {};
-        const enabled = isEntryEnabled(e);
-        const code = enabled ? (state.code || "------") : "------";
-        const timing = entryTiming(e);
-        const group = e.group_name ? '<span class="chip"><i class="swatch" data-color="' + esc(e.group_color || "#0f766e") + '"></i>' + esc(e.group_name) + '</span>' : '';
-        const otpTag = '<span class="chip">' + esc((e.otp_type || "totp").toUpperCase()) + '</span>';
-        const statusTag = enabled ? '' : '<span class="chip">' + esc(t("disabledEntry")) + '</span>';
-        const counter = (e.otp_type === "hotp") ? ('<span class="chip">counter ' + Number(e.hotp_counter || 0) + '</span>') : '';
-        const statusText = enabled ? ((e.otp_type === "hotp") ? t("clickGenerate") : timing.expiresIn + t("secLeft")) : t("disabledEntry");
-        return '<article class="entry' + (enabled ? '' : ' disabled') + '">'
-          + '<div class="title">' + esc(e.label) + '</div>'
-          + '<div class="meta">' + esc(e.issuer || t("noIssuer")) + '</div>'
-          + '<div class="row">' + otpTag + statusTag + group + counter + '</div>'
-          + '<div class="code" id="c-' + e.id + '">' + esc(code) + '</div>'
-          + '<div class="muted" id="x-' + e.id + '">' + esc(statusText) + '</div>'
-          + '<div class="bar"><i id="p-' + e.id + '" data-progress="' + (enabled ? timing.progress : 0) + '"></i></div>'
-          + '<div class="row mt-8">'
-          + (e.otp_type === "hotp"
-            ? '<button data-action="gen-hotp" data-id="' + e.id + '">' + esc(t("generateHotp")) + '</button>'
-            : '<button class="ghost" data-action="copy-code" data-id="' + e.id + '">' + esc(t("copyCode")) + '</button>')
-          + '<button class="ghost" data-action="toggle-entry" data-id="' + e.id + '" data-enabled="' + (enabled ? "0" : "1") + '">' + esc(enabled ? t("disableEntry") : t("enableEntry")) + '</button>'
-          + '<select id="entry-group-' + e.id + '">' + groupOptionsHtml(e.group_id) + '</select>'
-          + '<button class="ghost" data-action="set-entry-group" data-id="' + e.id + '">' + esc(t("setGroup")) + '</button>'
-          + '<button class="ghost" data-action="remove-entry-group" data-id="' + e.id + '">' + esc(t("removeGroup")) + '</button>'
-          + '<button class="ghost" data-action="edit-entry" data-id="' + e.id + '">' + esc(t("edit")) + '</button>'
-          + '<button class="warn" data-action="delete-entry" data-id="' + e.id + '">' + esc(t("delete")) + '</button>'
-          + '</div></article>';
-      }).join("");
-      applyDynamicStyles();
-      updateCodeTimers();
-    }
-
-    async function refreshVisibleCodes() {
-      const current = entries.filter(function(e) { return e.otp_type !== "hotp" && isEntryEnabled(e); });
-      await refreshCodesBatch(current, true);
-    }
-
-    async function refreshCode(id, silent) {
-      const entry = entries.find(function(x){ return x.id === id; });
-      if (entry && !isEntryEnabled(entry)) {
-        delete codeState[id];
-        updateEntryDisplay(id);
-        return;
-      }
-      try {
-        const r = await api("/api/entries/" + id + "/code?_t=" + Date.now());
-        if (Number.isFinite(r.now)) serverClockOffsetMs = (Number(r.now) * 1000) - Date.now();
-        codeState[id] = { code: r.code, fetchedStep: entryStep(entry) };
-        updateEntryDisplay(id);
-      } catch (e) {
-        if (!silent) alert(e.message);
-      }
-    }
-
-    async function refreshCodesBatch(list, silent) {
-      const current = (list || []).filter(function(e) { return e && e.otp_type !== "hotp" && isEntryEnabled(e); });
-      if (!current.length || codesRefreshing) return;
-      codesRefreshing = true;
-      try {
-        const result = await api("/api/codes/batch", {
-          method: "POST",
-          body: JSON.stringify({ entryIds: current.map(function(e) { return e.id; }) })
-        });
-        if (Number.isFinite(result.serverTime)) {
-          serverClockOffsetMs = (Number(result.serverTime) * 1000) - Date.now();
-        }
-        (result.items || []).forEach(function(item) {
-          const entry = entries.find(function(e) { return Number(e.id) === Number(item.id); });
-          if (!entry) return;
-          if (item.error || item.enabled === false) {
-            if (item.enabled === false) delete codeState[item.id];
-            return;
-          }
-          codeState[item.id] = { code: item.code, fetchedStep: entryStep(entry) };
-          updateEntryDisplay(item.id);
-        });
-        updateCodeTimers();
-      } catch (e) {
-        if (!silent) alert(e.message);
-      } finally {
-        codesRefreshing = false;
-      }
-    }
-
-    function entryPeriod(entry) {
-      return Math.max(1, Number((entry && entry.period) || 30));
-    }
-
-    function entryStep(entry) {
-      return Math.floor(serverNowSec() / entryPeriod(entry));
-    }
-
-    function entryTiming(entry) {
-      if (!isEntryEnabled(entry) || entry.otp_type === "hotp") return { expiresIn: 0, progress: entry.otp_type === "hotp" ? 100 : 0 };
-      const period = entryPeriod(entry);
-      const now = serverNowSec();
-      const elapsed = now % period;
-      return {
-        expiresIn: period - elapsed,
-        progress: Math.max(0, Math.min(100, (elapsed / period) * 100)),
-      };
-    }
-
-    function updateEntryDisplay(id) {
-      const entry = entries.find(function(e) { return Number(e.id) === Number(id); });
-      if (!entry) return;
-      const state = codeState[id] || {};
-      const enabled = isEntryEnabled(entry);
-      const timing = entryTiming(entry);
-      const codeEl = document.getElementById("c-" + id);
-      const exEl = document.getElementById("x-" + id);
-      const pEl = document.getElementById("p-" + id);
-      if (codeEl) codeEl.textContent = enabled ? (state.code || "------") : "------";
-      if (exEl) {
-        if (!enabled) exEl.textContent = t("disabledEntry");
-        else if (entry.otp_type === "hotp") exEl.textContent = t("clickGenerate");
-        else exEl.textContent = timing.expiresIn + t("secLeft");
-      }
-      if (pEl) pEl.style.width = (enabled ? timing.progress : 0) + "%";
-    }
-
-    function updateCodeTimers() {
-      let needsRefresh = [];
-      entries.forEach(function(entry) {
-        if (entry.otp_type === "hotp" || !isEntryEnabled(entry)) return;
-        updateEntryDisplay(entry.id);
-        const state = codeState[entry.id] || {};
-        const step = entryStep(entry);
-        if (!state.code || state.fetchedStep !== step) needsRefresh.push(entry);
-      });
-      if (needsRefresh.length) refreshCodesBatch(needsRefresh, true);
-    }
-
-    async function copyCode(id) {
-      const entry = entries.find(function(x){ return Number(x.id) === Number(id); });
-      if (entry && !isEntryEnabled(entry)) {
-        alert(t("disabledEntry"));
-        return;
-      }
-      const state = codeState[id] || {};
-      const code = String(state.code || "").trim();
-      if (!code || code === "------") {
-        try {
-          await refreshCode(id, true);
-        } catch {}
-      }
-      const latest = String(((codeState[id] || {}).code) || "").trim();
-      if (!latest || latest === "------") {
-        alert(t("copyFailed"));
-        return;
-      }
-      try {
-        await navigator.clipboard.writeText(latest);
-        alert(t("codeCopied"));
-      } catch (e) {
-        const ok = window.prompt(t("copyFailed"), latest);
-        if (ok !== null) {
-          alert(t("codeCopied"));
-        }
-      }
-    }
-
-    async function genHotp(id) {
-      const entry = entries.find(function(x){ return Number(x.id) === Number(id); });
-      if (entry && !isEntryEnabled(entry)) {
-        alert(t("disabledEntry"));
-        return;
-      }
-      try {
-        const r = await api("/api/entries/" + id + "/hotp", { method: "POST", body: "{}" });
-        codeState[id] = { code: r.code, fetchedStep: 0 };
-        await refreshAll();
-      } catch (e) { alert(e.message); }
-    }
-
-    async function toggleEntry(id, enabled) {
-      await api("/api/entries/" + id, {
-        method: "PATCH",
-        body: JSON.stringify({ enabled: enabled })
-      });
-      if (!enabled) delete codeState[id];
-      await refreshAll();
-    }
-
-    async function createEntry() {
-      try {
-        if (v("eUri") && !applyOtpInput(v("eUri"), "entryMsg")) return;
-        if (v("eSecret") && !applyOtpInput(v("eSecret"), "entryMsg")) return;
-        const hasUri = !!String(v("eUri") || "").trim();
-        const payload = {
-          label: v("eLabel"),
-          issuer: v("eIssuer"),
-          groupId: v("eGroup") ? Number(v("eGroup")) : null
-        };
-        if (hasUri) {
-          payload.otpauthUri = v("eUri");
-        } else {
-          payload.secret = v("eSecret");
-          payload.otpType = v("eOtpType");
-          payload.algorithm = v("eAlgo");
-          payload.digits = Number(v("eDigits") || 6);
-          payload.period = Number(v("ePeriod") || 30);
-          payload.hotpCounter = Number(v("eCounter") || 0);
-        }
-        await api("/api/entries", {
-          method: "POST",
-          body: JSON.stringify(payload)
-        });
-        msg("entryMsg", t("saved"));
-        ["eLabel","eIssuer","eSecret","eUri"].forEach(function(id){ document.getElementById(id).value = ""; });
-        await refreshAll();
-      } catch (e) { msg("entryMsg", e.message, true); }
-    }
-
-    async function setEntryGroup(id) {
-      const el = document.getElementById("entry-group-" + id);
-      const groupId = el && el.value ? Number(el.value) : null;
-      await api("/api/entries/" + id, {
-        method: "PATCH",
-        body: JSON.stringify({ groupId: groupId })
-      });
-      alert(t("groupUpdated"));
-      await refreshAll();
-    }
-
-    async function removeEntryGroup(id) {
-      await api("/api/entries/" + id, {
-        method: "PATCH",
-        body: JSON.stringify({ groupId: null })
-      });
-      alert(t("groupUpdated"));
-      await refreshAll();
-    }
-
-    async function editEntry(id) {
-      const e = entries.find(function(x){ return Number(x.id) === Number(id); });
-      if (!e) return;
-      const label = prompt(t("labelPrompt"), e.label); if (label === null) return;
-      const issuer = prompt(t("issuerPrompt"), e.issuer || ""); if (issuer === null) return;
-      const groupIdRaw = prompt(t("groupIdPrompt"), e.group_id || "");
-      const groupId = groupIdRaw ? Number(groupIdRaw) : null;
-      await api("/api/entries/" + id, {
-        method: "PATCH",
-        body: JSON.stringify({ label: label, issuer: issuer, groupId: groupId })
-      });
-      await refreshAll();
-    }
-
-    async function deleteEntry(id) {
-      if (!confirm(t("deleteEntryConfirm"))) return;
-      await api("/api/entries/" + id, { method: "DELETE" });
-      await refreshAll();
-    }
-
-    async function createGroup() {
-      try {
-        await api("/api/groups", {
-          method: "POST",
-          body: JSON.stringify({ name: v("gName"), color: v("gColor") })
-        });
-        document.getElementById("gName").value = "";
-        await refreshAll();
-      } catch (e) { alert(e.message); }
-    }
-
-    async function deleteGroup(id) {
-      if (!confirm(t("deleteGroupConfirm"))) return;
-      await api("/api/groups/" + id, { method: "DELETE" });
-      await refreshAll();
-    }
-
-    async function createUser() {
-      try {
-        await api("/api/users", {
-          method: "POST",
-          body: JSON.stringify({ username: v("uName"), password: v("uPass"), role: v("uRole") })
-        });
-        msg("userMsg", t("userCreated"));
-        await refreshUsers();
-      } catch (e) { msg("userMsg", e.message, true); }
-    }
-
-    async function loadLoginPolicy() {
-      try {
-        const d = await api("/api/security/login-policy");
-        document.getElementById("riskMaxReq").value = d.maxRequestsPerMinute;
-        document.getElementById("riskLockMin").value = d.lockMinutes;
-        msg(
-          "riskMsg",
-          t("riskPolicyLoaded") + " " + d.maxRequestsPerMinute + " " + t("times") + t("lockFor") + d.lockMinutes + " " + t("minutes")
-        );
-      } catch (e) {
-        msg("riskMsg", e.message, true);
-      }
-    }
-
-    async function saveLoginPolicy() {
-      try {
-        const maxRequestsPerMinute = Number(v("riskMaxReq") || 10);
-        const lockMinutes = Number(v("riskLockMin") || 15);
-        await api("/api/security/login-policy", {
-          method: "PATCH",
-          body: JSON.stringify({ maxRequestsPerMinute: maxRequestsPerMinute, lockMinutes: lockMinutes })
-        });
-        msg("riskMsg", t("riskPolicySaved"));
-        await loadLoginPolicy();
-      } catch (e) {
-        msg("riskMsg", e.message, true);
-      }
-    }
-
-    async function refreshUsers() {
-      const d = await api("/api/users");
-      const table = document.getElementById("usersTable");
-      // F-03 fix: rebuild table with a single DOM write (no innerHTML += accumulation)
-      const tbody = document.createElement("tbody");
-      const headerRow = document.createElement("tr");
-      headerRow.innerHTML = "<th>" + esc(t("usersThId")) + "</th><th>" + esc(t("usersThName")) + "</th><th>" + esc(t("usersThRole")) + "</th><th>" + esc(t("usersThAction")) + "</th>";
-      tbody.appendChild(headerRow);
-      (d.users || []).forEach(function(u) {
-        const next = u.role === "admin" ? "user" : "admin";
-        const tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + u.id + "</td><td>" + esc(u.username) + "</td><td>" + u.role + "</td><td>" +
-          "<button class='ghost' data-action='switch-role' data-id='" + u.id + "' data-role='" + next + "'>" + esc(t("setRole")) + " " + next + "</button> " +
-          "<button class='ghost' data-action='reset-password' data-id='" + u.id + "'>" + esc(t("resetPassword")) + "</button> " +
-          "<button class='warn' data-action='delete-user' data-id='" + u.id + "'>" + esc(t("delete")) + "</button></td>";
-        tbody.appendChild(tr);
-      });
-      table.replaceChildren(tbody);
-    }
-
-    async function switchRole(id, role) {
-      // F-03 fix: properly implemented switchRole body
-      await api("/api/users/" + id + "/role", { method: "PATCH", body: JSON.stringify({ role: role }) });
-      await refreshUsers();
-    }
-
-    async function changeMyPassword() {
-      const currentPassword = prompt(t("currentPassword"));
-      if (!currentPassword) return;
-      const newPassword = prompt(t("newPassword"));
-      if (!newPassword) return;
-      try {
-        await api("/api/me/password", {
-          method: "PATCH",
-          body: JSON.stringify({ currentPassword: currentPassword, newPassword: newPassword })
-        });
-        alert(t("passwordChanged"));
-        location.reload();
-      } catch (e) { alert(e.message); }
-    }
-
-    async function resetPassword(id) {
-      if (!confirm(t("passwordResetConfirm"))) return;
-      const newPassword = prompt(t("newPassword"));
-      if (!newPassword) return;
-      try {
-        await api("/api/users/" + id + "/password", {
-          method: "PATCH",
-          body: JSON.stringify({ newPassword: newPassword })
-        });
-        alert(t("passwordReset"));
-        await refreshUsers();
-      } catch (e) { alert(e.message); }
-    }
-
-    async function deleteUser(id) {
-      if (!confirm(t("deleteUserConfirm"))) return;
-      await api("/api/users/" + id, { method: "DELETE" });
-      await refreshUsers();
-    }
-
-    function toggleImport() {
-      const el = document.getElementById("importPanel");
-      el.classList.toggle("hidden");
-    }
-
-    async function exportData() {
-      if (!PLAINTEXT_EXPORT_ENABLED) {
-        alert(t("plaintextExportDisabled"));
-        return;
-      }
-      if (!confirm(t("plaintextExportConfirm"))) return;
-      const password = prompt(t("currentPassword"));
-      if (!password) return;
-      const d = await api("/api/export", {
-        method: "POST",
-        body: JSON.stringify({ confirmPassword: password })
-      });
-      const text = JSON.stringify(d, null, 2);
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-        alert(t("backupCopied"));
-      } else {
-        prompt(t("copyExportJson"), text);
-      }
-    }
-
-    async function exportOtpAuthTxt() {
-      try {
-        if (!PLAINTEXT_EXPORT_ENABLED) {
-          alert(t("plaintextExportDisabled"));
-          return;
-        }
-        if (!confirm(t("plaintextExportConfirm"))) return;
-        const password = prompt(t("currentPassword"));
-        if (!password) return;
-        const resp = await fetch("/api/export/otpauth", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ confirmPassword: password })
-        });
-        if (!resp.ok) {
-          let err = "HTTP " + resp.status;
-          try {
-            const d = await resp.json();
-            if (d && d.error) err = d.error;
-          } catch {}
-          throw new Error(err);
-        }
-        const text = await resp.text();
-        downloadTextFile("otpauth-export.txt", text);
-        alert(t("otpauthExportDone"));
-      } catch (e) {
-        msg("importMsg", e.message, true);
-      }
-    }
-
-    async function exportDataEncrypted() {
-      const passphrase = prompt(t("setBackupPassphrase"));
-      if (!passphrase) return;
-      const d = await api("/api/export/encrypted", {
-        method: "POST",
-        body: JSON.stringify({ passphrase: passphrase })
-      });
-      const text = JSON.stringify(d.encrypted, null, 2);
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-        alert(t("encryptedBackupCopied"));
-      } else {
-        prompt(t("copyEncryptedExportJson"), text);
-      }
-    }
-
-    async function importData() {
-      try {
-        const payload = JSON.parse(v("importText") || "{}");
-        const d = await api("/api/import", { method: "POST", body: JSON.stringify(payload) });
-        msg("importMsg", t("importedDone") + ": groups=" + d.imported.groups + ", entries=" + d.imported.entries);
-        await refreshAll();
-      } catch (e) { msg("importMsg", e.message, true); }
-    }
-
-    async function importOtpAuthText() {
-      try {
-        const text = String(v("importText") || "");
-        const d = await api("/api/import/otpauth", { method: "POST", body: JSON.stringify({ text: text }) });
-        let detail = t("otpauthImportDone") + ": found=" + d.found + ", imported=" + d.imported + ", failed=" + d.failed;
-        if (d.errors && d.errors.length) detail += " - " + d.errors.join("; ");
-        msg("importMsg", detail, Number(d.failed || 0) > 0);
-        await refreshAll();
-      } catch (e) { msg("importMsg", e.message, true); }
-    }
-
-    async function importDataEncrypted() {
-      try {
-        const encrypted = JSON.parse(v("importText") || "{}");
-        const passphrase = v("importPassphrase");
-        const d = await api("/api/import/encrypted", {
-          method: "POST",
-          body: JSON.stringify({ encrypted: encrypted, passphrase: passphrase })
-        });
-        msg("importMsg", t("encryptedImportedDone") + ": groups=" + d.imported.groups + ", entries=" + d.imported.entries);
-        await refreshAll();
-      } catch (e) { msg("importMsg", e.message, true); }
-    }
-
-    async function loadImportFile(ev) {
-      try {
-        const file = ev && ev.target && ev.target.files && ev.target.files[0];
-        if (!file) return;
-        const text = await file.text();
-        document.getElementById("importText").value = text;
-        msg("importMsg", t("importFileLoaded"));
-      } catch (e) {
-        msg("importMsg", e.message, true);
-      }
-    }
-
-    async function startScan() {
-      try {
-        const video = document.getElementById("scanVideo");
-        scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = scanStream;
-        video.classList.remove("hidden");
-        msg("scanMsg", t("cameraStarted"));
-        const canUseBarcodeDetector = "BarcodeDetector" in window;
-        let detector = null;
-        if (canUseBarcodeDetector) {
-          detector = new BarcodeDetector({ formats: ["qr_code"] });
-        } else {
-          await ensureJsQrLoaded();
-          msg("scanMsg", t("cameraFallback"));
-        }
-        clearInterval(scanTimer);
-        scanTimer = setInterval(async function() {
-          try {
-            let raw = "";
-            if (detector) {
-              const barcodes = await detector.detect(video);
-              if (barcodes && barcodes.length) raw = String(barcodes[0].rawValue || "");
-            } else {
-              raw = await detectQrFromVideoByJsQr(video);
-            }
-            if (raw) {
-              applyScannedOtpUri(raw);
-              stopScan();
-            } else if (canUseBarcodeDetector && !jsQrReady) {
-              // BarcodeDetector may fail on some devices; fallback once to jsQR.
-              await ensureJsQrLoaded();
-              msg("scanMsg", t("cameraFallback"));
-              detector = null;
-            }
-          } catch {}
-        }, 600);
-      } catch (e) {
-        msg("scanMsg", t("cameraDenied") + e.message, true);
-      }
-    }
-
-    function stopScan() {
-      if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
-      if (scanStream) {
-        scanStream.getTracks().forEach(function(t) { t.stop(); });
-        scanStream = null;
-      }
-      const video = document.getElementById("scanVideo");
-      if (video) {
-        video.srcObject = null;
-        video.classList.add("hidden");
-      }
-    }
-
-    async function scanImageFile(ev) {
-      try {
-        const file = ev && ev.target && ev.target.files && ev.target.files[0];
-        if (!file) return;
-        let raw = "";
-        // F-02: use local-only QR detection — no third-party API.
-          if ("BarcodeDetector" in window) {
-            const bmp = await createImageBitmap(file);
-            const detector = new BarcodeDetector({ formats: ["qr_code"] });
-            const barcodes = await detector.detect(bmp);
-            if (barcodes.length) raw = String(barcodes[0].rawValue || "");
-          }
-          if (!raw) {
-            await ensureJsQrLoaded();
-            raw = await detectQrFromImageFileByJsQr(file);
-          }
-        if (!raw) {
-          msg("scanMsg", t("noQrFound"), true);
-          return;
-        }
-        applyScannedOtpUri(raw);
-        msg("scanMsg", t("qrFromImage"));
-      } catch (e) {
-        msg("scanMsg", t("scanImageFailed") + e.message, true);
-      }
-    }
-
-    function applyScannedOtpUri(raw) {
-      if (applyOtpInput(raw, "scanMsg")) {
-        msg("scanMsg", t("qrDetected") + " " + t("qrReadyToSave"));
-      } else {
-        msg("scanMsg", t("qrInvalid"), true);
-      }
-    }
-
-    async function ensureJsQrLoaded() {
-      if (jsQrReady && typeof window.jsQR === "function") return;
-      await new Promise(function(resolve, reject) {
-        const exists = document.querySelector("script[data-jsqr='1']");
-        if (exists) {
-          exists.addEventListener("load", resolve, { once: true });
-          exists.addEventListener("error", reject, { once: true });
-          return;
-        }
-        const s = document.createElement("script");
-        s.src = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js";
-        s.integrity = "sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx";
-        s.crossOrigin = "anonymous";
-        s.async = true;
-        s.dataset.jsqr = "1";
-        s.onload = resolve;
-        s.onerror = reject;
-        document.head.appendChild(s);
-      });
-      jsQrReady = typeof window.jsQR === "function";
-      if (!jsQrReady) throw new Error("jsQR unavailable");
-    }
-
-    async function detectQrFromVideoByJsQr(video) {
-      if (!window.jsQR) return "";
-      const w = video.videoWidth || 0;
-      const h = video.videoHeight || 0;
-      if (!w || !h) return "";
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(video, 0, 0, w, h);
-      const img = ctx.getImageData(0, 0, w, h);
-      const result = window.jsQR(img.data, w, h, { inversionAttempts: "attemptBoth" });
-      return result && result.data ? String(result.data) : "";
-    }
-
-    async function detectQrFromImageFileByJsQr(file) {
-      if (!window.jsQR) return "";
-      const dataUrl = await fileToDataUrl(file);
-      const img = await loadImage(dataUrl);
-      const canvas = document.createElement("canvas");
-      canvas.width = img.naturalWidth || img.width;
-      canvas.height = img.naturalHeight || img.height;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const result = window.jsQR(imageData.data, canvas.width, canvas.height, { inversionAttempts: "attemptBoth" });
-      return result && result.data ? String(result.data) : "";
-    }
-
-    function fileToDataUrl(file) {
-      return new Promise(function(resolve, reject) {
-        const fr = new FileReader();
-        fr.onload = function() { resolve(String(fr.result || "")); };
-        fr.onerror = reject;
-        fr.readAsDataURL(file);
-      });
-    }
-
-    function loadImage(src) {
-      return new Promise(function(resolve, reject) {
-        const img = new Image();
-        img.onload = function() { resolve(img); };
-        img.onerror = reject;
-        img.src = src;
-      });
-    }
-
-    function downloadTextFile(filename, content) {
-      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    }
-
-    function esc(s) {
-      return String(s || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/\"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    function bindUiEvents() {
-      document.addEventListener("click", function(evt) {
-        const target = evt.target.closest("[data-action]");
-        if (!target) return;
-        const action = target.dataset.action;
-        const id = Number(target.dataset.id || 0);
-        const role = target.dataset.role || "";
-        const run = {
-          "bootstrap": function() { return bootstrap(evt); },
-          "login": function() { return login(evt); },
-          "logout": function() { return logout(evt); },
-          "refresh-all": refreshAll,
-          "export-data": exportData,
-          "export-otpauth": exportOtpAuthTxt,
-          "export-encrypted": exportDataEncrypted,
-          "toggle-import": toggleImport,
-          "import-data": importData,
-          "import-otpauth": importOtpAuthText,
-          "import-encrypted": importDataEncrypted,
-          "start-scan": startScan,
-          "stop-scan": stopScan,
-          "create-entry": createEntry,
-          "create-group": createGroup,
-          "create-user": createUser,
-          "save-login-policy": saveLoginPolicy,
-          "delete-group": function() { return deleteGroup(id); },
-          "gen-hotp": function() { return genHotp(id); },
-          "copy-code": function() { return copyCode(id); },
-          "toggle-entry": function() { return toggleEntry(id, evt.target.getAttribute("data-enabled") === "1"); },
-          "set-entry-group": function() { return setEntryGroup(id); },
-          "remove-entry-group": function() { return removeEntryGroup(id); },
-          "edit-entry": function() { return editEntry(id); },
-          "delete-entry": function() { return deleteEntry(id); },
-          "switch-role": function() { return switchRole(id, role); },
-          "change-my-password": changeMyPassword,
-          "reset-password": function() { return resetPassword(id); },
-          "delete-user": function() { return deleteUser(id); },
-        }[action];
-        if (!run) return;
-        evt.preventDefault();
-        Promise.resolve(run()).catch(function(e) { alert(e.message || String(e)); });
-      });
-
-      document.getElementById("langSelect").addEventListener("change", function(evt) {
-        changeLang(evt.target.value);
-      });
-      document.getElementById("autoLogoutSelect").addEventListener("change", function(evt) {
-        changeAutoLogout(evt.target.value);
-      });
-      document.getElementById("search").addEventListener("input", renderEntries);
-      document.getElementById("groupFilter").addEventListener("change", renderEntries);
-      document.getElementById("importFile").addEventListener("change", loadImportFile);
-      document.getElementById("qrImageFile").addEventListener("change", scanImageFile);
-      bindOtpInputRecognition("eSecret");
-      bindOtpInputRecognition("eUri");
-    }
-
-    function applyDynamicStyles() {
-      document.querySelectorAll(".swatch[data-color]").forEach(function(el) {
-        const color = el.getAttribute("data-color") || "#0f766e";
-        if (/^#[0-9a-fA-F]{6}$/.test(color)) el.style.backgroundColor = color;
-      });
-      document.querySelectorAll(".bar > i[data-progress]").forEach(function(el) {
-        const progress = Math.max(0, Math.min(100, Number(el.getAttribute("data-progress") || 0)));
-        el.style.width = progress + "%";
-      });
-    }
-
-    setInterval(updateCodeTimers, 1000);
-
-    bindUiEvents();
-    init();
-  </script>
-</body>
-</html>`;
+  return renderAppHtml(env, nonce);
 }

@@ -99,6 +99,7 @@ Requires `Authorization: Bearer <accessToken>`.
 All routes below require `Authorization: Bearer <accessToken>`.
 
 - `GET /api/v1/me`
+- `PATCH /api/v1/me/password`
 - `GET /api/v1/entries`
 - `POST /api/v1/entries`
 - `PATCH /api/v1/entries/:id`
@@ -152,9 +153,11 @@ Response:
 
 ## Export
 
-Encrypted export is the default safe export path:
+Encrypted export is the default safe export path and requires a Web UI cookie session plus current-password step-up confirmation:
 
-- `POST /api/export/encrypted`
+- `POST /api/export/encrypted` with `{ "passphrase": "<backup passphrase>", "confirmPassword": "<current password>" }`
+
+A successful password confirmation opens a 5-minute recent-authentication window for sensitive Web UI actions. Bearer tokens cannot call legacy export endpoints.
 
 Plaintext export endpoints require `ALLOW_PLAINTEXT_EXPORT=true` and a password confirmation in the POST body:
 
@@ -176,4 +179,4 @@ Wildcard origins are ignored when credentialed CORS is enabled.
 
 ## Legacy Routes
 
-The existing `/api/mobile/*`, `/api/extension/*`, and Web UI cookie routes remain available for compatibility.
+The existing `/api/mobile/*`, `/api/extension/*`, and Web UI cookie routes remain available for compatibility. Legacy `/api/*` Web UI and admin routes require the `__Host-session` cookie; `/api/v1/*` routes require bearer tokens and do not expose full import/export or user-management capabilities.
