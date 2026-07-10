@@ -12,6 +12,7 @@ Cloudflare Worker + D1 based 2FA manager. It supports Web UI access, TOTP/HOTP e
 - JSON, otpauth URI, and encrypted backup import/export
 - AES-GCM encrypted OTP secrets in D1
 - `/api/v1` bearer-token API for Android and browser extensions
+- Strict separation between Web UI cookie sessions and `/api/v1` bearer tokens
 - Exact-origin CORS allowlist for browser extensions
 
 ## Requirements
@@ -57,6 +58,7 @@ openssl rand -base64 32
 
 Optional settings:
 
+- `BOOTSTRAP_TOKEN` or `INIT_SECRET`: required one-time initialization secret for `/api/bootstrap`. Do not deploy an uninitialized public Worker without this secret.
 - `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login.
 - `TURNSTILE_SITE_KEY`: renders Turnstile in the Web UI.
 - `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions or HTTPS clients, for example `chrome-extension://<id>,moz-extension://<id>,https://app.example.com`. Wildcards and non-local `http://` origins are ignored; `http://localhost` is allowed for local development.
@@ -82,7 +84,7 @@ Remote:
 npm run d1:migrate:remote
 ```
 
-The current migration chain includes API session storage and indexes for refresh cleanup and client-type queries.
+The current migration chain includes API session storage, indexes for refresh cleanup and client-type queries, session step-up timestamps, and a bootstrap completion sentinel.
 
 ## Development
 
@@ -90,7 +92,18 @@ The current migration chain includes API session storage and indexes for refresh
 npm run dev
 ```
 
-Then open the local Worker URL. On first use, bootstrap the first admin account from the Web UI with the configured `BOOTSTRAP_TOKEN`.
+Then open the local Worker URL. On first use, bootstrap the first admin account from the Web UI and enter the `BOOTSTRAP_TOKEN` value when prompted.
+
+### First Deployment Bootstrap Safety
+
+Before exposing a new deployment publicly:
+
+1. Set `ENCRYPTION_KEY`, `SESSION_PEPPER`, and `BOOTSTRAP_TOKEN`/`INIT_SECRET` as Wrangler secrets.
+2. Restrict access to the Worker during first initialization when possible (for example, via Cloudflare Access or a temporary network allowlist).
+3. Create the first admin exactly once through the Web UI or `POST /api/bootstrap` with `bootstrapToken` (or `X-Bootstrap-Token`).
+4. Remove temporary access restrictions after confirming login works.
+
+Bootstrap is permanently closed after initialization. Existing deployments are marked closed by migration `0009_step_up_bootstrap.sql` when at least one user already exists. If concurrent bootstrap requests race, the conditional insert allows only one admin creation to succeed.
 
 ## Verification
 
@@ -99,7 +112,7 @@ npm test
 node --check src/worker.js
 ```
 
-The test suite covers API v1 CORS, JSON parsing, Turnstile config compatibility, bearer sessions, refresh rotation, HTML security headers, and key RBAC regressions.
+The test suite covers API v1 CORS, JSON parsing, Turnstile config compatibility, bearer sessions, refresh rotation, HTML security headers, Web-vs-bearer auth boundaries, step-up auth, bootstrap hardening, login risk cleanup, and key RBAC regressions.
 
 ## API
 
@@ -120,10 +133,10 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 ## Security Notes
 
 - Never commit real secrets or production `wrangler.toml` values.
-- Treat export payloads as sensitive. Plaintext export should be enabled only when you explicitly need it; prefer encrypted export when sharing backups.
+- Treat export payloads as sensitive. Plaintext export should be enabled only when you explicitly need it; prefer encrypted export when sharing backups. Encrypted export requires a current-password step-up confirmation and then honors a 5-minute recent-authentication window for sensitive Web UI actions.
 - Keep `BOOTSTRAP_TOKEN` configured until the first admin account has been created. An empty deployment cannot initialize without it.
 - Do not send Web UI cookies and API bearer tokens in the same request. Mixed authentication is rejected to keep CSRF checks and rate-limit buckets unambiguous.
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.
 - Configure `CORS_ALLOWED_ORIGINS` with exact browser-extension origins, not wildcards.
 - New passwords must be 12 to 256 characters and include uppercase, lowercase, number, and symbol.
-- New OTP entries accept SHA-256 or SHA-512 algorithms only.
+- OTP entries accept SHA-1, SHA-256, or SHA-512. Missing otpauth algorithms default to SHA-1 for authenticator compatibility.
