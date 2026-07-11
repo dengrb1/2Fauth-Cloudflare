@@ -583,6 +583,13 @@ test("web UI client keeps authentication and form submission recovery paths", ()
   assert.match(CLIENT_SCRIPT, /riskForm: "save-login-policy"/);
 });
 
+test("web UI marks the OTP search as a non-credential field", async () => {
+  const response = await worker.fetch(new Request("https://example.com/"), envWithDb(emptyDb()), ctx());
+  const html = await response.text();
+
+  assert.match(html, /<input id="search" name="otp-search-filter" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true"/);
+});
+
 test("web UI camera scanner falls back when BarcodeDetector yields no code", () => {
   assert.match(CLIENT_SCRIPT, /if \(!raw\) \{\s+await ensureJsQrLoaded\(\);\s+detector = null;/);
   assert.match(CLIENT_SCRIPT, /setMessage\("scanMsg", t\("scanFallback"\)\);\s+raw = detectQrFromVideo\(video\);/);

@@ -94,7 +94,7 @@ export function renderAppHtml(env, nonce) {
     <header class="topbar">
       <button class="btn btn-secondary icon-btn mobile-menu" data-action="toggle-sidebar" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button>
       <div class="page-title"><h1 id="pageTitle">验证码</h1><p id="pageSubtitle" data-i18n="codesSubtitle">快速取用并管理动态验证码</p></div>
-      <label class="topbar-search" id="globalSearchWrap">${ICONS.search}<span class="sr-only" data-i18n="search">搜索</span><input id="search" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索标签或发行方" /></label>
+      <label class="topbar-search" id="globalSearchWrap">${ICONS.search}<span class="sr-only" data-i18n="search">搜索</span><input id="search" name="otp-search-filter" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-i18n-placeholder="searchPlaceholder" placeholder="搜索标签或发行方" /></label>
       <div class="spacer"></div>
       <button class="btn btn-primary" data-action="open-entry" aria-label="添加验证码" data-i18n-aria-label="addCode">${ICONS.plus}<span data-i18n="addCode">添加验证码</span></button>
     </header>
