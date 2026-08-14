@@ -59,8 +59,9 @@ openssl rand -base64 32
 Optional settings:
 
 - `BOOTSTRAP_TOKEN` or `INIT_SECRET`: required one-time initialization secret for `/api/bootstrap`. Do not deploy an uninitialized public Worker without this secret.
-- `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login.
+- `TURNSTILE_SECRET_KEY` or `TURNSTILE_KEY`: enables Turnstile verification for web/android login. Successful tokens must also report the current request hostname.
 - `TURNSTILE_SITE_KEY`: renders Turnstile in the Web UI.
+- `TURNSTILE_ALLOWED_HOSTNAMES`: optional comma-separated hostname allowlist for deployments intentionally served from more than one hostname. Leave unset to require the request hostname.
 - `CORS_ALLOWED_ORIGINS`: comma-separated exact origins for browser extensions or HTTPS clients, for example `chrome-extension://<id>,moz-extension://<id>,https://app.example.com`. Wildcards and non-local `http://` origins are ignored; `http://localhost` is allowed for local development.
 - `ALLOW_PLAINTEXT_EXPORT`: defaults to disabled. Temporarily set to `true` only when you need `/api/export` or `/api/export/otpauth`; encrypted export stays available either way.
 - `API_RATE_MAX_REQUESTS_PER_MINUTE`: optional per-session/IP API rate limit, default `120`.
@@ -134,6 +135,9 @@ Legacy Web UI, `/api/mobile/*`, and `/api/extension/*` routes remain available f
 
 - Never commit real secrets or production `wrangler.toml` values.
 - Treat export payloads as sensitive. Plaintext export should be enabled only when you explicitly need it; prefer encrypted export when sharing backups. Encrypted export requires a current-password step-up confirmation and then honors a 5-minute recent-authentication window for sensitive Web UI actions.
+- Web sessions have a 30-day absolute lifetime, and API refresh sessions have a 90-day absolute lifetime. Regular use cannot extend either bound indefinitely.
+- The Web UI uses a strict CSP plus isolation and Permissions-Policy headers. Camera access is permitted only to this origin for QR scanning; other high-risk browser capabilities are disabled.
+- Closing a sensitive dialog or completing an import clears password, passphrase, and OTP-secret fields from the page. Page lifecycle teardown also clears in-memory browser TOTP keys.
 - Keep `BOOTSTRAP_TOKEN` configured until the first admin account has been created. An empty deployment cannot initialize without it.
 - Do not send Web UI cookies and API bearer tokens in the same request. Mixed authentication is rejected to keep CSRF checks and rate-limit buckets unambiguous.
 - Keep `SESSION_PEPPER` and `ENCRYPTION_KEY` stable unless you have a rotation plan.

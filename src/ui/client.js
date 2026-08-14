@@ -33,11 +33,17 @@ export const CLIENT_SCRIPT = String.raw`
   let codeState = Object.create(null);
   let serverClockOffsetMs = 0;
   let codesRefreshing = false;
+  let codeTimer = null;
+  let codeRequestAbort = null;
+  let vaultGeneration = 0;
+  let vaultStepUpDialogOpen = false;
+  const browserTotpKeys = new Map();
   let scanStream = null;
   let scanTimer = null;
   let jsQrReady = false;
   let inactivityTimer = null;
   let activityBound = false;
+  let otpLifecycleBound = false;
   let turnstileWidgetId = null;
   let turnstileToken = "";
   let actionHandler = null;
@@ -55,7 +61,13 @@ export const CLIENT_SCRIPT = String.raw`
       credentials: "include"
     }));
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.detail ? data.error + ": " + data.detail : (data.error || "HTTP " + response.status));
+    if (!response.ok) {
+      const error = new Error(data.detail ? data.error + ": " + data.detail : (data.error || "HTTP " + response.status));
+      error.status = response.status;
+      error.payload = data;
+      if (response.status === 401 && !/password confirmation/i.test(String(data.error || ""))) clearBrowserTotpVault();
+      throw error;
+    }
     return data;
   }
 
@@ -126,6 +138,7 @@ export const CLIENT_SCRIPT = String.raw`
   }
 
   function showAuthSection(id, stateText) {
+    clearBrowserTotpVault();
     byId("authLoading").classList.add("hidden");
     byId("bootstrap").classList.add("hidden");
     byId("login").classList.add("hidden");
@@ -141,6 +154,8 @@ export const CLIENT_SCRIPT = String.raw`
     byId("userRole").textContent = currentUser.role === "admin" ? t("adminRole") : t("userRole");
     if (currentUser.role === "admin") byId("adminNav").classList.remove("hidden");
     bindActivityEvents();
+    bindOtpLifecycle();
+    startOtpActivity();
     scheduleAutoLogout();
   }
 
@@ -153,6 +168,7 @@ export const CLIENT_SCRIPT = String.raw`
       if (window.turnstile && typeof window.turnstile.render === "function") {
         turnstileWidgetId = window.turnstile.render("#turnstileBox", {
           sitekey: TURNSTILE_SITE_KEY,
+          action: "login",
           callback: (token) => { turnstileToken = token || ""; },
           "expired-callback": () => { turnstileToken = ""; },
           "error-callback": () => { turnstileToken = ""; }
@@ -226,6 +242,7 @@ export const CLIENT_SCRIPT = String.raw`
 
   async function logout() {
     if (inactivityTimer) clearTimeout(inactivityTimer);
+    clearBrowserTotpVault();
     await api("/api/logout", { method: "POST", body: "{}" });
     location.replace("/");
   }
@@ -281,10 +298,11 @@ export const CLIENT_SCRIPT = String.raw`
       groups = data.groups || [];
       const valid = new Set(entries.map((entry) => String(entry.id)));
       Object.keys(codeState).forEach((id) => { if (!valid.has(String(id))) delete codeState[id]; });
+      clearBrowserTotpVault();
       hydrateGroupSelects();
       renderGroups();
       renderEntries();
-      await refreshVisibleCodes();
+      if (!document.hidden) await refreshVisibleCodes();
     } catch (error) {
       renderLoadError(error);
       throw error;
@@ -404,14 +422,23 @@ export const CLIENT_SCRIPT = String.raw`
   }
 
   async function refreshVisibleCodes() {
-    await refreshCodesBatch(entries.filter((entry) => entry.otp_type !== "hotp" && isEnabled(entry)), true);
+    if (document.hidden) return;
+    const activeTotpEntries = entries.filter((entry) => entry.otp_type !== "hotp" && isEnabled(entry));
+    if (browserTotpAvailable()) {
+      await refreshBrowserTotp(activeTotpEntries, true);
+      return;
+    }
+    await refreshCodesBatch(activeTotpEntries, true);
   }
 
   async function refreshCodesBatch(list, silent) {
-    if (!list.length || codesRefreshing) return;
+    if (!list.length || codesRefreshing || document.hidden) return;
     codesRefreshing = true;
+    const controller = new AbortController();
+    codeRequestAbort = controller;
     try {
-      const result = await api("/api/codes/batch", { method: "POST", body: JSON.stringify({ entryIds: list.map((entry) => entry.id) }) });
+      const result = await api("/api/codes/batch", { method: "POST", signal: controller.signal, body: JSON.stringify({ entryIds: list.map((entry) => entry.id) }) });
+      if (document.hidden || controller.signal.aborted) return;
       if (Number.isFinite(result.serverTime)) serverClockOffsetMs = Number(result.serverTime) * 1000 - Date.now();
       (result.items || []).forEach((item) => {
         const entry = entries.find((candidate) => Number(candidate.id) === Number(item.id));
@@ -419,10 +446,149 @@ export const CLIENT_SCRIPT = String.raw`
       });
       updateCodeTimers();
     } catch (error) {
-      if (!silent) toast(error.message, true);
+      if (!silent && error.name !== "AbortError") toast(error.message, true);
     } finally {
+      if (codeRequestAbort === controller) codeRequestAbort = null;
       codesRefreshing = false;
     }
+  }
+
+  function browserTotpAvailable() {
+    return WEB_TOTP_MODE === "browser" && !!(window.crypto && window.crypto.subtle);
+  }
+
+  function clearBrowserTotpVault() {
+    vaultGeneration += 1;
+    browserTotpKeys.clear();
+    entries.filter((entry) => entry.otp_type !== "hotp").forEach((entry) => delete codeState[entry.id]);
+  }
+
+  function decodeBase32Secret(secret) {
+    const normalized = String(secret || "").toUpperCase().replace(/[\s=-]/g, "");
+    if (!normalized || !/^[A-Z2-7]+$/.test(normalized)) throw new Error("Invalid TOTP secret");
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let buffer = 0;
+    let bits = 0;
+    const bytes = [];
+    for (const character of normalized) {
+      buffer = (buffer << 5) | alphabet.indexOf(character);
+      bits += 5;
+      if (bits >= 8) {
+        bits -= 8;
+        bytes.push((buffer >>> bits) & 0xff);
+        buffer &= bits ? (1 << bits) - 1 : 0;
+      }
+    }
+    if (!bytes.length) throw new Error("Invalid TOTP secret");
+    return new Uint8Array(bytes);
+  }
+
+  function validBrowserTotpAlgorithm(value) {
+    const algorithm = String(value || "").toUpperCase();
+    return ["SHA-1", "SHA-256", "SHA-512"].includes(algorithm) ? algorithm : null;
+  }
+
+  async function importBrowserTotpKey(item, generation) {
+    const algorithm = validBrowserTotpAlgorithm(item.algorithm);
+    const digits = Number(item.digits);
+    const period = Number(item.period);
+    if (!algorithm || ![6, 7, 8].includes(digits) || !Number.isInteger(period) || period < 15 || period > 120) return;
+    const secretBytes = decodeBase32Secret(item.secret);
+    try {
+      const key = await crypto.subtle.importKey("raw", secretBytes, { name: "HMAC", hash: { name: algorithm } }, false, ["sign"]);
+      if (generation === vaultGeneration && !document.hidden) {
+        browserTotpKeys.set(String(item.id), { key, digits, period, algorithm });
+      }
+    } finally {
+      secretBytes.fill(0);
+    }
+  }
+
+  function isPasswordStepUpError(error) {
+    return error && error.status === 401 && /password confirmation/i.test(error.message || "");
+  }
+
+  function promptForVaultPassword(list) {
+    if (vaultStepUpDialogOpen) return;
+    vaultStepUpDialogOpen = true;
+    openAction({
+      title: t("currentPassword"),
+      description: t("codesSubtitle"),
+      fields: [{ name: "confirmPassword", label: t("currentPassword"), type: "password", autocomplete: "current-password" }],
+      onConfirm: async (data) => {
+        await refreshBrowserTotp(list, false, data.confirmPassword);
+        closeAction();
+      },
+    });
+  }
+
+  async function refreshBrowserTotp(list, silent, confirmPassword) {
+    if (!list.length || document.hidden) return;
+    const missing = list.filter((entry) => !browserTotpKeys.has(String(entry.id)));
+    if (missing.length) await syncBrowserTotpVault(missing, silent, confirmPassword);
+    if (!document.hidden) await computeBrowserTotpCodes(list);
+  }
+
+  async function syncBrowserTotpVault(list, silent, confirmPassword) {
+    if (!list.length || codesRefreshing || document.hidden) return;
+    codesRefreshing = true;
+    const controller = new AbortController();
+    const generation = vaultGeneration;
+    codeRequestAbort = controller;
+    try {
+      for (let start = 0; start < list.length; start += 90) {
+        const chunk = list.slice(start, start + 90);
+        const payload = { entryIds: chunk.map((entry) => entry.id) };
+        if (confirmPassword) payload.confirmPassword = confirmPassword;
+        const result = await api("/api/codes/vault", { method: "POST", signal: controller.signal, body: JSON.stringify(payload) });
+        if (controller.signal.aborted || document.hidden || generation !== vaultGeneration) return;
+        if (Number.isFinite(result.serverTime)) serverClockOffsetMs = Number(result.serverTime) * 1000 - Date.now();
+        await Promise.all((result.items || []).map((item) => importBrowserTotpKey(item, generation).catch(() => {})));
+      }
+      if (!document.hidden && generation === vaultGeneration) updateCodeTimers();
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      if (!confirmPassword && isPasswordStepUpError(error)) {
+        promptForVaultPassword(list);
+        return;
+      }
+      if (silent) return;
+      toast(error.message, true);
+      throw error;
+    } finally {
+      if (codeRequestAbort === controller) codeRequestAbort = null;
+      codesRefreshing = false;
+    }
+  }
+
+  async function generateBrowserTotp(record, step) {
+    const counter = new Uint8Array(8);
+    let value = Math.max(0, Math.floor(step));
+    for (let index = 7; index >= 0; index -= 1) {
+      counter[index] = value & 0xff;
+      value = Math.floor(value / 256);
+    }
+    const digest = new Uint8Array(await crypto.subtle.sign("HMAC", record.key, counter));
+    const offset = digest[digest.length - 1] & 0x0f;
+    if (offset + 4 > digest.length) throw new Error("Invalid TOTP digest");
+    const binary = (((digest[offset] & 0x7f) << 24) | (digest[offset + 1] << 16) | (digest[offset + 2] << 8) | digest[offset + 3]) >>> 0;
+    return String(binary % (10 ** record.digits)).padStart(record.digits, "0");
+  }
+
+  async function computeBrowserTotpCodes(list) {
+    const updates = await Promise.all(list.map(async (entry) => {
+      const record = browserTotpKeys.get(String(entry.id));
+      if (!record || entry.otp_type === "hotp" || !isEnabled(entry)) return null;
+      const step = Math.floor(serverNowSec() / record.period);
+      const state = codeState[entry.id] || {};
+      if (state.code && state.fetchedStep === step) return entry;
+      const code = await generateBrowserTotp(record, step);
+      if (!document.hidden && browserTotpKeys.get(String(entry.id)) === record) {
+        codeState[entry.id] = { code, fetchedStep: step };
+      }
+      return entry;
+    }));
+    if (!document.hidden) updates.filter(Boolean).forEach(updateEntryDisplay);
   }
 
   function updateEntryDisplay(entry) {
@@ -438,20 +604,32 @@ export const CLIENT_SCRIPT = String.raw`
   }
 
   function updateCodeTimers() {
-    const refresh = [];
+    if (document.hidden) return;
+    const localRefresh = [];
+    const remoteRefresh = [];
+    const missingVaultEntries = [];
     entries.forEach((entry) => {
       updateEntryDisplay(entry);
       if (entry.otp_type === "hotp" || !isEnabled(entry)) return;
       const state = codeState[entry.id] || {};
-      if (!state.code || state.fetchedStep !== entryStep(entry)) refresh.push(entry);
+      if (state.code && state.fetchedStep === entryStep(entry)) return;
+      if (browserTotpAvailable()) {
+        if (browserTotpKeys.has(String(entry.id))) localRefresh.push(entry);
+        else missingVaultEntries.push(entry);
+      } else remoteRefresh.push(entry);
     });
-    if (refresh.length) void refreshCodesBatch(refresh, true);
+    if (localRefresh.length) void computeBrowserTotpCodes(localRefresh).catch(() => {});
+    if (missingVaultEntries.length) void refreshBrowserTotp(missingVaultEntries, true).catch(() => {});
+    if (remoteRefresh.length) void refreshCodesBatch(remoteRefresh, true);
   }
 
   async function copyCode(id) {
     const entry = entries.find((item) => Number(item.id) === Number(id));
     if (!entry || !isEnabled(entry)) return;
-    if (!(codeState[id] && codeState[id].code)) await refreshCodesBatch([entry], false);
+    if (!(codeState[id] && codeState[id].code)) {
+      if (browserTotpAvailable()) await refreshBrowserTotp([entry], false);
+      else await refreshCodesBatch([entry], false);
+    }
     const code = String((codeState[id] && codeState[id].code) || "");
     if (!code) throw new Error(t("copyFailed"));
     try {
@@ -518,8 +696,14 @@ export const CLIENT_SCRIPT = String.raw`
 
   function closeEntry() {
     stopScan();
+    clearEntrySecretInputs();
     byId("entryDialog").close();
     if (dialogReturnFocus && typeof dialogReturnFocus.focus === "function") dialogReturnFocus.focus();
+  }
+
+  function clearEntrySecretInputs() {
+    byId("eSecret").value = "";
+    byId("eUri").value = "";
   }
 
   function canonicalBase32(input) { return String(input || "").toUpperCase().replace(/[\s=-]/g, ""); }
@@ -743,9 +927,16 @@ export const CLIENT_SCRIPT = String.raw`
     if (kind === "json") result = await api("/api/import", { method: "POST", body: JSON.stringify(JSON.parse(value("importText") || "{}")) });
     if (kind === "otpauth") result = await api("/api/import/otpauth", { method: "POST", body: JSON.stringify({ text: value("importText") }) });
     if (kind === "encrypted") result = await api("/api/import/encrypted", { method: "POST", body: JSON.stringify({ encrypted: JSON.parse(value("importText") || "{}"), passphrase: value("importPassphrase") }) });
+    clearImportSensitiveFields();
     setMessage("importMsg", t("importDone") + (result && result.imported ? ": " + JSON.stringify(result.imported) : ""));
     toast(t("importDone"));
     await refreshAll();
+  }
+
+  function clearImportSensitiveFields() {
+    byId("importText").value = "";
+    byId("importPassphrase").value = "";
+    byId("importFile").value = "";
   }
 
   async function loadImportFile(event) {
@@ -797,6 +988,45 @@ export const CLIENT_SCRIPT = String.raw`
     video.srcObject = null;
     video.classList.add("hidden");
     byId("stopScanButton").classList.add("hidden");
+  }
+
+  function stopCodeTimer() {
+    if (codeTimer) clearInterval(codeTimer);
+    codeTimer = null;
+  }
+
+  function stopOtpActivity() {
+    stopCodeTimer();
+    if (codeRequestAbort) codeRequestAbort.abort();
+  }
+
+  function startOtpActivity() {
+    if (!currentUser || document.hidden) return;
+    if (!codeTimer) codeTimer = setInterval(updateCodeTimers, 1000);
+    updateCodeTimers();
+  }
+
+  function bindOtpLifecycle() {
+    if (otpLifecycleBound) return;
+    otpLifecycleBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopOtpActivity();
+        stopScan();
+      } else startOtpActivity();
+    });
+    window.addEventListener("pagehide", () => {
+      stopOtpActivity();
+      stopScan();
+      clearBrowserTotpVault();
+    });
+    window.addEventListener("pageshow", () => startOtpActivity());
+    window.addEventListener("beforeunload", clearBrowserTotpVault);
+    byId("actionDialog").addEventListener("close", () => {
+      vaultStepUpDialogOpen = false;
+      actionHandler = null;
+      byId("actionFields").replaceChildren();
+    });
   }
 
   async function scanImage(event) {
@@ -862,6 +1092,7 @@ export const CLIENT_SCRIPT = String.raw`
     if (inactivityTimer) clearTimeout(inactivityTimer);
     if (!currentUser || !Number.isFinite(autoLogoutMinutes) || autoLogoutMinutes <= 0) return;
     inactivityTimer = setTimeout(async () => {
+      clearBrowserTotpVault();
       try { await api("/api/logout", { method: "POST", body: "{}" }); } finally { sessionStorage.setItem("auth_notice", "logoutTimeout"); location.replace("/"); }
     }, autoLogoutMinutes * 60 * 1000);
   }
@@ -974,7 +1205,10 @@ export const CLIENT_SCRIPT = String.raw`
 
   byId("search").addEventListener("input", renderEntries);
   byId("eSecret").addEventListener("paste", () => setTimeout(() => applyOtpInput(value("eSecret"), true), 0));
-  byId("entryDialog").addEventListener("close", stopScan);
+  byId("entryDialog").addEventListener("close", () => {
+    stopScan();
+    clearEntrySecretInputs();
+  });
   const desktopNavigation = window.matchMedia("(min-width: 901px)");
   desktopNavigation.addEventListener("change", () => setSidebarOpen(false));
   document.addEventListener("keydown", (event) => {
@@ -984,7 +1218,6 @@ export const CLIENT_SCRIPT = String.raw`
     }
   });
 
-  setInterval(updateCodeTimers, 1000);
   setSidebarOpen(false);
   void init();
 })();
