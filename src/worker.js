@@ -41,6 +41,7 @@ const ENCRYPTION_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
 const API_SESSION_LAST_USED_UPDATE_INTERVAL_SECONDS = 15 * 60;
 const ENTRY_LABEL_MAX_LENGTH = 200;
 const ENTRY_ISSUER_MAX_LENGTH = 100;
+const ENTRY_REORDER_MAX_IDS = 500;
 const OTP_ALGORITHM_DEFAULT = "SHA-1";
 const OTP_ALGORITHM_ERROR = "algorithm must be SHA-1, SHA-256, or SHA-512";
 const GROUP_NAME_MAX_LENGTH = 60;
@@ -121,6 +122,7 @@ function entryRoutes(prefix) {
   return [
     ["GET", `${prefix}/entries`, handleListEntries],
     ["POST", `${prefix}/entries`, handleCreateEntry],
+    ["PATCH", `${prefix}/entries/order`, handleReorderEntries],
     ["PATCH", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleUpdateEntry],
     ["GET", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/code`), handleEntryCode],
     ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/verify`), handleVerifyTotp],
@@ -769,17 +771,52 @@ async function handleListEntries(request, env) {
 async function listEntriesForAuth(env, auth) {
   if (auth.user.role === "admin") {
     const rows = await env.DB.prepare(
-      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.id DESC"
+      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, e.sort_order, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.enabled DESC, e.sort_order ASC, e.id DESC"
     ).all();
     return rows.results || [];
   }
 
   const rows = await env.DB.prepare(
-    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.id DESC"
+    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, e.sort_order, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.enabled DESC, e.sort_order ASC, e.id DESC"
   )
     .bind(auth.user.id)
     .all();
   return rows.results || [];
+}
+
+async function handleReorderEntries(request, env) {
+  const auth = await requireRouteSession(request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await parseJson(request);
+  const orderedIds = Array.isArray(body.orderedIds) ? body.orderedIds.map(Number) : null;
+  if (!orderedIds || orderedIds.length > ENTRY_REORDER_MAX_IDS) {
+    return json({ error: `orderedIds must be an array with at most ${ENTRY_REORDER_MAX_IDS} items` }, 400);
+  }
+  if (orderedIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(orderedIds).size !== orderedIds.length) {
+    return json({ error: "orderedIds must contain unique positive integer ids" }, 400);
+  }
+  if (!orderedIds.length) return json({ ok: true });
+
+  const allowedIds = new Set();
+  for (let offset = 0; offset < orderedIds.length; offset += VAULT_MAX_IDS) {
+    const chunk = orderedIds.slice(offset, offset + VAULT_MAX_IDS);
+    const placeholders = chunk.map(() => "?").join(",");
+    let statement = env.DB.prepare(`SELECT id FROM totp_entries WHERE id IN (${placeholders})`);
+    const bindings = [...chunk];
+    if (auth.user.role !== "admin") {
+      statement = env.DB.prepare(`SELECT id FROM totp_entries WHERE id IN (${placeholders}) AND user_id = ?`);
+      bindings.push(auth.user.id);
+    }
+    const rows = await statement.bind(...bindings).all();
+    (rows.results || []).forEach((row) => allowedIds.add(Number(row.id)));
+  }
+  if (allowedIds.size !== orderedIds.length) return json({ error: "One or more entries are unavailable" }, 403);
+
+  await env.DB.batch(orderedIds.map((id, index) => (
+    env.DB.prepare("UPDATE totp_entries SET sort_order = ? WHERE id = ?").bind(index, id)
+  )));
+  return json({ ok: true });
 }
 
 async function handleCreateEntry(request, env) {

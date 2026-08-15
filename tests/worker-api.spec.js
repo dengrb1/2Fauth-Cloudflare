@@ -66,6 +66,10 @@ function apiSessionDb(state = {}) {
 
 function webAppDataDb(state = {}) {
   return {
+    async batch(statements) {
+      state.batchSize = statements.length;
+      return Promise.all(statements.map((statement) => statement.run()));
+    },
     prepare(sql) {
       const statement = {
         bind(...args) {
@@ -564,6 +568,11 @@ test("web UI keeps phone and tablet navigation responsive", async () => {
   assert.match(html, /sidebar\.setAttribute\("inert", ""\)/);
   assert.match(html, /\.entries-grid, \.transfer-grid, \.settings-grid \{ grid-template-columns: 1fr; \}/);
   assert.match(html, /min-height: 44px; display: inline-flex/);
+  assert.match(html, /\.main \{ width: min\(100%, 1920px\)/);
+  assert.match(html, /\.dialog\.wide \{ width: min\(calc\(100% - 40px\), 860px\)/);
+  assert.match(html, /touch-action: none/);
+  assert.match(html, /addEventListener\("pointermove"/);
+  assert.match(html, /addEventListener\("dragstart"/);
 });
 
 test("web UI includes Chinese and English copy without native business dialogs", async () => {
@@ -904,6 +913,45 @@ test("web app data returns entries and groups in one request", async () => {
   assert.equal(body.groups.length, 1);
   assert.equal(body.groups[0].name, "Work");
   assert.equal((state.runs || []).some((sql) => sql.includes("login_risk_control")), false);
+});
+
+test("web users can persist a validated entry order", async () => {
+  const state = {};
+  const db = webAppDataDb(state);
+  const response = await worker.fetch(new Request("https://example.com/api/entries/order", {
+    method: "PATCH",
+    headers: {
+      Cookie: "__Host-session=web-token",
+      Origin: "https://example.com",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ orderedIds: [11] }),
+  }), envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(state.batchSize, 1);
+  assert.ok(state.binds.some(({ sql, args }) => sql.includes("SET sort_order = ?") && args[0] === 0 && args[1] === 11));
+});
+
+test("entry ordering rejects duplicate ids before updating D1", async () => {
+  const state = {};
+  const db = webAppDataDb(state);
+  const response = await worker.fetch(new Request("https://example.com/api/entries/order", {
+    method: "PATCH",
+    headers: {
+      Cookie: "__Host-session=web-token",
+      Origin: "https://example.com",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ orderedIds: [11, 11] }),
+  }), envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /unique positive integer ids/);
+  assert.equal(state.batchSize, undefined);
 });
 
 test("web sessions expire after their absolute lifetime", async () => {
